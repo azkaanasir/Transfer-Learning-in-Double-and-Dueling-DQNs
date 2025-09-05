@@ -1,0 +1,6 @@
+gymnasium
+matplotlib
+numpy
+tensorflow
+tensorboard
+tensorflow[and-cuda]
