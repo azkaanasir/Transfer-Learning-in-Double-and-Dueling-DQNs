@@ -220,7 +220,7 @@ import random
 import os
 import imageio
 import json
-from param import params  # <-- Import your parameter file
+from param import lunar_params as params  # <-- Import your parameter file
 
 # GPU Memory Growth
 physical_devices = tf.config.list_physical_devices('GPU')

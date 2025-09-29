@@ -1,4 +1,4 @@
-#step1 - dependencies
+# step1 - dependencies
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -12,6 +12,7 @@ import time
 import json
 import pickle
 import datetime
+from param import lunar_params, cartpole_params  # Fixed import
 
    
 # List all physical devices
@@ -37,7 +38,6 @@ if gpus:
 else:
     print("\nNo GPU found. Using CPU.")
 
-
 # Set a path for saving models and results locally
 SAVE_PATH = './models/ddqn_cartpole/' 
 os.makedirs(SAVE_PATH, exist_ok=True) 
@@ -47,6 +47,8 @@ print("Using save path:", SAVE_PATH)
 log_dir = os.path.join("logs", "cartpole", "ddqn", datetime.datetime.now().strftime("%Y-%m-%d ---%H:%M:%S"))
 train_log_dir = os.path.join(log_dir, "train")
 test_log_dir = os.path.join(log_dir, "test")
+os.makedirs(train_log_dir, exist_ok=True)
+os.makedirs(test_log_dir, exist_ok=True)
 train_writer = tf.summary.create_file_writer(train_log_dir)
 test_writer = tf.summary.create_file_writer(test_log_dir)
 
@@ -96,7 +98,9 @@ class DoubleDQNAgent:
         epsilon_decay=0.995, 
         buffer_size=10000, 
         batch_size=64, 
-        target_update_freq=10 
+        target_update_freq=10,
+        learning_rate=0.001,
+        optimizer='adam'
     ): 
         self.state_dim = state_dim 
         self.action_dim = action_dim 
@@ -107,6 +111,8 @@ class DoubleDQNAgent:
         self.batch_size = batch_size 
         self.target_update_freq = target_update_freq 
         self.update_counter = 0 
+        self.learning_rate = learning_rate
+        self.optimizer_name = optimizer
 
         # Create main and target networks 
         self.model = self.build_model() 
@@ -127,8 +133,14 @@ class DoubleDQNAgent:
             layers.Dense(self.action_dim, activation='linear') 
         ]) 
 
+        # Fixed optimizer selection
+        if self.optimizer_name.lower() == 'adam':
+            optimizer_choice = keras.optimizers.Adam(learning_rate=self.learning_rate)
+        else:
+            optimizer_choice = keras.optimizers.SGD(learning_rate=self.learning_rate)
+            
         model.compile( 
-            optimizer=keras.optimizers.Adam(learning_rate=0.001), 
+            optimizer=optimizer_choice, 
             loss='mse' 
         ) 
 
@@ -265,19 +277,21 @@ class DoubleDQNAgent:
             print(f"No checkpoint found or error loading checkpoint: {e}")
             print("Starting training from scratch.")
             return False, 0, [], [], []
-    #step 4
+
+#step 4
 def train_agent(env, agent, num_episodes=200, max_steps=500, early_stop=True):
     episode_rewards = []
     episode_lengths = []
     validation_rewards = []
-    solved_threshold = 195
-    consecutive_solves = 0
-    required_solves = 3  # Number of consecutive validations above threshold
+    
+    # Use parameters from cartpole_params
+    solved_threshold = cartpole_params['reward_threshold']  # 195
+    consecutive_episodes = 100  # Standard for CartPole-v1
+    validation_frequency = 10  # Validate every 10 episodes
+    checkpoint_frequency = 10  # Save checkpoint every 10 episodes
 
     # Try to load checkpoint using our agent's method
-    # checkpoint_loaded, start_episode, ep_rewards, ep_lengths, val_rewards = agent.load_checkpoint()
-
-    checkpoint_loaded = False
+    checkpoint_loaded, start_episode, ep_rewards, ep_lengths, val_rewards = agent.load_checkpoint()
 
     if checkpoint_loaded:
         print(f"Resuming from episode {start_episode}")
@@ -318,8 +332,26 @@ def train_agent(env, agent, num_episodes=200, max_steps=500, early_stop=True):
         episode_rewards.append(episode_reward)
         episode_lengths.append(step + 1)
 
-        # Validate every 10 episodes
-        if episode % 10 == 0:
+        # Print progress
+        if episode % validation_frequency == 0:
+            print(f"Episode {episode}/{num_episodes}, Reward: {episode_reward}, Epsilon: {agent.epsilon:.3f}")
+
+        # Check for early stopping - CartPole is solved when avg reward >= 195 over 100 consecutive episodes
+        if early_stop and len(episode_rewards) >= consecutive_episodes:
+            recent_avg_reward = np.mean(episode_rewards[-consecutive_episodes:])
+            
+            if episode % validation_frequency == 0:
+                print(f"Average reward over last {consecutive_episodes} episodes: {recent_avg_reward:.2f}")
+            
+            if recent_avg_reward >= solved_threshold:
+                print(f"Environment solved in {episode} episodes!")
+                print(f"Average reward over last {consecutive_episodes} episodes: {recent_avg_reward:.2f}")
+                # Save final checkpoint
+                agent.save_checkpoint(episode, episode_rewards, episode_lengths, validation_rewards)
+                break
+
+        # Validate every validation_frequency episodes
+        if episode % validation_frequency == 0 and episode > 0:
             # Save current epsilon and force greedy policy for validation
             original_epsilon = agent.epsilon
             agent.epsilon = 0.0
@@ -330,39 +362,24 @@ def train_agent(env, agent, num_episodes=200, max_steps=500, early_stop=True):
             agent.epsilon = original_epsilon
             
             validation_rewards.append(val_reward)
-            print(f"Episode {episode}/{num_episodes}, Reward: {episode_reward}, Validation: {val_reward}, Epsilon: {agent.epsilon:.3f}")
+            print(f"Validation reward: {val_reward:.2f}")
 
-            # Check for early stopping
-            if early_stop and val_reward >= solved_threshold:
-                consecutive_solves += 1
-                if consecutive_solves >= required_solves:
-                    print(f"Environment solved in {episode} episodes! Average reward: {val_reward:.2f}")
-                    # Save final checkpoint
-                    agent.save_checkpoint(episode, episode_rewards, episode_lengths, validation_rewards)
-                    break
-            else:
-                consecutive_solves = 0
-        else:
-            print(f"Episode {episode}/{num_episodes}, Reward: {episode_reward}, Epsilon: {agent.epsilon:.3f}")
-
-        # Save checkpoint every 10 episodes
-        if episode % 10 == 9:  # Save at episodes 9, 19, 29, etc.
+        # Save checkpoint every checkpoint_frequency episodes
+        if episode % checkpoint_frequency == 0 and episode > 0:
             agent.save_checkpoint(episode, episode_rewards, episode_lengths, validation_rewards)
-            print(f"Checkpoint saved at episode {episode}")
 
-
-        # Log metrics manually to TensorBoard
+        # Log metrics to TensorBoard
         with train_writer.as_default():
-            tf.summary.scalar('rewards', episode_reward, step=episode)
+            tf.summary.scalar('episode_rewards', episode_reward, step=episode)
             tf.summary.scalar('episode_lengths', episode_lengths[-1], step=episode)
-            # print(loss)
-            tf.summary.scalar('Loss', loss , step=episode)
+            tf.summary.scalar('epsilon', agent.epsilon, step=episode)
+            if loss > 0:  # Only log loss if we actually trained
+                tf.summary.scalar('loss', loss, step=episode)
 
-        with test_writer.as_default():
-            tf.summary.scalar('validation_rewards', validation_rewards[-1], step=episode)
-            # tf.summary.scalar('4', test_accuracy.result(), step=episode)
-
-        
+        # Log validation rewards (only when we actually have new validation data)
+        if episode % validation_frequency == 0 and episode > 0 and len(validation_rewards) > 0:
+            with test_writer.as_default():
+                tf.summary.scalar('validation_rewards', validation_rewards[-1], step=episode)
 
     return episode_rewards, episode_lengths, validation_rewards, agent.loss_history
 
@@ -400,38 +417,48 @@ def plot_training_results(rewards, lengths, validations, losses):
     plt.title('Episode Rewards')
     plt.xlabel('Episode')
     plt.ylabel('Reward')
-    plt.axhline(y=195, color='r', linestyle='--', label='Solved Threshold')
+    plt.axhline(y=cartpole_params['reward_threshold'], color='r', linestyle='--', label='Solved Threshold')
     plt.legend()
     plt.grid(True)
 
     # Plot smoothed rewards
     plt.subplot(2, 2, 2)
-    window_size = 10
-    smoothed_rewards = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
-    plt.plot(smoothed_rewards)
-    plt.title(f'Smoothed Rewards (Window Size: {window_size})')
-    plt.xlabel('Episode')
-    plt.ylabel('Reward')
-    plt.axhline(y=195, color='r', linestyle='--', label='Solved Threshold')
-    plt.legend()
-    plt.grid(True)
+    window_size = min(100, max(10, len(rewards) // 4))  # Ensure minimum window size
+    if len(rewards) > window_size:
+        smoothed_rewards = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
+        plt.plot(range(window_size-1, len(rewards)), smoothed_rewards)
+        plt.title(f'Smoothed Rewards (Window Size: {window_size})')
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.axhline(y=cartpole_params['reward_threshold'], color='r', linestyle='--', label='Solved Threshold')
+        plt.legend()
+        plt.grid(True)
+    else:
+        plt.plot(rewards)
+        plt.title('Episode Rewards (Not enough data for smoothing)')
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.grid(True)
 
     # Plot validation rewards
     plt.subplot(2, 2, 3)
-    plt.plot(range(0, len(rewards), 10)[:len(validations)], validations)
-    plt.title('Validation Rewards')
-    plt.xlabel('Episode')
-    plt.ylabel('Average Reward')
-    plt.grid(True)
+    if validations:
+        validation_episodes = range(0, len(rewards), 10)[:len(validations)]
+        plt.plot(validation_episodes, validations)
+        plt.title('Validation Rewards')
+        plt.xlabel('Episode')
+        plt.ylabel('Average Reward')
+        plt.grid(True)
 
     # Plot losses
     plt.subplot(2, 2, 4)
-    plt.plot(losses)
-    plt.title('Training Loss')
-    plt.xlabel('Training Step')
-    plt.ylabel('Loss')
-    plt.yscale('log')  # Log scale for better visualization
-    plt.grid(True)
+    if losses:
+        plt.plot(losses)
+        plt.title('Training Loss')
+        plt.xlabel('Training Step')
+        plt.ylabel('Loss')
+        plt.yscale('log')  # Log scale for better visualization
+        plt.grid(True)
 
     plt.tight_layout()
 
@@ -448,46 +475,57 @@ if __name__ == "__main__":
     state_dim = env.observation_space.shape[0]  # 4 for CartPole
     action_dim = env.action_space.n  # 2 for CartPole
 
-    # Create Double DQN agent
+    # Create Double DQN agent using parameters from cartpole_params
     double_dqn_agent = DoubleDQNAgent(
         state_dim=state_dim,
         action_dim=action_dim,
-        gamma=0.99,  # Discount factor
-        epsilon=1.0,  # Start with full exploration
-        epsilon_min=0.01,  # Minimum exploration rate
-        epsilon_decay=0.995,  # Decay rate
-        buffer_size=10000,  # Replay buffer size
-        batch_size=64,  # Training batch size
-        target_update_freq=10  # Update target network every 10 episodes
+        gamma=cartpole_params['gamma'],
+        epsilon=cartpole_params['epsilon_start'],
+        epsilon_min=cartpole_params['epsilon_min'],
+        epsilon_decay=cartpole_params['epsilon_decay'],
+        buffer_size=cartpole_params['replay_buffer_size'],
+        batch_size=cartpole_params['batch_size'],
+        target_update_freq=cartpole_params['target_update_freq'],
+        learning_rate=cartpole_params['lr'],
+        optimizer=cartpole_params['optimizer']
     )
 
     # Train the agent
     print("Training Double DQN Agent on CartPole...")
+    print(f"Target: Average reward >= {cartpole_params['reward_threshold']} over 100 consecutive episodes")
+    
     rewards, lengths, validations, losses = train_agent(
         env=env,
         agent=double_dqn_agent,
-        num_episodes=300,  # Train for 300 episodes
-        max_steps=500,  # Maximum steps per episode
+        num_episodes=cartpole_params['num_episodes'],
+        max_steps=500,  # Maximum steps per episode for CartPole
+        early_stop=True
     )
 
     # Plot and save results
     plot_training_results(rewards, lengths, validations, losses)
 
     # Final evaluation
-    print("Final Evaluation:")
+    print("\nFinal Evaluation:")
     # Force greedy policy for final evaluation
     original_epsilon = double_dqn_agent.epsilon
     double_dqn_agent.epsilon = 0.0
-    final_reward = validate_agent(env, double_dqn_agent, num_episodes=20)
+    final_reward = validate_agent(env, double_dqn_agent, num_episodes=100)
     double_dqn_agent.epsilon = original_epsilon  # Restore epsilon
-    print(f"Double DQN average reward: {final_reward:.2f}")
+    
+    print(f"Double DQN average reward over 100 episodes: {final_reward:.2f}")
+    
+    if final_reward >= cartpole_params['reward_threshold']:
+        print("✅ Agent successfully solved CartPole-v1!")
+    else:
+        print("❌ Agent did not reach the solving threshold.")
 
-    # Save the model
+    # Save the final model
     model_path = f"{SAVE_PATH}double_dqn_cartpole_final.h5"
     double_dqn_agent.model.save(model_path)
     print(f"Model saved to {model_path}")
 
-    # Save checkpoint one last time
+    # Save final checkpoint
     double_dqn_agent.save_checkpoint(
         episode=len(rewards)-1,
         episode_rewards=rewards,
