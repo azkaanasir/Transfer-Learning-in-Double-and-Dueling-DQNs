@@ -1,0 +1,6 @@
+python main.py 
+python main.py --episodes 500 --seed 42 --render-every 0   # example
+python main.py --no-early-stop                             # disable early stop
+
+
+tensorboard --logdir runs --port 6006
