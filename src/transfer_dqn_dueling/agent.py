@@ -1,159 +1,233 @@
-"""Agent implementation that optionally uses a transfer model built from a pretrained CartPole model."""
-
+"""Transfer Dueling DQN Agent. Mirrors structure and API of DuelingDQNAgent."""
+import json
 import os
 import pickle
-import json
-from typing import Tuple, List, Optional
+import time
+from typing import List, Tuple
 
 import numpy as np
 from tensorflow import keras
 
-from models import build_dueling_model, build_transfer_dueling_model
+from models import build_dueling_model, DuelingCombineLayer, transfer_weights_from_source
 from replay_buffer import ReplayBuffer
-from config import BASE_SAVE_PATH, MODEL_LATEST, TARGET_MODEL_LATEST, REPLAY_BUFFER, METADATA, lunar_params
+from config import BASE_SAVE_PATH, MODEL_LATEST, TARGET_MODEL_LATEST, REPLAY_BUFFER, METADATA, SOURCE_MODEL, SOURCE_TARGET_MODEL, TRANSFER_OPTIONS
 
 
-class DuelingDQNAgent:
+class TransferDuelingDQNAgent:
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
-        params: dict,
-        pretrained_path: Optional[str] = None,
-        freeze_base: bool = True,
+        gamma: float = 0.99,
+        epsilon: float = 1.0,
+        epsilon_min: float = 0.01,
+        epsilon_decay: float = 0.995,
+        buffer_size: int = 10_000,
+        batch_size: int = 64,
+        target_update_freq: int = 10,
+        learning_rate: float = 1e-3,
+        # transfer options: leave default None to not change parameters
+        transfer_source_model_path: str = SOURCE_MODEL,
+        transfer_source_target_path: str = SOURCE_TARGET_MODEL,
+        transfer_options: dict = None,
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.params = params
+        self.gamma = gamma
 
-        self.gamma = params['gamma']
-        self.epsilon = params.get('epsilon_start', 1.0)
-        self.epsilon_min = params.get('epsilon_min', 0.01)
-        self.epsilon_decay = params.get('epsilon_decay', 0.995)
-        self.batch_size = params.get('batch_size', 64)
-        self.target_update_freq = params.get('target_update_freq', 1000)
+        # exploration
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+
+        # replay & learning
+        self.batch_size = batch_size
+        self.replay_buffer = ReplayBuffer(buffer_size)
+        self.loss_history: List[float] = []
+
+        # model & training bookkeeping
+        self.target_update_freq = target_update_freq
         self.update_counter = 0
-        self.learning_rate = params.get('lr', 1e-3)
 
-        # Build model: use transfer builder if pretrained_path provided
-        if pretrained_path:
-            self.model = build_transfer_dueling_model(
-                state_dim=state_dim,
-                action_dim=action_dim,
-                pretrained_path=pretrained_path,
-                freeze_base=freeze_base,
-                learning_rate=self.learning_rate
-            )
-        else:
-            self.model = build_dueling_model(state_dim, action_dim, learning_rate=self.learning_rate)
-
-        # Build target model and sync weights
-        self.target_model = build_dueling_model(state_dim, action_dim, learning_rate=self.learning_rate)
+        # build models (LunarLander shapes)
+        self.model = build_dueling_model(state_dim, action_dim, learning_rate)
+        self.target_model = build_dueling_model(state_dim, action_dim, learning_rate)
         self.update_target_network()
 
-        # replay buffer
-        self.replay_buffer = ReplayBuffer(params['replay_buffer_size'])
-        self.loss_history = []
-        self.reward_history = []
+        # transfer settings
+        self.transfer_source_model_path = transfer_source_model_path
+        self.transfer_source_target_path = transfer_source_target_path
+        self.transfer_options = transfer_options if transfer_options is not None else TRANSFER_OPTIONS.copy()
+
+        # Optionally perform weight transfer on initialization
+        if self.transfer_options.get('do_weight_transfer', False):
+            self.transfer_from_source(
+                source_model_path=self.transfer_source_model_path,
+                source_target_path=self.transfer_source_target_path,
+                partial_copy_first_dense=self.transfer_options.get('partial_copy_first_dense_on_shape_mismatch', True),
+                unfreeze_first_fc=self.transfer_options.get('unfreeze_first_fc', True),
+                unfreeze_last_n_fc=self.transfer_options.get('unfreeze_last_n_fc', 2),
+            )
 
     def update_target_network(self):
         self.target_model.set_weights(self.model.get_weights())
 
     def select_action(self, state: np.ndarray) -> int:
-        if np.random.rand() <= self.epsilon:
+        if np.random.rand() < self.epsilon:
             return int(np.random.randint(self.action_dim))
-        q = self.model.predict(state.reshape(1, -1).astype(np.float32), verbose=0)[0]
-        return int(np.argmax(q))
+        state = np.reshape(state, [1, self.state_dim])
+        q_values = self.model.predict(state, verbose=0)[0]
+        return int(np.argmax(q_values))
 
-    def train_step(self) -> float:
-        """Perform one update (sample a batch and train). Uses train_on_batch to avoid eager/fit differences."""
-        if self.replay_buffer.size() < self.batch_size:
+    def train(self) -> float:
+        if len(self.replay_buffer) < self.batch_size:
             return 0.0
 
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
 
-        # Double DQN target computation: choose action from online model, evaluate with target model
-        next_q_online = self.model.predict(next_states, verbose=0)
-        next_actions = np.argmax(next_q_online, axis=1)
-        next_q_target = self.target_model.predict(next_states, verbose=0)
-        target_vals = rewards + (1 - dones) * self.gamma * next_q_target[np.arange(len(next_actions)), next_actions]
+        next_q_values = self.target_model.predict(next_states, verbose=0)
+        max_next_q = np.max(next_q_values, axis=1)
+        target_q_values = rewards + (1 - dones) * self.gamma * max_next_q
 
-        q_curr = self.model.predict(states, verbose=0)
-        q_curr[np.arange(len(states)), actions] = target_vals
+        current_q = self.model.predict(states, verbose=0)
+        batch_indices = np.arange(len(states))
+        current_q[batch_indices, actions] = target_q_values
 
-        # Train using train_on_batch for stability and to avoid eager conversion issues
-        loss = self.model.train_on_batch(states, q_curr)
-        # train_on_batch returns [loss, metrics..] when compiled with metrics; adapt accordingly
-        if isinstance(loss, list) or isinstance(loss, tuple):
-            loss_value = float(loss[0])
-        else:
-            loss_value = float(loss)
-
-        self.loss_history.append(loss_value)
+        history = self.model.fit(states, current_q, verbose=0, batch_size=self.batch_size)
+        loss = float(history.history['loss'][0])
+        self.loss_history.append(loss)
 
         self.update_counter += 1
         if self.update_counter % self.target_update_freq == 0:
             self.update_target_network()
 
-        return loss_value
+        return loss
 
-    # persistence
+    # --- checkpointing -----------------------------------------------------
+    def save(self, filepath: str):
+        self.model.save(filepath)
+
+    def load(self, filepath: str):
+        # When loading models containing custom layers, supply custom_objects
+        self.model = keras.models.load_model(filepath, custom_objects={'DuelingCombineLayer': DuelingCombineLayer})
+        self.update_target_network()
+
     def save_checkpoint(self, episode: int, episode_rewards: List[float], episode_lengths: List[int], validation_rewards: List[float]):
         os.makedirs(BASE_SAVE_PATH, exist_ok=True)
+
         self.model.save(os.path.join(BASE_SAVE_PATH, MODEL_LATEST))
         self.target_model.save(os.path.join(BASE_SAVE_PATH, TARGET_MODEL_LATEST))
+
         with open(os.path.join(BASE_SAVE_PATH, REPLAY_BUFFER), 'wb') as f:
-            pickle.dump(self.replay_buffer.save_buffer(), f)
+            pickle.dump(list(self.replay_buffer.buffer), f)
 
         metadata = {
             'epsilon': self.epsilon,
-            'ep': episode,
+            'episode': episode,
             'episode_rewards': episode_rewards,
             'episode_lengths': episode_lengths,
             'validation_rewards': validation_rewards,
             'loss_history': self.loss_history,
             'update_counter': self.update_counter,
+            'timestamp': time.time()
         }
+
         with open(os.path.join(BASE_SAVE_PATH, METADATA), 'w') as f:
             json.dump(metadata, f)
 
+        print(f"Checkpoint saved at episode {episode}")
+
     def load_checkpoint(self) -> Tuple[bool, int, List[float], List[int], List[float]]:
-        model_path = os.path.join(BASE_SAVE_PATH, MODEL_LATEST)
-        meta_path = os.path.join(BASE_SAVE_PATH, METADATA)
-        if not (os.path.exists(model_path) and os.path.exists(meta_path)):
-            return False, 0, [], [], []
         try:
-            # load weights into model (compile=False then recompile) to avoid Keras3 string-deserialize issue
-            loaded = keras.models.load_model(model_path, compile=False)
-            self.model.set_weights(loaded.get_weights())
-            self.target_model.set_weights(loaded.get_weights())
-            # replay buffer
-            try:
-                with open(os.path.join(BASE_SAVE_PATH, REPLAY_BUFFER), 'rb') as f:
-                    data = pickle.load(f)
-                    self.replay_buffer.load_buffer(data)
-            except Exception:
-                pass
-            with open(meta_path, 'r') as f:
-                meta = json.load(f)
-            self.epsilon = meta.get('epsilon', self.epsilon)
-            self.loss_history = meta.get('loss_history', [])
-            ep = meta.get('ep', 0)
-            ep_rewards = meta.get('episode_rewards', [])
-            ep_lengths = meta.get('episode_lengths', [])
-            val_rewards = meta.get('validation_rewards', [])
-            return True, ep + 1, ep_rewards, ep_lengths, val_rewards
-        except Exception as e:
-            print('Failed to load checkpoint:', e)
+            self.model = keras.models.load_model(os.path.join(BASE_SAVE_PATH, MODEL_LATEST),
+                                                custom_objects={'DuelingCombineLayer': DuelingCombineLayer})
+            self.target_model = keras.models.load_model(os.path.join(BASE_SAVE_PATH, TARGET_MODEL_LATEST),
+                                                       custom_objects={'DuelingCombineLayer': DuelingCombineLayer})
+
+            with open(os.path.join(BASE_SAVE_PATH, REPLAY_BUFFER), 'rb') as f:
+                buffer_data = pickle.load(f)
+                self.replay_buffer.load_buffer(buffer_data)
+
+            with open(os.path.join(BASE_SAVE_PATH, METADATA), 'r') as f:
+                metadata = json.load(f)
+
+            self.epsilon = metadata.get('epsilon', self.epsilon)
+            self.update_counter = metadata.get('update_counter', 0)
+            self.loss_history = metadata.get('loss_history', [])
+
+            episode = metadata.get('episode', 0)
+            episode_rewards = metadata.get('episode_rewards', [])
+            episode_lengths = metadata.get('episode_lengths', [])
+            validation_rewards = metadata.get('validation_rewards', [])
+
+            print(f"Loaded checkpoint from episode {episode}")
+            return True, episode + 1, episode_rewards, episode_lengths, validation_rewards
+
+        except (FileNotFoundError, OSError, IOError) as e:
+            print(f"No checkpoint found or error loading checkpoint: {e}")
+            print("Starting training from scratch.")
             return False, 0, [], [], []
 
-    def unfreeze_trunk_and_recompile(self):
-        """If you want to fine-tune the frozen trunk later: call this to unfreeze and recompile."""
-        for layer in self.model.layers:
-            if layer.name.startswith('trunk_dense_'):
-                layer.trainable = True
-        self.model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
-            loss=keras.losses.MeanSquaredError(),
-            metrics=[keras.metrics.MeanSquaredError()]
-        )
+    # --- transfer utilities -----------------------------------------------
+    def transfer_from_source(
+        self,
+        source_model_path: str,
+        source_target_path: str = None,
+        partial_copy_first_dense: bool = True,
+        unfreeze_first_fc: bool = True,
+        unfreeze_last_n_fc: int = 2,
+    ):
+        """Transfer weights from a saved source model into both main and target models, then set trainable flags."""
+
+        # Load source and copy weights into self.model
+        try:
+            transfer_weights_from_source(self.model, source_model_path, partial_copy_first_dense)
+            print(f"[transfer] Copied weights from {source_model_path} -> main model.")
+        except Exception as e:
+            print(f"[transfer] Failed to copy into main model: {e}")
+
+        # If a separate source target model exists, prefer that for copying into self.target_model
+        if source_target_path:
+            try:
+                transfer_weights_from_source(self.target_model, source_target_path, partial_copy_first_dense)
+                print(f"[transfer] Copied weights from {source_target_path} -> target model.")
+            except Exception as e:
+                print(f"[transfer] Failed to copy into target model from target file: {e}")
+                # fallback: copy from source model into target
+                try:
+                    transfer_weights_from_source(self.target_model, source_model_path, partial_copy_first_dense)
+                    print("[transfer] Fallback: copied source model into target model.")
+                except Exception as e2:
+                    print(f"[transfer] Fallback failed: {e2}")
+        else:
+            # No separate target model provided — copy same weights to the target network.
+            self.target_model.set_weights(self.model.get_weights())
+            print("[transfer] Set target model weights equal to main model.")
+
+        # Set trainable flags based on modular options:
+        dense_layers = [l for l in self.model.layers if isinstance(l, keras.layers.Dense)]
+        if not dense_layers:
+            print("[transfer] No dense layers found to set trainable flags.")
+            return
+
+        # Default: freeze all then selectively unfreeze
+        for l in dense_layers:
+            l.trainable = False
+
+        if unfreeze_first_fc and len(dense_layers) >= 1:
+            dense_layers[0].trainable = True
+
+        if unfreeze_last_n_fc and unfreeze_last_n_fc > 0:
+            for l in dense_layers[-unfreeze_last_n_fc:]:
+                l.trainable = True
+
+        # Apply same trainable settings to target_model's dense layers
+        target_dense_layers = [l for l in self.target_model.layers if isinstance(l, keras.layers.Dense)]
+        for i, l in enumerate(target_dense_layers):
+            try:
+                # Copy the trainable flag by index where possible
+                l.trainable = dense_layers[i].trainable if i < len(dense_layers) else False
+            except Exception:
+                l.trainable = False
+
+        print(f"[transfer] Trainable settings applied. First unfreeze: {unfreeze_first_fc}, last_n: {unfreeze_last_n_fc}")

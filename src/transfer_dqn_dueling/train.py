@@ -1,63 +1,99 @@
-"""Training loop that coordinates environment, agent, persistence, evaluation and TensorBoard logging."""
-import os
+"""Training loop, validation and TensorBoard logging utilities."""
+from typing import List, Tuple, Optional
 import datetime
-import matplotlib.pyplot as plt
+import os
+import time
+
 import numpy as np
-import gymnasium as gym
 import tensorflow as tf
 
-from config import lunar_params, BASE_SAVE_PATH, MODEL_LATEST, METADATA, TB_LOG_DIR, RESULTS_PNG, PRETRAINED_CARTPOLE_PATH
-from agent import DuelingDQNAgent
-from utils import load_training_state, save_training_state, save_gif, evaluate, set_gpu_growth
+from agent import TransferDuelingDQNAgent  # keeps compatibility with original agent API
+from config import TB_LOG_DIR as CONFIG_TB_LOG_DIR  # fallback if tb_log_dir not provided
+# from utils import plot_training_results  # kept for backward compatibility if needed
 
 
-def train_agent(pretrained_path: str = None, freeze_base: bool = True):
-    set_gpu_growth()
-    env = gym.make(lunar_params['env_id'])
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+def validate_agent(env, agent: TransferDuelingDQNAgent, num_episodes: int = 10) -> float:
+    """Run deterministic evaluation (greedy policy) and return average episode reward."""
+    total_rewards = []
+    for _ in range(num_episodes):
+        state, _ = env.reset()
+        episode_reward = 0.0
+        done = False
+        while not done:
+            state_tensor = np.reshape(state, [1, agent.state_dim])
+            q_values = agent.model.predict(state_tensor, verbose=0)[0]
+            action = int(np.argmax(q_values))
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            state = next_state
+            episode_reward += float(reward)
+        total_rewards.append(episode_reward)
+    return float(np.mean(total_rewards)) if total_rewards else 0.0
 
-    agent = DuelingDQNAgent(state_dim, action_dim, lunar_params, pretrained_path, freeze_base)
 
-    # resume state (from metadata file)
-    all_rewards, eval_scores, start_ep, loaded_eps = load_training_state(os.path.join(BASE_SAVE_PATH, METADATA))
-    if loaded_eps is not None:
-        agent.epsilon = loaded_eps
+def record_video(env, agent: TransferDuelingDQNAgent, video_path: str):
+    # Placeholder for HPC-safe environments where rendering isn't available.
+    print(f"[HPC] Skipping video recording. Would have saved to: {video_path}")
 
-    # try checkpoint from agent-level checkpoint
-    ckpt_loaded, ckpt_ep, ep_rewards, ep_lengths, val_rewards = agent.load_checkpoint()
-    if ckpt_loaded:
-        print(f"Loaded checkpoint from episode {ckpt_ep-1}; resuming at {ckpt_ep}")
-        start_ep = max(start_ep, ckpt_ep)
-        # merge loaded histories if present
-        if ep_rewards:
-            all_rewards = ep_rewards
-        if val_rewards:
-            eval_scores = val_rewards
 
-    best_score = max(eval_scores) if eval_scores else -np.inf
+def _safe_timestamp_for_path() -> str:
+    # Filesystem safe timestamp (no colons).
+    return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    num_episodes = lunar_params['num_episodes']
-    max_steps = lunar_params.get('max_steps', 500)
 
-    # TensorBoard setup
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    logdir = os.path.join(TB_LOG_DIR, timestamp)
+def train_agent(
+    env,
+    agent: TransferDuelingDQNAgent,
+    num_episodes: int = 200,
+    max_steps: int = 500,
+    render_every: int = 50,
+    early_stop: bool = True,
+    tb_log_dir: Optional[str] = None,
+) -> Tuple[List[float], List[int], List[float], List[float]]:
+    """
+    Train loop compatible with both the original DuelingDQNAgent and the TransferDuelingDQNAgent.
+    - tb_log_dir: optional override for TensorBoard logs; if None the module-level config TB_LOG_DIR is used.
+    Returns: (episode_rewards, episode_lengths, validation_rewards, loss_history)
+    """
+    episode_rewards: List[float] = []
+    episode_lengths: List[int] = []
+    validation_rewards: List[float] = []
+
+    # thresholds (kept locally so signature/behavior stays identical)
+    solved_threshold = 195
+    consecutive_solves = 0
+    required_solves = 5
+
+    # TensorBoard writer (allow override so transfer_main can pass its own TB path)
+    base_logdir = tb_log_dir or CONFIG_TB_LOG_DIR
+    logdir = os.path.join(base_logdir, _safe_timestamp_for_path())
     os.makedirs(logdir, exist_ok=True)
     writer = tf.summary.create_file_writer(logdir)
+
+    # Try to resume training if checkpoint exists
+    checkpoint_loaded, start_episode, ep_rewards, ep_lengths, val_rewards = agent.load_checkpoint()
+
+    if checkpoint_loaded:
+        print(f"Resuming from episode {start_episode}")
+        episode_rewards = ep_rewards
+        episode_lengths = ep_lengths
+        validation_rewards = val_rewards
+    else:
+        start_episode = 0
+
     global_train_step = 0
 
-    for ep in range(start_ep, num_episodes):
+    for episode in range(start_episode, num_episodes):
         state, _ = env.reset()
-        total_reward = 0.0
+        episode_reward = 0.0
 
         for step in range(max_steps):
             action = agent.select_action(state)
-            next_state, reward, term, trunc, _ = env.step(action)
-            done = term or trunc
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
 
             agent.replay_buffer.add(state, action, reward, next_state, done)
-            loss = agent.train_step()
+            loss = agent.train()
 
             # Log training loss per training step to TensorBoard
             if loss and loss != 0.0:
@@ -66,83 +102,64 @@ def train_agent(pretrained_path: str = None, freeze_base: bool = True):
                 global_train_step += 1
 
             state = next_state
-            total_reward += float(reward)
+            episode_reward += float(reward)
 
             if done:
                 break
 
-        all_rewards.append(total_reward)
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(step + 1)
 
-        # Log episode-level metrics
+        # Log episode-level metrics (episode index is consistent whether resuming or fresh)
         with writer.as_default():
-            tf.summary.scalar('episode/reward', total_reward, step=ep)
-            tf.summary.scalar('episode/length', step + 1, step=ep)
-            tf.summary.scalar('agent/epsilon', agent.epsilon, step=ep)
+            tf.summary.scalar('episode/reward', episode_reward, step=episode)
+            tf.summary.scalar('episode/length', step + 1, step=episode)
+            tf.summary.scalar('agent/epsilon', agent.epsilon, step=episode)
 
-        # Validation & logging every save interval
-        if ep % lunar_params['save_interval_episodes'] == 0:
-            original_epsilon = agent.epsilon
-            agent.epsilon = 0.0
-            val_score = evaluate(agent, env, episodes=lunar_params.get('eval_episodes', 3))
-            agent.epsilon = original_epsilon
+        # Validation & logging every 10 episodes
+        if episode % 10 == 0:
+            # Epsilon decay applied on validation cadence (keeps behaviour from previous code)
+            if agent.epsilon > agent.epsilon_min:
+                agent.epsilon = max(agent.epsilon_min, agent.epsilon * agent.epsilon_decay)
 
-            eval_scores.append(val_score)
-            print(f"Episode {ep}/{num_episodes}, Reward: {total_reward:.2f}, Validation: {val_score:.2f}, Epsilon: {agent.epsilon:.3f}")
+            val_reward = validate_agent(env, agent, num_episodes=5)
+            validation_rewards.append(val_reward)
+
+            print(f"Episode {episode}/{num_episodes}, Reward: {episode_reward:.2f}, Validation: {val_reward:.2f}, Epsilon: {agent.epsilon:.3f}")
 
             # Log validation metric
             with writer.as_default():
-                tf.summary.scalar('validation/avg_reward', val_score, step=ep)
+                tf.summary.scalar('validation/avg_reward', val_reward, step=episode)
 
-            if val_score > best_score:
-                best_score = val_score
-                agent.save_checkpoint(ep, all_rewards, [], eval_scores)
-                print("New best model saved.")
-
-            save_training_state(os.path.join(BASE_SAVE_PATH, METADATA), all_rewards, eval_scores, ep + 1, agent.epsilon)
-
+            # Early stopping condition (requires consecutive validation solves)
+            if early_stop and val_reward >= solved_threshold:
+                consecutive_solves += 1
+                if consecutive_solves >= required_solves:
+                    print(f"Environment solved in {episode} episodes! Avg validation reward: {val_reward:.2f}")
+                    agent.save_checkpoint(episode, episode_rewards, episode_lengths, validation_rewards)
+                    break
+            else:
+                consecutive_solves = 0
         else:
-            print(f"Episode {ep} | Train: {total_reward:.2f} | Eps: {agent.epsilon:.3f}")
+            print(f"Episode {episode}/{num_episodes}, Reward: {episode_reward:.2f}, Epsilon: {agent.epsilon:.3f}")
 
-        # save GIF every 100 episodes
-        if ep % 100 == 0 and ep > 0 and 'gif' in lunar_params.get('video_format', []):
-            save_gif(agent, os.path.join(BASE_SAVE_PATH, f'episode_{ep}.gif'))
+        # Optional recording
+        if render_every and episode % render_every == 0:
+            record_video(env, agent, f"dueling_episode_{episode}.mp4")
 
-        # early stop when solved (mean of last 100)
-        if len(all_rewards) >= 100 and np.mean(all_rewards[-100:]) >= lunar_params['reward_threshold']:
-            print(f"Environment solved at episode {ep}!")
-            if 'gif' in lunar_params.get('video_format', []):
-                save_gif(agent, os.path.join(BASE_SAVE_PATH, f'solved_at_{ep}.gif'))
-            break
+        # Periodic checkpoint save (every 10 episodes; mirrors previous behaviour)
+        if episode % 10 == 9:
+            agent.save_checkpoint(episode, episode_rewards, episode_lengths, validation_rewards)
 
-        # Decay epsilon ONCE per episode (safer)
-        if agent.epsilon > agent.epsilon_min:
-            agent.epsilon = max(agent.epsilon_min, agent.epsilon * agent.epsilon_decay)
+    # Final checkpoint/save at the end of training (if not saved by early stop)
+    try:
+        agent.save_checkpoint(episode, episode_rewards, episode_lengths, validation_rewards)
+    except Exception:
+        # Avoid crashing at the end if filesystem is readonly, etc.
+        print("Warning: failed to save final checkpoint.")
 
-        # periodic checkpoint save (end of block to include last step)
-        if ep % lunar_params['save_interval_episodes'] == lunar_params['save_interval_episodes'] - 1:
-            agent.save_checkpoint(ep, all_rewards, [], eval_scores)
-
-    # final saves
-    agent.save_checkpoint(ep, all_rewards, [], eval_scores)
-    agent.save(os.path.join(BASE_SAVE_PATH, 'final_model.h5'))
-    if 'gif' in lunar_params.get('video_format', []):
-        save_gif(agent, os.path.join(BASE_SAVE_PATH, 'final.gif'))
-
+    # Flush and close writer
     writer.flush()
     writer.close()
 
-    # Save plot (best-effort)
-    # try:
-    #     plt.plot(all_rewards, label='Train Rewards')
-    #     if eval_scores:
-    #         plt.plot(np.arange(0, len(eval_scores)) * lunar_params['save_interval_episodes'], eval_scores, label='Eval Scores')
-    #     plt.axhline(y=lunar_params['reward_threshold'], linestyle='--', label='Solved Threshold')
-    #     plt.legend()
-    #     plt.title('Dueling DQN — Training Progress')
-    #     plt.xlabel('Episode'); plt.ylabel('Reward'); plt.grid(True)
-    #     plt.tight_layout()
-    #     plt.savefig(os.path.join(BASE_SAVE_PATH, RESULTS_PNG))
-    # except Exception as e:
-    #     print("Failed to save training plot:", e)
-
-    return all_rewards, None, eval_scores, agent.loss_history
+    return episode_rewards, episode_lengths, validation_rewards, agent.loss_history

@@ -8,6 +8,8 @@ from typing import List, Tuple, Optional
 import imageio
 import numpy as np
 import gymnasium as gym
+import random
+
 
 # NOTE: import tensorflow inside functions to avoid early-side-effects at import time
 def set_gpu_growth():
@@ -126,3 +128,41 @@ def evaluate(agent, env, episodes: int = 3) -> float:
     if not scores:
         return 0.0
     return float(np.mean(scores))
+
+
+
+def set_global_seed(seed: int = 42, deterministic: bool = False):
+    """
+    Set global random seeds for reproducibility.
+    
+    Args:
+        seed (int): The random seed value.
+        deterministic (bool): If True, tries to make computations deterministic.
+    """
+    # Python random
+    random.seed(seed)
+
+    # NumPy
+    np.random.seed(seed)
+
+    # TensorFlow
+    try:
+        import tensorflow as tf
+        tf.random.set_seed(seed)
+        if deterministic:
+            if hasattr(tf.config.experimental, "enable_op_determinism"):
+                tf.config.experimental.enable_op_determinism()
+    except ImportError:
+        pass
+
+    # PyTorch
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        if deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
+
