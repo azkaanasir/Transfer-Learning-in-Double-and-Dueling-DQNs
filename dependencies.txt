@@ -4,3 +4,6 @@ numpy
 tensorflow
 tensorboard
 tensorflow[and-cuda]
+imageio
+swig
+gymnasium[box2d]

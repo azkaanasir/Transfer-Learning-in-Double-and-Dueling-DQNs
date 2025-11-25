@@ -11,7 +11,7 @@ TARGET_MODEL_LATEST = 'dueling_target_model.h5'
 REPLAY_BUFFER = 'replay_buffer.pkl'
 METADATA = 'training_metadata.json'
 RESULTS_PNG = 'dueling_lunarlander_results.png'
-TB_LOG_DIR = "logs/lunarlander_dqn_dueling"
+TB_LOG_DIR = "logs/transfer_dqn_dueling"
 
 # Source (CartPole) model location: assumes you used original BASE_SAVE_PATH
 SOURCE_BASE = os.path.join('.', 'models', 'dueling_dqn_cartpole')

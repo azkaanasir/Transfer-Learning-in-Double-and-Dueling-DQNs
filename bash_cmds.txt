@@ -1,0 +1,13 @@
+source grp05_venv/bin/activate
+
+tensorboard --logdir logs --port 6006
+
+# lunarlander_dqn_dueling
+python main.py --episodes 500 --seed 0 --render-every 0 --no-early-stop
+trained = yes
+ueling DQN average reward: -66.23
+
+# cartpole_dqn_dueling
+python main.py --episodes 500 --seed 0 --render-every 0 --no-early-stop
+trained = yes
+Dueling DQN average reward: 154.85
