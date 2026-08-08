@@ -1,0 +1,20 @@
+# Pinned environment for the Phase 1 2x2 sweep.
+# Addresses IJCNN R4's reproducibility ask (REVIEW_REPORT.md P1-9): the original
+# repo shipped only an unpinned dependencies.txt.
+#
+# On Colab, TensorFlow is preinstalled -- install only the Box2D stack:
+#     pip install 'gymnasium[box2d]' swig
+# Locally, substitute `tensorflow` for `tensorflow_cpu` if you want GPU support.
+
+tensorflow_cpu==2.21.0
+keras==3.15.1
+gymnasium==1.2.3
+Box2D==2.3.10
+pygame==2.6.1
+numpy==2.4.0
+scipy==1.17.1
+pandas==3.0.3
+h5py==3.14.0
+
+# Only needed to re-read the archived TensorBoard logs (analysis/extract_logs.py)
+tensorboard==2.20.0
