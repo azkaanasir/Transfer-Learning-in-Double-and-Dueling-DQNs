@@ -1,1 +1,10 @@
 grp05_venv/
+
+# analysis working files (regenerable: python analysis/extract_logs.py)
+analysis/_logs/
+analysis/_out/
+
+# experiment outputs (regenerable: python experiments/sweep.py)
+runs/
+__pycache__/
+*.pyc
