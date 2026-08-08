@@ -8,3 +8,9 @@ analysis/_out/
 runs/
 __pycache__/
 *.pyc
+
+# Local working state -- deliberately never pushed.
+# This repo is public and the manuscript is under review at ICANN, so the
+# reviewer PDFs and the internal audit must not be published from here.
+paper/
+memory/
