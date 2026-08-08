@@ -98,7 +98,9 @@ def main(argv=None) -> int:
                    help='which stage to run; transfer requires source done')
     p.add_argument('--archs', nargs='+', default=None, choices=list(ARCHS))
     p.add_argument('--rules', nargs='+', default=None, choices=list(RULES))
-    p.add_argument('--episodes', type=int, default=500)
+    p.add_argument('--episodes', type=int, default=1000,
+                   help='1000, not the manuscript 500: epsilon does not floor '
+                        'until ~ep 891, so 500 measures arms mid-exploration')
     p.add_argument('--lr', type=float, default=5e-4,
                    help='shared by every arm -- this is the control claim')
     p.add_argument('--freeze-episodes', type=int, default=100)

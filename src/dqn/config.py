@@ -36,7 +36,15 @@ class Config:
     seed: int = 0
 
     # ---- shared by every arm; do not vary these per-arm ------------------
-    num_episodes: int = 500
+    # 1000, not the manuscript's 500. Under the epsilon schedule below,
+    # epsilon does not reach its 0.01 floor until episode ~891, so a
+    # 500-episode budget measures every arm mid-exploration. A pilot run
+    # confirmed this: at episode 500 a CartPole source sits near 150 and is
+    # still climbing; by episode 1000 it solves the task (final-100 mean 396,
+    # greedy evaluation pinned at the 500 cap). Running to 1000 also answers
+    # IJCNN R3 / ROADMAP item 4.3 -- whether Dueling stabilises with longer
+    # training -- without a separate experiment.
+    num_episodes: int = 1000
     max_steps: int = 1000
     lr: float = 5e-4
     gamma: float = 0.99
