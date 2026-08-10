@@ -24,6 +24,7 @@ import argparse
 import itertools
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -88,6 +89,78 @@ def build_jobs(seeds, stage, out_root, episodes, lr, freeze_episodes,
     return jobs
 
 
+def shard(seeds: list[int], n: int) -> list[list[int]]:
+    """Split seeds into n contiguous groups, dropping empties."""
+    n = max(1, min(n, len(seeds)))
+    per = -(-len(seeds) // n)          # ceiling division
+    groups = [seeds[i:i + per] for i in range(0, len(seeds), per)]
+    return [g for g in groups if g]
+
+
+def run_sharded(args, seeds: list[int]) -> int:
+    """Fan the sweep out across worker processes, one seed group each.
+
+    Sharding by *seed* is what makes this safe: a transfer run loads the source
+    checkpoint for its own cell and seed, and build_jobs emits
+    source -> baseline -> transfer adjacently per seed, so each group is
+    self-contained and no worker depends on another's output.
+
+    Workers are separate interpreters rather than forks -- TensorFlow does not
+    survive forking, and Windows has no fork at all. Each worker is capped to a
+    couple of threads: left unpinned, every TF process tries to claim all cores
+    and they thrash, which costs more than the parallelism gains.
+    """
+    groups = shard(seeds, args.jobs)
+    threads = max(1, (os.cpu_count() or 4) // len(groups))
+    log_dir = os.path.join(args.out_root, '_logs')
+    os.makedirs(log_dir, exist_ok=True)
+
+    env = dict(os.environ)
+    env.update(OMP_NUM_THREADS=str(threads),
+               TF_NUM_INTRAOP_THREADS=str(threads),
+               TF_NUM_INTEROP_THREADS='1',
+               TF_CPP_MIN_LOG_LEVEL='2')
+
+    print(f'{len(groups)} workers x {threads} threads each')
+    procs = []
+    for i, group in enumerate(groups):
+        spec = f'{group[0]}-{group[-1]}' if len(group) > 1 else str(group[0])
+        cmd = [sys.executable, os.path.abspath(__file__),
+               '--seeds', spec, '--stage', args.stage,
+               '--episodes', str(args.episodes), '--lr', str(args.lr),
+               '--freeze-episodes', str(args.freeze_episodes),
+               '--out-root', args.out_root, '--jobs', '1']
+        if args.archs:
+            cmd += ['--archs', *args.archs]
+        if args.rules:
+            cmd += ['--rules', *args.rules]
+        if args.force:
+            cmd += ['--force']
+        path = os.path.join(log_dir, f'shard{i}_seeds{spec}.log')
+        fh = open(path, 'w', encoding='utf-8')
+        procs.append((subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
+                                       env=env), fh, spec, path))
+        print(f'  worker {i}: seeds {spec:6s} -> {path}')
+
+    print('\nWaiting. Tail any shard log to follow progress.')
+    failed = []
+    for proc, fh, spec, path in procs:
+        code = proc.wait()
+        fh.close()
+        status = 'ok' if code == 0 else f'FAILED (exit {code})'
+        print(f'  seeds {spec:6s}: {status}')
+        if code != 0:
+            failed.append((spec, path))
+
+    if failed:
+        print('\nFailed shards -- inspect their logs:')
+        for spec, path in failed:
+            print(f'  seeds {spec}: {path}')
+        return 1
+    print('\nAll shards complete. Next: experiments/aggregate.py')
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -105,6 +178,9 @@ def main(argv=None) -> int:
                    help='shared by every arm -- this is the control claim')
     p.add_argument('--freeze-episodes', type=int, default=100)
     p.add_argument('--out-root', default='runs')
+    p.add_argument('--jobs', type=int, default=1,
+                   help='parallel worker processes, sharded by seed '
+                        '(default 1). Wall-clock is roughly total/jobs.')
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--force', action='store_true',
                    help='re-run even if a completed manifest exists')
@@ -126,6 +202,13 @@ def main(argv=None) -> int:
         for stage, cfg in pending:
             print(f'  [{stage:8s}] {cfg.run_id():34s} {cfg.env_id}')
         return 0
+
+    if not pending:
+        print('Nothing to do.')
+        return 0
+
+    if args.jobs > 1 and len(seeds) > 1:
+        return run_sharded(args, seeds)
 
     started = time.time()
     for i, (stage, cfg) in enumerate(pending, 1):
