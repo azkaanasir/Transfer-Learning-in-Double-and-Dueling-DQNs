@@ -63,7 +63,6 @@ that module pins are the interface. Output is the twelve sections of
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -83,7 +82,7 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from experiments import registry                                  # noqa: E402
-from src.dqn import envs                                          # noqa: E402
+from src.dqn import envs, provenance                              # noqa: E402
 
 # ===========================================================================
 # 1. Pre-registered constants. These are read from `ANALYSIS_PLAN.md`, not
@@ -154,6 +153,52 @@ MDE_MULTIPLIERS: dict[tuple[str, str], float] = {
     ('unpaired', 'nominal'): 1.39,
     ('unpaired', 'holm8'): 1.87,
 }
+
+#: Where the multipliers came from, printed with the power table.
+MDE_SOURCE = 'ANALYSIS_PLAN.md §6.2 (pre-registered, transcribed here)'
+
+
+def _adopt_statlib_mde() -> None:
+    """Prefer `statlib`'s MDE table when that module exists, but verify it.
+
+    `statlib.py` derives the multipliers from the exact null distribution, so it
+    is the better source than a transcription. It is imported softly because
+    this module must run without it, and the values are checked against the
+    pre-registered ones rather than trusted: `ANALYSIS_PLAN.md` §6.4 forbids
+    re-tuning the power table after seeing results, so a statlib table that
+    disagreed with §6.2 would be a plan violation arriving through an import.
+    A disagreement therefore keeps the pre-registered numbers and says so.
+    """
+    global MDE_SOURCE
+    try:
+        from experiments import statlib          # type: ignore  # noqa: PLC0415
+    except Exception:                            # noqa: BLE001
+        return
+    table_ = getattr(statlib, 'MDE_MULTIPLIERS', None)
+    if not isinstance(table_, dict):
+        return
+    disagree = []
+    for key, planned in MDE_MULTIPLIERS.items():
+        got = table_.get(key)
+        if got is None:
+            disagree.append(f'{key}: absent from statlib')
+        elif abs(float(got) - planned) > 0.01:
+            disagree.append(f'{key}: statlib {float(got):.3f} vs '
+                            f'pre-registered {planned:.3f}')
+    if disagree:
+        MDE_SOURCE = ('ANALYSIS_PLAN.md §6.2 (pre-registered). statlib.py '
+                      'disagrees and was NOT adopted: ' + '; '.join(disagree)
+                      + '. ANALYSIS_PLAN.md §6.4 forbids re-tuning the power '
+                        'table, so the pre-registered values stand and the '
+                        'disagreement is reported')
+        return
+    MDE_MULTIPLIERS.update({k: float(v) for k, v in table_.items()
+                            if k in MDE_MULTIPLIERS})
+    MDE_SOURCE = ('statlib.MDE_MULTIPLIERS, verified equal to '
+                  'ANALYSIS_PLAN.md §6.2')
+
+
+_adopt_statlib_mde()
 
 #: `ANALYSIS_PLAN.md` §6.3, the planning inputs. Reported next to the observed
 #: SDs, per the §6.4 update rule, so the reader can see whether the pilot's
@@ -265,10 +310,10 @@ def require_confirmatory(name: str) -> None:
         return
     raise MetricRoleError(
         f'{name!r} has declared role {role!r}; ANALYSIS_PLAN.md §1 permits a '
-        f'confirmatory test only on the co-primary endpoints '
+        'confirmatory test only on the co-primary endpoints '
         f'{list(CONFIRMATORY_ENDPOINTS)}. Refusing. '
-        f'(This is the mechanical fix for the published §V.A/§V.B '
-        f'contradiction: a t-test on a metric §V.B called descriptive-only.)')
+        '(This is the mechanical fix for the published §V.A/§V.B '
+        'contradiction: a t-test on a metric §V.B called descriptive-only.)')
 
 
 # ===========================================================================
@@ -624,7 +669,6 @@ def logrank_statistic(t1, e1, t2, e2) -> dict:
     """
     t1 = np.asarray(list(t1), float); e1 = np.asarray(list(e1), bool)
     t2 = np.asarray(list(t2), float); e2 = np.asarray(list(e2), bool)
-    n1, n2 = len(t1), len(t2)
     if min(int(e1.sum()), int(e2.sum())) < LOGRANK_MIN_EVENTS:
         return {'statistic': None, 'df': 1, 'events': (int(e1.sum()),
                                                        int(e2.sum())),
@@ -676,8 +720,24 @@ def phrase_direction(value: float, subject: str, reference: str,
 def phrase_dispersion(name_a: str, sd_a: float, name_b: str,
                       sd_b: float) -> str:
     """Spread comparison; the word comes from the ratio, never from a guess."""
-    if not (np.isfinite(sd_a) and np.isfinite(sd_b)) or sd_b <= 0:
+    if not (np.isfinite(sd_a) and np.isfinite(sd_b)):
         return f'{name_a} vs {name_b}: dispersion ratio not estimable'
+    # Either spread being zero makes the ratio undefined in one direction or the
+    # other, and a degenerate spread is a real situation rather than an error:
+    # it is what a single seed gives, and what identical seeds would give. The
+    # published paper's dispersion narrative was wrong in its *direction*, so
+    # the failure mode to avoid here is inventing a word for a ratio that does
+    # not exist -- not crashing, and not silently printing a direction.
+    if sd_a <= 0 and sd_b <= 0:
+        return (f'{name_a} and {name_b} both have zero across-seed spread; '
+                f'no dispersion comparison is defined')
+    if sd_b <= 0:
+        return (f'{name_b} has zero across-seed spread, so the ratio to '
+                f'{name_a} (SD {sd_a:.4f}) is undefined')
+    if sd_a <= 0:
+        return (f'{name_a} has zero across-seed spread against {name_b} '
+                f'(SD {sd_b:.4f}); the ratio is zero and no multiplier is '
+                f'reportable')
     ratio = sd_a / sd_b
     if abs(ratio - 1.0) <= 1e-9:
         return (f'{name_a} and {name_b} have the same across-seed spread '
@@ -771,14 +831,16 @@ REQUIRED_COLUMNS: tuple[str, ...] = (
 CELL_ORDER: tuple[str, ...] = tuple(f'{a}-{r}' for a, r in registry.CELLS)
 
 
-def file_md5(path: str) -> Optional[str]:
-    if not os.path.exists(path):
-        return None
-    h = hashlib.md5()
-    with open(path, 'rb') as fh:
-        for chunk in iter(lambda: fh.read(65536), b''):
-            h.update(chunk)
-    return h.hexdigest()
+def file_digest(path: str) -> Optional[str]:
+    """Content hash, using the SAME function that wrote the manifests.
+
+    This is `src.dqn.provenance.file_hash` (blake2b-16), not a local choice. It
+    has to be: the plan hash in a manifest is compared against the current file
+    here, and a comparison between two different hash functions would report a
+    changed pre-registration on every single invocation -- a warning that always
+    fires is a warning nobody reads.
+    """
+    return provenance.file_hash(path)
 
 
 @dataclass
@@ -791,6 +853,9 @@ class Ledger:
 
     confirmatory: list[str] = field(default_factory=list)
     suppressed: list[str] = field(default_factory=list)
+    #: Suppressions outside the confirmatory family. Kept apart so the family's
+    #: own count of 8 is never inflated by an unrelated arm being too small.
+    other_suppressed: list[str] = field(default_factory=list)
     screen_q: list[str] = field(default_factory=list)
     estimation: list[str] = field(default_factory=list)
     refusals: list[str] = field(default_factory=list)
@@ -822,15 +887,15 @@ def load_per_seed(path: str, ledger: Ledger) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(
             f'{path} not found. Run `python experiments/aggregate.py` first; '
-            f'this module never recomputes a per-run scalar itself, so that no '
-            f'number in the paper has two definitions.')
+            'this module never recomputes a per-run scalar itself, so that no '
+            'number in the paper has two definitions.')
     df = pd.read_csv(path)
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(
             f'{path} is missing pinned columns {missing}. The per-seed schema '
-            f'is a contract between aggregate.py and this module; refusing to '
-            f'guess a substitute.')
+            'is a contract between aggregate.py and this module; refusing to '
+            'guess a substitute.')
     truth = {True: True, False: False, 'True': True, 'False': False,
              'true': True, 'false': False, 1: True, 0: False}
     for col in ('source_valid', 'metrics_contiguous', 'freeze_verified',
@@ -844,7 +909,7 @@ def load_per_seed(path: str, ledger: Ledger) -> pd.DataFrame:
     if absent:
         ledger.deviations.append(
             f'per_seed.csv lacks optional columns {absent}; the sections that '
-            f'need them report as unavailable rather than approximating them')
+            'need them report as unavailable rather than approximating them')
     return df
 
 
@@ -1022,14 +1087,20 @@ def section_provenance(df: pd.DataFrame, opts: Options,
     rather than left for a reader to notice.
     """
     h1('1. PROVENANCE AND PLAN HASH')
-    current = file_md5(PLAN_FILE)
-    design = file_md5(DESIGN_FILE)
+    plans = provenance.plan_hashes()
+    current = plans.get('ANALYSIS_PLAN.md')
+    design = plans.get('DESIGN.md')
     hashes = sorted(set(str(v) for v in df['plan_hash'].dropna().unique()))
     print(f'  per-seed table       : {opts.per_seed}')
-    print(f'  table md5            : {file_md5(opts.per_seed)}')
+    print(f'  table digest         : {file_digest(opts.per_seed)}')
     print(f'  rows                 : {len(df)}')
-    print(f'  ANALYSIS_PLAN.md md5 : {current}   (current file)')
-    print(f'  DESIGN.md md5        : {design}')
+    print(f'  ANALYSIS_PLAN.md     : {current}   (current file)')
+    print(f'  DESIGN.md            : {design}')
+    print(f'  reference_returns    : {plans.get("reference_returns.json")}')
+    print('  hash function        : blake2b-16, the one src/dqn/provenance.py '
+          'used to write')
+    print('                         the manifests, so the comparison below is '
+          'like for like')
     print(f'  plan hash in data    : {", ".join(hashes) or "(absent)"}')
     for col, name in (('git_commit', 'git commit'), ('git_dirty', 'git dirty')):
         if col in df.columns:
@@ -1060,8 +1131,9 @@ def section_provenance(df: pd.DataFrame, opts: Options,
     else:
         print()
         print('  Plan hash matches: the pre-registration covers this analysis.')
-    return {'plan_md5_current': current, 'design_md5': design,
-            'plan_md5_in_data': hashes, 'table_md5': file_md5(opts.per_seed),
+    return {'plan_hash_current': current, 'design_hash': design,
+            'plan_hash_in_data': hashes,
+            'table_digest': file_digest(opts.per_seed),
             'rows': int(len(df)), 'exploratory': exploratory,
             'n_boot': opts.n_boot, 'boot_seed': opts.boot_seed}
 
@@ -1112,10 +1184,23 @@ def section_inventory(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
         if set(ss) != set(ts):
             ledger.deviations.append(
                 f'{cell}: scratch and transfer seed sets differ; the arm is '
-                f'incomplete and DESIGN.md §8.4 refuses a partial arm')
+                'incomplete and DESIGN.md §8.4 refuses a partial arm')
     print(table(comp, ('cell', 'n_scratch', 'n_transfer', 'paired_seeds',
                        'scratch_only', 'transfer_only', 'transfer_labels')))
     out['completeness'] = comp
+    smallest = min((c['paired_seeds'] for c in comp), default=0)
+    if smallest < MIN_N_FOR_INFERENCE:
+        print()
+        print('  ' + '*' * 70)
+        print(f'  {VALIDATION_STAMP}')
+        print(f'  The smallest paired sample in the confirmatory contrast is '
+              f'n={smallest}, below the')
+        print(f'  floor of {MIN_N_FOR_INFERENCE}. This banner is printed here, '
+              'at the top of the report, as well as')
+        print('  at the end, so that no reader reaches a table before reaching '
+              'the warning.')
+        print('  ' + '*' * 70)
+    out['smallest_paired_n'] = smallest
 
     h2('2c. seed blocks')
     blk = []
@@ -1127,16 +1212,16 @@ def section_inventory(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
     tune = df[df['seed_block'] == 'TUNE']
     if len(tune):
         print(f'  REFUSAL: {len(tune)} run(s) sit in the TUNE block. '
-              f'ANALYSIS_PLAN.md §8 forbids any reported estimate computed on '
-              f'TUNE seeds (selection leakage). They are excluded from every '
-              f'estimate below.')
+              'ANALYSIS_PLAN.md §8 forbids any reported estimate computed on '
+              'TUNE seeds (selection leakage). They are excluded from every '
+              'estimate below.')
         ledger.refusals.append(f'{len(tune)} TUNE-block runs excluded from all '
-                               f'estimates (selection leakage)')
+                               'estimates (selection leakage)')
     donors = df[df['seed_block'].isin(SOURCE_ONLY_BLOCKS)]
     if len(donors):
         print(f'  {len(donors)} run(s) sit in a source-only block '
               f'{list(SOURCE_ONLY_BLOCKS)}. DESIGN.md §3.4 bars C4SRC from '
-              f'target-side estimation and')
+              'target-side estimation and')
         print('  reserves RESERVE for replacement sources, so they are '
               'excluded from every')
         print('  target-side arm. They are scratch runs on the target '
@@ -1150,9 +1235,9 @@ def section_inventory(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
     unknown = df[df['seed_block'].fillna('UNKNOWN') == 'UNKNOWN']
     if len(unknown):
         print(f'  {len(unknown)} run(s) have no recognised seed block; their '
-              f'provenance in the block scheme of DESIGN.md §3.4 is unstated.')
+              'provenance in the block scheme of DESIGN.md §3.4 is unstated.')
         ledger.deviations.append(f'{len(unknown)} run(s) in no declared seed '
-                                 f'block')
+                                 'block')
     out['seed_blocks'] = blk
 
     h2('2d. source validity (DESIGN.md §4.3: normalised gate >= '
@@ -1182,8 +1267,8 @@ def section_inventory(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
         n_inv = sum(r['invalid'] for r in srows)
         n_val = sum(r['valid'] for r in srows)
         print(f'  {n_val} valid source(s), {n_inv} rejected. Rejected source '
-              f'seeds are listed above, never dropped silently (DESIGN.md '
-              f'§4.3).')
+              'seeds are listed above, never dropped silently (DESIGN.md '
+              '§4.3).')
         if n_val == 0 and n_inv > 0:
             print('  Every source in this dataset fails the validity gate. '
                   'The published study')
@@ -1299,7 +1384,7 @@ def section_descriptives(df: pd.DataFrame, opts: Options, ledger: Ledger,
     is partly a comparison of headroom.
     """
     h1(f'3. DESCRIPTIVES on {metric} (normalised score; random policy = 0, '
-       f'threshold = 1)')
+       'threshold = 1)')
     ledger.est(f'descriptives on {metric}')
     rows = []
     # Grouped by environment as well as by arm. Scores are normalised per
@@ -1429,7 +1514,7 @@ def section_convergence(df: pd.DataFrame, opts: Options,
               'throughout (DESIGN.md §5.2).')
         ledger.deviations.append(
             f'convergence gate failed in {len(failing)} arm(s): P1 is '
-            f'"performance at budget", not asymptotic performance')
+            '"performance at budget", not asymptotic performance')
     else:
         print('  No arm shows a final-window slope distinguishable from zero '
               'at 95%. That is')
@@ -1475,10 +1560,10 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
     print('  Family (pre-registered, ANALYSIS_PLAN.md §2):')
     print(f'    endpoints : {", ".join(CONFIRMATORY_ENDPOINTS)}')
     print(f'    cells     : {", ".join(CELL_ORDER)}')
-    print(f'    contrast  : delta = transfer - scratch, within cell, at '
-          f'matched seeds')
-    print(f'    primary   : exact sign-flip randomisation test, statistic = '
-          f'the mean delta')
+    print('    contrast  : delta = transfer - scratch, within cell, at '
+          'matched seeds')
+    print('    primary   : exact sign-flip randomisation test, statistic = '
+          'the mean delta')
     print(f'    correction: Holm-Bonferroni over '
           f'{CONFIRMATORY_FAMILY_SIZE}; strictest step alpha = '
           f'{ALPHA_STRICTEST:.5f}')
@@ -1486,7 +1571,7 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
     if set(computed) != set(CONFIRMATORY_ENDPOINTS):
         print(f'  NOTE: --metric restricted this run to {computed}. The family '
               f'size stays {CONFIRMATORY_FAMILY_SIZE} by pre-registration, so '
-              f'the adjustment is unchanged.')
+              'the adjustment is unchanged.')
         ledger.deviations.append(
             f'--metric restricted the computed family to {computed}; Holm '
             f'still applied over {CONFIRMATORY_FAMILY_SIZE}')
@@ -1510,33 +1595,40 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
             }
             if len(pd_['transfer_labels']) > 1:
                 rec['suppressed'] = (
-                    f'ambiguous primary arm: labels '
+                    'ambiguous primary arm: labels '
                     f'{pd_["transfer_labels"]} all match registry.PROTOCOL')
             elif len(pd_['freeze_updates_observed']) > 1:
                 rec['suppressed'] = (
-                    f'freeze_updates is not constant across the arm '
+                    'freeze_updates is not constant across the arm '
                     f'({pd_["freeze_updates_observed"]}); DESIGN.md §8.4 '
-                    f'refuses to aggregate runs that differ in an invariant')
+                    'refuses to aggregate runs that differ in an invariant')
             elif pd_['n_a'] == 0 or pd_['n_b'] == 0:
                 empty = ('transfer' if pd_['n_a'] == 0 else 'scratch')
                 rec['suppressed'] = (
                     f'the {empty} arm is empty in the analysis set in force. '
-                    f'Under --source-policy valid this happens when every '
-                    f'source fails the DESIGN.md §4.3 gate: the primary '
-                    f'estimand is defined on valid sources only, so it does '
-                    f'not exist here. Nothing is substituted for it')
+                    'Under --source-policy valid this happens when every '
+                    'source fails the DESIGN.md §4.3 gate: the primary '
+                    'estimand is defined on valid sources only, so it does '
+                    'not exist here. Nothing is substituted for it')
             elif pd_['only_a'] or pd_['only_b']:
                 rec['suppressed'] = (
                     f'incomplete arm: seeds {pd_["only_a"]} appear only in '
                     f'transfer, {pd_["only_b"]} only in scratch. A partial arm '
-                    f'is refused (DESIGN.md §8.4); no seed is dropped to '
-                    f'rescue the test')
+                    'is refused (DESIGN.md §8.4); no seed is dropped to '
+                    'rescue the test')
             elif n < MIN_N_FOR_INFERENCE:
                 rec['suppressed'] = (
                     f'n={n} < {MIN_N_FOR_INFERENCE}: no test and no interval '
-                    f'(ANALYSIS_PLAN.md §9)')
+                    '(ANALYSIS_PLAN.md §9)')
             if 'suppressed' in rec:
-                rec.update({'mean_delta': float(np.mean(d)) if n else None,
+                # A suppressed member's point estimate is withheld too, not
+                # only its test. ANALYSIS_PLAN.md §9: a number from fewer than
+                # three seeds "may not be quoted, compared, or used to choose
+                # between hypotheses", and printing it in a results table is
+                # quoting it.
+                rec.update({'mean_delta': (float(np.mean(d))
+                                           if n >= MIN_N_FOR_INFERENCE
+                                           else None),
                             'p_signflip': None})
                 members.append(rec)
                 ledger.suppressed.append(
@@ -1602,12 +1694,20 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                 print(f'    {r["metric"]}/{r["cell"]}: {r["suppressed"]}')
 
     h2('5b. interpretation rule, stated before the numbers were seen')
-    example_n = max((r['n'] for r in members if r.get('p_signflip')),
-                    default=10)
-    print(f'  At n={example_n} the exact sign-flip test cannot return a '
-          f'two-sided p below')
+    observed = [r['n'] for r in members if r.get('p_signflip') is not None]
+    if observed:
+        example_n = max(observed)
+        source_of_n = 'observed'
+    else:
+        example_n = len(registry.SEED_BLOCKS['CONFIRM'])
+        source_of_n = 'planned'
+        print(f'  No member produced a test, so the rule is stated at the '
+              f'PLANNED n={example_n} (the')
+        print('  CONFIRM block), not at any n present in this dataset.')
+    print(f'  At the {source_of_n} n={example_n} the exact sign-flip test '
+          'cannot return a two-sided p below')
     print(f'  2/2^{example_n} = {2 / 2 ** example_n:.5f}, attained exactly '
-          f'when every seed moves the same way.')
+          'when every seed moves the same way.')
     strict = ALPHA_STRICTEST
     reachable = (2 / 2 ** example_n) < strict
     print(f'  The strictest Holm step is alpha = {strict:.5f}.')
@@ -1619,7 +1719,7 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
         print('  clear the corrected threshold at this sample size.')
     else:
         print(f'  Therefore NO result at n={example_n} can clear the '
-              f'corrected threshold: the')
+              'corrected threshold: the')
         print(f'  smallest attainable p ({2 / 2 ** example_n:.5f}) exceeds '
               f'{strict:.5f}. The tests below')
         print('  are reported for completeness and CANNOT be significant. '
@@ -1642,7 +1742,7 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
         rho = rec['rho_pearson']
         if np.isfinite(rho) and rho < 0:
             print(f'    rho = {rho:+.3f} < 0: the matched-seed pairing does '
-                  f'NOT hold in this cell.')
+                  'NOT hold in this cell.')
             print('    ANALYSIS_PLAN.md §2.1 pre-commits to giving the '
                   'unpaired result equal')
             print(f'    prominence here: Mann-Whitney U = '
@@ -1650,7 +1750,7 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                   f'{rec["p_mannwhitney"]:.5f}.')
         else:
             print(f'    rho = {rho:+.3f}: reported whatever its value; the '
-                  f'paired test stays')
+                  'paired test stays')
             print('    primary by pre-registration, not by comparison of '
                   'p-values.')
         agree = [('sign-flip', rec['p_signflip']),
@@ -1660,12 +1760,12 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
         if len(set(verdicts.values())) == 1:
             print(f'    all three tests agree at the nominal alpha '
                   f'({"reject" if list(verdicts.values())[0] else "do not reject"}); '
-                  f'the Holm-corrected verdict is what counts.')
+                  'the Holm-corrected verdict is what counts.')
         else:
             dis = ', '.join(f'{k}={"reject" if v else "no"}'
                             for k, v in verdicts.items())
             print(f'    the three tests DISAGREE at the nominal alpha ({dis}); '
-                  f'that disagreement is')
+                  'that disagreement is')
             print('    the finding, and the pre-registered primary is the '
                   'sign-flip test.')
     return {'members': members, 'family_size': CONFIRMATORY_FAMILY_SIZE,
@@ -1730,7 +1830,7 @@ def section_equivalence(conf: dict, df: pd.DataFrame, opts: Options,
         else:
             verdict = 'INCONCLUSIVE'
             reason = (f'the interval [{lo:+.4f}, {hi:+.4f}] straddles the '
-                      f'margin boundary')
+                      'margin boundary')
         rows.append({'metric': metric, 'cell': cell, 'n': rec['n'],
                      'ci_lo': lo, 'ci_hi': hi, 'sd_scratch': sd_scratch,
                      'sd_transfer': sd_transfer, 'margin': margin,
@@ -1891,19 +1991,19 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
         if dropped:
             print(f'  listwise-complete seeds for the JOINT estimate: '
                   f'{common}')
-            print(f'  seeds present in some conditions but not all, therefore '
-                  f'outside the joint')
+            print('  seeds present in some conditions but not all, therefore '
+                  'outside the joint')
             print(f'  estimate (reported, not dropped silently): {dropped}')
             ledger.deviations.append(
                 f'{cell} control set: seeds {dropped} are not complete across '
                 f'all conditions, so the joint estimate uses {common}')
         if len(common) < MIN_N_FOR_INFERENCE:
             print(f'  n={len(common)} < {MIN_N_FOR_INFERENCE}: no estimate and '
-                  f'no interval (ANALYSIS_PLAN.md §9).')
+                  'no interval (ANALYSIS_PLAN.md §9).')
             out['cells'][cell] = {'n': len(common), 'suppressed': True,
                                   'present': present, 'missing': missing}
-            ledger.suppressed.append(f'control contrasts {cell}: '
-                                     f'n={len(common)}')
+            ledger.other_suppressed.append(f'control contrasts {cell}: '
+                                           f'n={len(common)}')
             continue
 
         mat = np.column_stack([[per_seed[k][s] for s in common]
@@ -1983,8 +2083,8 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
             rhs = per_seed_contrast['C1-C0']
             resid = float(np.max(np.abs(lhs - rhs)))
             print()
-            print(f'  Telescoping identity residual (an identity, see the '
-                  f'header): max |lhs - rhs|')
+            print('  Telescoping identity residual (an identity, see the '
+                  'header): max |lhs - rhs|')
             print(f'  over seeds = {resid:.3e}')
 
         if 'C2-C0' in per_seed_contrast and 'C1-C3' in per_seed_contrast:
@@ -2023,17 +2123,17 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
                              > abs(by['C2-C0']['hl'])))
     if h1_neg:
         k = sum(1 for _, neg, *_ in h1_neg if neg)
-        print(f'  H1 (DESIGN.md §2.3): the untrained-source contrast is '
-              f'negative with an')
+        print('  H1 (DESIGN.md §2.3): the untrained-source contrast is '
+              'negative with an')
         print(f'  interval excluding zero in {k} of {len(h1_neg)} cell(s) with '
-              f'an estimate. H1 predicts')
+              'an estimate. H1 predicts')
         print('  at least 3 of 4; it is refuted if the interval covers zero in '
               '2 or more cells')
         print('  or is positive in any. No p-value attaches to this.')
     if h2_flags:
         k = sum(1 for _, flag in h2_flags if flag)
         print(f'  H2: |C1-C3| exceeds |C2-C0| in {k} of {len(h2_flags)} '
-              f'cell(s). H2 is refuted at 2 or more.')
+              'cell(s). H2 is refuted at 2 or more.')
     return out
 
 
@@ -2048,12 +2148,12 @@ def section_c4(df: pd.DataFrame, opts: Options, ledger: Ledger,
     the mechanics under study, and had no pass criterion.
     """
     h1(f'8. C4 POSITIVE CONTROL on {metric} (interface change, zero dynamics '
-       f'shift)')
+       'shift)')
     ledger.est('C4 positive control')
-    print(f'  Pass criterion, pre-registered: the HL estimate of the paired '
-          f'delta has a 95%')
+    print('  Pass criterion, pre-registered: the HL estimate of the paired '
+          'delta has a 95%')
     print(f'  bootstrap CI whose lower bound exceeds {C4_LOWER_BOUND:+.2f} '
-          f'normalised-score units.')
+          'normalised-score units.')
     iface = df[df['env'] == opts.interface_env]
     if not len(iface):
         print(f'  No runs on the interface-change environment '
@@ -2081,7 +2181,7 @@ def section_c4(df: pd.DataFrame, opts: Options, ledger: Ledger,
             rec.update({'verdict': 'suppressed',
                         'reason': f'n={len(d)} < {MIN_N_FOR_INFERENCE}: no '
                                   f'test, no interval (ANALYSIS_PLAN.md §9)'})
-            ledger.suppressed.append(f'C4 {cell}: n={len(d)}')
+            ledger.other_suppressed.append(f'C4 {cell}: n={len(d)}')
         else:
             res = bootstrap_statistic(d, hodges_lehmann_paired, opts.n_boot,
                                       opts.boot_seed, vec=hl_vec)
@@ -2114,7 +2214,7 @@ def section_c4(df: pd.DataFrame, opts: Options, ledger: Ledger,
         print('  (DESIGN.md §4.2).')
         ledger.deviations.append(
             f'C4 failed in {len(fails)} cell(s): the protocol degrades '
-            f'performance at zero dynamics shift')
+            'performance at zero dynamics shift')
     return {'available': True, 'env': opts.interface_env, 'rows': rows}
 
 
@@ -2190,8 +2290,14 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
     for cell in CELL_ORDER:
         s = _clean(scratch_arm(df[df['cell'] == cell], opts)[metric])
         headroom[cell] = (1.0 - float(np.mean(s))) if len(s) else float('nan')
+    # Two distinct sets, because an override changes whether a contrast is
+    # COMPUTED but not whether it is CONFOUNDED. Conflating them would let the
+    # override quietly launder the confound out of the output.
     blocked = {(g['a'], g['b']) for g in gate if not g['permitted']}
     blocked |= {(b, a) for a, b in blocked}
+    confounded_pairs = {(g['a'], g['b']) for g in gate
+                        if g['verdict'] == 'CONFOUNDED'}
+    confounded_pairs |= {(b, a) for a, b in confounded_pairs}
 
     rows = []
     for a, b in combinations(CELL_ORDER, 2):
@@ -2228,11 +2334,13 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
             raw_excl = raw['lo'] > 0 or raw['hi'] < 0
             adj_excl = adj['lo'] > 0 or adj['hi'] < 0
             agree = 'agree' if raw_excl == adj_excl else 'DISAGREE'
+        conf_note = ('INTENSITY-CONFOUNDED (override in force)'
+                     if (a, b) in confounded_pairs else '')
         rec.update({'hl': raw['estimate'], 'ci_lo': raw['lo'],
                     'ci_hi': raw['hi'], 'hl_headroom_adj': adj['estimate'],
                     'adj_lo': adj['lo'], 'adj_hi': adj['hi'],
                     'headroom_a': ha, 'headroom_b': hb, 'scales': agree,
-                    'note': ''})
+                    'note': conf_note})
         rows.append(rec)
     print(table(rows, ('a', 'b', 'n', 'hl', 'ci_lo', 'ci_hi',
                        'hl_headroom_adj', 'adj_lo', 'adj_hi', 'headroom_a',
@@ -2247,7 +2355,7 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
             print(f'  {r["a"]} vs {r["b"]}: {r["note"]}')
         elif r.get('scales') == 'DISAGREE':
             print(f'  {r["a"]} vs {r["b"]}: the normalised and '
-                  f'headroom-adjusted scales DISAGREE on')
+                  'headroom-adjusted scales DISAGREE on')
             print('    whether the interval excludes zero. No wording is '
                   'licensed for this pair.')
 
@@ -2257,8 +2365,8 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
         common = sorted(set.intersection(*[set(deltas[w]) for w in want]))
         arch_pairs = {('mlp-vanilla', 'dueling-vanilla'),
                       ('mlp-double', 'dueling-double')}
-        confounded = any(p in blocked for p in arch_pairs)
-        if confounded and not opts.allow_intensity_confound:
+        confounded = any(pr in confounded_pairs for pr in arch_pairs)
+        if any(pr in blocked for pr in arch_pairs):
             print()
             print('  2x2 interaction: REFUSED. It mixes both architectures, '
                   'whose transferred')
@@ -2335,7 +2443,7 @@ def sub_rq5(df: pd.DataFrame, opts: Options, ledger: Ledger,
         print(f'    {caveat}')
         if len(present) < 2:
             print('    fewer than two levels present: no trend computed.')
-            out[family] = {'available': False}
+            out[family] = {'available': False, 'n': 0}
             continue
         rows = []
         groups = []
@@ -2361,19 +2469,38 @@ def sub_rq5(df: pd.DataFrame, opts: Options, ledger: Ledger,
                            'sd_delta')))
         if sum(len(g) for g in groups) < MIN_N_FOR_INFERENCE * 2:
             print('    too few deltas for a trend estimate; suppressed.')
-            out[family] = {'available': False, 'levels': rows}
+            out[family] = {'available': False, 'levels': rows,
+                           'n': int(sum(len(g) for g in groups))}
             continue
         order = np.argsort(np.asarray(order_vals))
-        jt = jonckheere_effect([groups[i] for i in order])
+        ordered = [groups[i] for i in order]
+        jt = jonckheere_effect(ordered)
+        # The plan asks for the standardised effect *with a bootstrap CI*, so
+        # the levels are resampled within themselves -- level membership is set
+        # by us and is not a random quantity, so it is not resampled.
+        rng = np.random.default_rng(opts.boot_seed)
+        reps = []
+        for _ in range(min(opts.n_boot, 2000)):
+            draw = [g[rng.integers(0, len(g), len(g))] if len(g) else g
+                    for g in ordered]
+            reps.append(jonckheere_effect(draw)['standardised'])
+        reps_arr = np.asarray([r for r in reps if np.isfinite(r)])
+        lo, hi = ((float(np.percentile(reps_arr, 2.5)),
+                   float(np.percentile(reps_arr, 97.5)))
+                  if len(reps_arr) >= 100 else (float('nan'), float('nan')))
+        n_total = int(sum(len(g) for g in ordered))
         print(f'    Jonckheere concordance across increasing shift: '
-              f'{jt["standardised"]:+.3f}')
+              f'{jt["standardised"]:+.3f}   95% CI [{lo:+.3f}, {hi:+.3f}]')
         print('    ' + phrase_trend(jt['standardised'], family))
+        print('    ' + phrase_interval_verdict(lo, hi, 'the trend'))
         print('    H4 predicts monotone DEGRADATION, i.e. a negative '
               'concordance. Reported as')
         print('    a standardised effect with no p-value '
               '(ANALYSIS_PLAN.md §3).')
-        out[family] = {'available': True, 'levels': rows,
-                       'concordance': jt['standardised'], 'role': role}
+        out[family] = {'available': True, 'levels': rows, 'role': role,
+                       'concordance': jt['standardised'],
+                       'effect': jt['standardised'], 'J': jt['J'],
+                       'ci_lo': lo, 'ci_hi': hi, 'n': n_total}
     return out
 
 
@@ -2419,7 +2546,7 @@ def sub_rq6(df: pd.DataFrame, opts: Options, ledger: Ledger,
                        'delta_at_budget', 'hl', 'ci_lo', 'ci_hi')))
     if all(r['n'] == 0 for r in rows):
         print(f'  The prefix columns {prefixes} exist but hold no values in '
-              f'this dataset, so RQ6')
+              'this dataset, so RQ6')
         print('  is not estimable here. Nothing is substituted for a prefix '
               'evaluation that was')
         print('  never run.')
@@ -2437,7 +2564,7 @@ def sub_rq6(df: pd.DataFrame, opts: Options, ledger: Ledger,
             print(f'  {r["cell"]}: the delta CHANGES SIGN between prefix '
                   f'{r["prefix"]} ({a:+.4f}) and the')
             print(f'    budget ({b:+.4f}). The conclusion is budget-dependent '
-                  f'in this cell.')
+                  'in this cell.')
     return {'available': True, 'rows': rows, 'prefixes': prefixes}
 
 
@@ -2696,6 +2823,7 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
     `REPLICATE` seeds and reported as a fresh estimate.
     """
     h2('9j. ablation screens -- BH q for orientation only, never an assertion')
+    ledger.est('ablation screens (BH q, orientation only)')
     screens = [e for e in registry.EXPERIMENTS.values()
                if e.family == 'screen']
     present = []
@@ -2725,8 +2853,13 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
                                               opts.n_boot, opts.boot_seed,
                                               vec=hl_vec)
                     sf = sign_flip_test(d, seed=opts.boot_seed)
-                    rec.update({'hl': res['estimate'], 'ci_lo': res['lo'],
-                                'ci_hi': res['hi'], 'p_raw': sf['p']})
+                    rec.update({'hl': res['estimate'],
+                                'estimate': res['estimate'],
+                                'ci_lo': res['lo'], 'ci_hi': res['hi'],
+                                'p_raw': sf['p'], 'p': sf['p'],
+                                'statistic': float(np.mean(d)),
+                                'test': 'exact sign-flip on paired deltas',
+                                'rq': 'screen'})
                     pvals.append((len(rows), sf['p']))
                 rows.append(rec)
     if pvals:
@@ -2738,6 +2871,7 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
             q = min(prev, p * m / rank)
             prev = q
             rows[i]['q_bh'] = q
+            rows[i]['q'] = q
     print(table(rows, ('experiment', 'cell', 'level', 'n', 'hl', 'ci_lo',
                        'ci_hi', 'p_raw', 'q_bh')))
     print('  These q-values ORIENT; they assert nothing. A screen result is '
@@ -2789,10 +2923,11 @@ def section_power(df: pd.DataFrame, conf: dict, opts: Options,
     """
     h1('10. POWER AND MINIMUM DETECTABLE EFFECTS')
     print('  Multipliers, pre-registered in ANALYSIS_PLAN.md §6.2 and not '
-          're-tuned (§6.4):')
+          're-tuned (§6.4).')
+    print(f'  Source: {MDE_SOURCE}.')
     print(table([{'test': k[0], 'alpha': ('0.05' if k[1] == 'nominal'
                                           else f'{ALPHA_STRICTEST:.5f} '
-                                               f'(Holm over '
+                                               '(Holm over '
                                                f'{CONFIRMATORY_FAMILY_SIZE})'),
                   'MDE_in_sigma': v} for k, v in MDE_MULTIPLIERS.items()],
                 ('test', 'alpha', 'MDE_in_sigma'), nd=2))
@@ -2833,7 +2968,7 @@ def section_power(df: pd.DataFrame, conf: dict, opts: Options,
     print('  MDE units are normalised score. A cell is flagged NOT POWERED '
           'when its MDE at')
     print(f'  the Holm-corrected alpha reaches {UNPOWERED_MDE} score units -- '
-          f'which by construction is')
+          'which by construction is')
     print('  the entire distance from a random policy to the registered '
           'threshold')
     print('  (ANALYSIS_PLAN.md §6.3). Which cells are powered is therefore a '
@@ -2879,7 +3014,7 @@ def section_ledger(ledger: Ledger, conf: dict) -> dict:
     rows = [
         {'family': 'Confirmatory',
          'members': f'{CONFIRMATORY_FAMILY_SIZE} (4 cells x 2 co-primary '
-                    f'endpoints)',
+                    'endpoints)',
          'procedure': 'Holm-Bonferroni',
          'adjusted_alpha': f'step-down from {ALPHA_STRICTEST:.5f}'},
         {'family': 'Screens (E3-E8, E12)',
@@ -2901,6 +3036,10 @@ def section_ledger(ledger: Ledger, conf: dict) -> dict:
           f'{len(ledger.suppressed)}')
     for name in ledger.suppressed:
         print(f'    {name}')
+    print(f'  suppressed outside the family        : '
+          f'{len(ledger.other_suppressed)}')
+    for name in ledger.other_suppressed:
+        print(f'    {name}')
     print(f'  analyses carrying NO p-value         : '
           f'{len(ledger.estimation)}')
     for name in ledger.estimation:
@@ -2921,6 +3060,7 @@ def section_ledger(ledger: Ledger, conf: dict) -> dict:
     print('  result from being rescued by relocating it into a family of one.')
     return {'families': rows, 'confirmatory': ledger.confirmatory,
             'suppressed': ledger.suppressed,
+            'suppressed_outside_family': ledger.other_suppressed,
             'estimation_only': ledger.estimation,
             'refusals': ledger.refusals,
             'screen_q_count': len(ledger.screen_q)}
@@ -3151,6 +3291,20 @@ def self_test() -> int:
     check('the strictest Holm alpha is 0.00625',
           abs(ALPHA_STRICTEST - 0.00625) < 1e-12)
 
+    h2('MDE table provenance')
+    check('the multipliers match the pre-registered ANALYSIS_PLAN.md §6.2 '
+          'values',
+          abs(MDE_MULTIPLIERS[('paired', 'nominal')] - 1.00) < 0.011
+          and abs(MDE_MULTIPLIERS[('paired', 'holm8')] - 1.54) < 0.011
+          and abs(MDE_MULTIPLIERS[('unpaired', 'nominal')] - 1.39) < 0.011
+          and abs(MDE_MULTIPLIERS[('unpaired', 'holm8')] - 1.87) < 0.011,
+          str(MDE_MULTIPLIERS))
+    check('the paired multiplier is smaller than the unpaired one, which is '
+          'why pairing is primary',
+          MDE_MULTIPLIERS[('paired', 'nominal')]
+          < MDE_MULTIPLIERS[('unpaired', 'nominal')])
+    print(f'  source: {MDE_SOURCE}')
+
     print()
     if failures:
         print(f'{len(failures)} SELF-TEST FAILURE(S): {failures}')
@@ -3195,9 +3349,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help='restrict to runs belonging to these experiment ids '
                         '(a run may belong to several)')
     p.add_argument('--metric', action='append', default=None,
-                   choices=list(CONFIRMATORY_ENDPOINTS),
                    help='restrict the computed co-primary endpoints; the '
-                        'family size stays 8 by pre-registration')
+                        'family size stays 8 by pre-registration. Validated '
+                        'against METRIC_ROLES rather than by an argparse '
+                        'choice list, so the refusal message names the role '
+                        'and the plan section that forbids it')
     p.add_argument('--target-env', default=registry.TARGET_ENV)
     p.add_argument('--source-env', default=registry.SOURCE_ENV)
     p.add_argument('--interface-env', default=registry.INTERFACE_ENV,
@@ -3224,6 +3380,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.self_test:
         return self_test()
+
+    # The metric-role gate, applied before anything is read from disk. A
+    # descriptive metric is refused here rather than tested, which is the
+    # mechanical fix for the published paper testing a metric its own text
+    # declared descriptive-only (DESIGN.md §5.4).
+    for m in (args.metric or ()):
+        try:
+            require_confirmatory(m)
+        except MetricRoleError as exc:
+            print(f'stats.py: {exc}')
+            return 2
 
     opts = Options(
         per_seed=args.per_seed,
@@ -3262,7 +3429,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         'allow_intensity_confound': opts.allow_intensity_confound,
         'tune_runs_excluded': n_tune}}
 
-    print(f'stats.py -- executing ANALYSIS_PLAN.md §10, sections 1-12')
+    print('stats.py -- executing ANALYSIS_PLAN.md §10, sections 1-12')
     print(f'  invocation: {" ".join(sys.argv)}')
 
     report['s1_provenance'] = section_provenance(df, opts, ledger)

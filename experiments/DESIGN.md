@@ -657,6 +657,19 @@ stamped into the output.
     shuffled-source baselines exist in the transfer literature. The claim is
     their first use inside a head-structure x target-rule factorial in the DQN
     family — not the controls.
+11. **The interface-change corner is not perfectly difficulty-neutral.**
+    Surfaced by the generated environment table rather than by argument: the
+    padded/extended variant's no-op score is 0.25 against the base
+    environment's 0.18. The *dynamics* are provably identical — the wrapped
+    environment reproduces the base trajectory bit-identically under aliased
+    actions, and `validate.py` asserts it — but extending the action set from 4
+    to 6 by aliasing actions 0 and 1 doubles their probability under a uniform
+    random policy, so the random-policy *reference* shifts. Two consequences,
+    both stated rather than absorbed: the normalisation denominator differs from
+    the base environment's, and RQ5's estimand for this corner is the
+    *within-variant* delta, where the shared denominator cancels. Comparing this
+    corner's delta against another variant's therefore uses the scale-free
+    effect size, as §5.1 already requires for the shift axes.
 
 ---
 

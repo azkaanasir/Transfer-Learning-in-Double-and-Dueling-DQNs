@@ -1,4 +1,4 @@
-"""Every figure the paper carries, drawn from the two pinned CSVs and nothing else.
+"""Every figure the paper carries, from the two pinned CSVs and nothing else.
 
 Why this file exists in this form
 --------------------------------
@@ -24,8 +24,9 @@ Four properties are therefore mechanical here, not editorial:
   runs in `runs_demo/` evaluate 5 episodes at 2 checkpoints, and a caption that
   claimed the design's 100 episodes at 3 checkpoints would be exactly the C8
   defect reintroduced.
-* **Provenance travels with every figure** (`DESIGN.md` §8.3). `<name>.provenance.json`
-  records the content hash of each input CSV, the git commit and dirty flag,
+* **Provenance travels with every figure** (`DESIGN.md` §8.3).
+  `<name>.provenance.json` records the content hash of each input CSV, the git
+  commit and dirty flag,
   the `ANALYSIS_PLAN.md` hash, the exact argv, and the arm labels the figure
   resolved -- so a stale figure is detectable rather than plausible.
 * **No inference is invented here.** Every interval comes from `stats.py`'s
@@ -145,6 +146,13 @@ CELL_ORDER: tuple[str, ...] = tuple(f'{a}-{r}' for a, r in registry.CELLS)
 CONTRAST_ORDER: tuple[str, ...] = ('scratch', 'transfer_untrained',
                                    'transfer_permuted', 'transfer')
 
+#: Short codes for the conditions, used where an annotation has to fit inside
+#: a column-width panel. The long names are in the legend and the caption.
+CONDITION_CODE: dict[str, str] = {
+    'scratch': 'C0', 'transfer': 'C1', 'transfer_untrained': 'C2',
+    'transfer_permuted': 'C3',
+}
+
 CONTRAST_NAMES: tuple[tuple[str, str, str], ...] = (
     ('transfer_untrained', 'scratch', 'untrained-source'),
     ('transfer_permuted', 'transfer_untrained', 'permuted-source'),
@@ -216,6 +224,21 @@ def _seed_list(seeds: Sequence[int], limit: int = 12) -> str:
             + f', ... (+{len(seeds) - limit} more)')
 
 
+def _cell_label_with_n(cell: str, n_by_cell: dict[str, set]) -> str:
+    """Cell name with its seed count, for a tick label.
+
+    n lives in the tick label rather than in an annotation inside the axes,
+    where a wide interval collides with it. Where the endpoints disagree on n
+    -- one endpoint missing for a seed -- every value is shown rather than the
+    first, because a hidden n is how a partial arm gets read as a complete one.
+    """
+    name = cell.replace('-', ' / ')
+    values = sorted(n_by_cell.get(cell, ()))
+    if not values:
+        return name
+    return f"{name}\n(n={'/'.join(str(v) for v in values)})"
+
+
 def _as_bool(series: pd.Series) -> np.ndarray:
     """CSV booleans, which arrive as bool, str or object depending on whether a
     column had any missing values. Never guess: an unrecognised token becomes
@@ -250,12 +273,23 @@ def _trailing_mean(y: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
-def _no_data(ax: plt.Axes, message: str) -> None:
-    """Say that a panel is empty and why, rather than leaving blank axes."""
+def _no_data(ax: plt.Axes, message: str, hide_x: bool = False,
+             hide_y: bool = False) -> None:
+    """Say that a panel is empty and why, rather than leaving blank axes.
+
+    Only the tick *marks* and the grid go; the tick *labels* stay. Two
+    mistakes are being avoided. `set_xticks([])` on a shared axis changes the
+    locator for every panel in the group, so one empty panel would strip the
+    tick labels off its populated neighbours. And on a shared axis the empty
+    panel is often the very one that carries the group's labels -- the
+    left-hand panel of a row -- so switching its labels off blanks the scale
+    for the whole row. `hide_x` / `hide_y` are for the case where the axis is
+    genuinely not shared with anything populated, so its scale means nothing.
+    """
     ax.text(0.5, 0.5, textwrap.fill(message, 34), transform=ax.transAxes,
             ha='center', va='center', fontsize=6.6, color=_GREY, style='italic')
-    ax.set_xticks([])
-    ax.set_yticks([])
+    ax.tick_params(which='both', bottom=False, left=False,
+                   labelbottom=not hide_x, labelleft=not hide_y)
     ax.grid(False)
 
 
@@ -416,7 +450,7 @@ class Context:
 
     # -- label -> runs ----------------------------------------------------
     def rows_for_labels(self, labels: Iterable[str]) -> pd.DataFrame:
-        wanted = [l for l in dict.fromkeys(labels) if l]
+        wanted = [name for name in dict.fromkeys(labels) if name]
         rows = self.per_seed[self.per_seed['label'].isin(wanted)]
         if self.selected:
             rows = rows[rows['run_dir'].isin(self.selected)]
@@ -508,8 +542,8 @@ class Context:
         return out
 
 
-def load(per_seed_path: str, curves_path: Optional[str]) -> tuple[pd.DataFrame,
-                                                                 pd.DataFrame]:
+def load(per_seed_path: str,
+         curves_path: Optional[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     per_seed = pd.read_csv(per_seed_path)
     missing = [c for c in ('run_dir', 'label', 'cell', 'condition', 'seed',
                            'final_score', 'auc_score')
@@ -557,9 +591,15 @@ class Paired:
         return len(self.seeds)
 
 
-def _seed_series(ctx: Context, label: str, metric: str,
-                 duplicates: list[str]) -> pd.Series:
-    rows = arm_rows(ctx, label)
+def _rows_to_series(rows: pd.DataFrame, metric: str, name: str,
+                    duplicates: list[str]) -> pd.Series:
+    """seed -> metric for a set of runs, one value per seed.
+
+    De-duplication is by seed within whatever rows the caller passes, sorted by
+    path so the choice is reproducible. Callers that vary a factor pass rows
+    already restricted to one level of it, so a factor level is never collapsed
+    away here.
+    """
     if metric not in rows.columns:
         return pd.Series(dtype=float)
     rows = (rows[['run_dir', 'seed', metric]].dropna(subset=[metric])
@@ -567,20 +607,36 @@ def _seed_series(ctx: Context, label: str, metric: str,
     dupe = rows['seed'].duplicated(keep=False)
     if bool(dupe.any()):
         for seed in sorted(set(rows.loc[dupe, 'seed'].tolist())):
-            duplicates.append(f'{label}@s{seed}')
+            duplicates.append(f'{name}@s{seed}')
         rows = rows.drop_duplicates(subset=['seed'], keep='first')
     return rows.set_index('seed')[metric].astype(float)
 
 
-def pair(ctx: Context, base_label: str, treat_label: str,
-         metric: str) -> Paired:
+def _seed_series(ctx: Context, label: str, metric: str,
+                 duplicates: list[str]) -> pd.Series:
+    return _rows_to_series(arm_rows(ctx, label), metric, label, duplicates)
+
+
+def pair(ctx: Context, base_label: str, treat_label: str, metric: str,
+         base_rows: Optional[pd.DataFrame] = None,
+         treat_rows: Optional[pd.DataFrame] = None) -> Paired:
     """Matched-seed contrast. Seeds are a blocking factor (`DESIGN.md` §2.4
     RQ2), so an unmatched seed cannot enter the delta -- and it is recorded
     rather than dropped quietly, because silent seed dropping is one of the six
-    published defects (`DESIGN.md` §1)."""
+    published defects (`DESIGN.md` §1).
+
+    `treat_rows` lets a caller that is varying a factor supply the runs itself,
+    restricted to one level. Selecting by label alone would be wrong there: two
+    levels of a factor can share an arm label, and pairing on the label would
+    then hand back the same runs for both levels and draw a flat line.
+    """
     dupes: list[str] = []
-    b = _seed_series(ctx, base_label, metric, dupes)
-    t = _seed_series(ctx, treat_label, metric, dupes)
+    b = (_rows_to_series(base_rows, metric, base_label, dupes)
+         if base_rows is not None
+         else _seed_series(ctx, base_label, metric, dupes))
+    t = (_rows_to_series(treat_rows, metric, treat_label, dupes)
+         if treat_rows is not None
+         else _seed_series(ctx, treat_label, metric, dupes))
     common = sorted(set(b.index) & set(t.index))
     return Paired(
         seeds=common,
@@ -645,7 +701,8 @@ def exclusion_sentence(est: dict) -> str:
         return 'no exclusion bound (interval suppressed)'
     if lo >= 0:
         return 'a degradation of any size is excluded at 95%'
-    return f'a degradation worse than {abs(lo):.3f} score units is excluded at 95%'
+    return (f'a degradation worse than {abs(lo):.3f} score units is '
+            f'excluded at 95%')
 
 
 def equivalence_sentence(est: dict, sd: float,
@@ -792,7 +849,8 @@ def freeze_boundary(ctx: Context, frame: pd.DataFrame) -> dict:
     out['exited'] = len(steps)
     if steps:
         out['mean_env_step'] = float(np.mean(steps))
-        out['sd_env_step'] = float(np.std(steps, ddof=1)) if len(steps) > 1 else 0.0
+        out['sd_env_step'] = (float(np.std(steps, ddof=1))
+                              if len(steps) > 1 else 0.0)
     if updates_max:
         out['max_updates'] = float(np.max(updates_max))
     return out
@@ -816,13 +874,20 @@ def draw_boundary(ax: plt.Axes, boundary: dict, label: bool = False) -> bool:
 # 6. Emission -- the figure, its generated caption, its provenance
 # ---------------------------------------------------------------------------
 def stamp_validation(fig: plt.Figure, n: int) -> None:
+    """Mark the figure as machinery evidence, not result evidence.
+
+    Faint on purpose: the stamp has to be unmissable in a slide deck and still
+    leave the data readable, because the whole use of an n<3 figure is checking
+    that the pipeline produced the right shape of curve.
+    """
+    size = max(16.0, min(30.0, 4.2 * fig.get_figwidth()))
     fig.text(0.5, 0.5, stats.VALIDATION_STAMP.split(' - ')[0],
-             fontsize=34, color='#D0D0D0', alpha=0.55, ha='center',
-             va='center', rotation=24, zorder=0,
+             fontsize=size, color='#B4B4B4', alpha=0.30, ha='center',
+             va='center', rotation=22, zorder=0,
              transform=fig.transFigure)
-    fig.text(0.5, 0.455, f'n={n} seeds: {stats.VALIDATION_STAMP}',
-             fontsize=7.5, color='#9A9A9A', ha='center', va='center',
-             rotation=24, zorder=0, transform=fig.transFigure)
+    fig.text(0.5, 0.5 - 0.055, f'n={n} seeds: {stats.VALIDATION_STAMP}',
+             fontsize=6.6, color='#A8A8A8', alpha=0.75, ha='center',
+             va='center', rotation=22, zorder=0, transform=fig.transFigure)
 
 
 def protocol_sentence(protocol: dict) -> str:
@@ -891,7 +956,8 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
     lines = [textwrap.fill(body, 92), '']
     if seeds:
         lines.append(textwrap.fill(
-            f'Seeds: n={len(seeds)} distinct seeds plotted ({_seed_list(seeds)}). '
+            f'Seeds: n={len(seeds)} distinct seeds plotted '
+            f'({_seed_list(seeds)}). '
             + ('Below the confirmatory floor of ten seeds '
                '(STANDING_INSTRUCTIONS.md S4): estimates only, and no claim in '
                'the paper may rest on this figure.'
@@ -928,7 +994,8 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
            f"[{ctx.hashes.get('curves')}]" if ctx.curves_path else '')
         + f"; git {str(git.get('commit'))[:12]}"
         + (' (dirty working tree)' if git.get('dirty') else '')
-        + f"; ANALYSIS_PLAN.md {(ctx.prov.get('plans') or {}).get('ANALYSIS_PLAN.md')}", 92))
+        + f"; ANALYSIS_PLAN.md "
+          f"{(ctx.prov.get('plans') or {}).get('ANALYSIS_PLAN.md')}", 92))
 
     caption_path = os.path.join(ctx.outdir, f'{name}.caption.txt')
     with open(caption_path, 'w', encoding='utf-8') as fh:
@@ -1025,7 +1092,7 @@ def fig_learning_curves(ctx: Context) -> None:
                            'final_grid_mean': float(b['mean'][-1])}
         bnd = freeze_boundary(ctx, frames.get((cell, 'transfer'), pd.DataFrame()))
         boundaries[cell] = bnd
-        drew_boundary |= draw_boundary(ax, bnd, label=(cell == cells[0]))
+        drew_boundary |= draw_boundary(ax, bnd)
         ax.axhline(0.0, color=_GREY, linewidth=0.5)
         ax.axhline(1.0, color=_GREY, linewidth=0.5, dashes=(1, 2))
         ax.set_title(cell.replace('-', ' / '))
@@ -1046,12 +1113,13 @@ def fig_learning_curves(ctx: Context) -> None:
                for c in ('scratch', 'transfer')]
     handles.append(Patch(facecolor=_BLUE, alpha=0.16,
                          label='95% bootstrap band'))
-    handles.append(Line2D([], [], color=_GREY, dashes=(3, 2),
-                          label='freeze window ends'))
+    if drew_boundary:               # never advertise a line that is not there
+        handles.append(Line2D([], [], color=_GREY, dashes=(3, 2),
+                              label='freeze window ends'))
     handles.append(Line2D([], [], color=_GREY, linewidth=0.5, dashes=(1, 2),
                           label='score 1 = registered threshold'))
     fig.tight_layout(rect=(0, 0.09, 1, 1))
-    _legend(fig, handles, ncol=5)
+    _legend(fig, handles, ncol=len(handles))
 
     exited = sum(b['exited'] for b in boundaries.values())
     total = sum(b['runs'] for b in boundaries.values())
@@ -1106,16 +1174,17 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
     endpoints = stats.CONFIRMATORY_ENDPOINTS
     cells = [c for c in CELL_ORDER if c in ctx.arms]
     fig, axes = plt.subplots(1, len(endpoints),
-                             figsize=(FULL_WIDTH, 0.55 * len(cells) + 1.9),
+                             figsize=(FULL_WIDTH, 0.42 * len(cells) + 1.7),
                              sharey=True)
     axes = np.atleast_1d(axes)
     meta: dict[str, Any] = {'cells': {}}
     seeds: set[int] = set()
     n_min = None
     margin = stats.EQUIVALENCE_MARGIN
-    labels_used = [l for cell in cells for l in
+    labels_used = [lbl for cell in cells for lbl in
                    (ctx.arms[cell].get('scratch'),
-                    ctx.arms[cell].get('transfer')) if l]
+                    ctx.arms[cell].get('transfer')) if lbl]
+    n_by_cell: dict[str, set[int]] = {}
 
     for ax, endpoint in zip(axes, endpoints):
         ax.axvspan(-margin, margin, color=_GREY, alpha=0.13, linewidth=0,
@@ -1147,10 +1216,7 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
                             markersize=5.0, markeredgewidth=1.1, zorder=3)
             ax.plot([est['estimate']], [y], marker='o', color=_BLUE,
                     markersize=4.2, zorder=4)
-            ax.annotate(f'n={p.n}', xy=(1.0, y), xycoords=('axes fraction',
-                                                           'data'),
-                        xytext=(-2, 0), textcoords='offset points',
-                        fontsize=6.2, color=_GREY, ha='right', va='center')
+            n_by_cell.setdefault(cell, set()).add(p.n)
             meta['cells'].setdefault(cell, {})[endpoint] = {
                 'n': p.n, 'seeds': p.seeds,
                 'hodges_lehmann': est['estimate'], 'ci_lo': est['lo'],
@@ -1164,7 +1230,7 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
                 'duplicate_arm_seeds': p.duplicates,
             }
         ax.set_yticks(list(range(len(cells)))[::-1])
-        ax.set_yticklabels([c.replace('-', ' / ') for c in cells])
+        ax.set_yticklabels([_cell_label_with_n(c, n_by_cell) for c in cells])
         ax.set_xlabel(f'delta {endpoint} (transfer - scratch)')
         ax.set_title(f'{endpoint}  (co-primary '
                      f'{"P1" if endpoint == "final_score" else "P2"})')
@@ -1226,105 +1292,158 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
 def fig_control_decomposition(ctx: Context) -> None:
     endpoint = 'final_score'
     cells = [c for c in CELL_ORDER if c in ctx.arms]
-    fig, axes = plt.subplots(1, max(len(cells), 1),
-                             figsize=(FULL_WIDTH, 3.0), sharey=True)
-    axes = np.atleast_1d(axes)
+    labels_used = [lbl for cell in cells
+                   for lbl in ctx.arms[cell].values()]
     meta: dict[str, Any] = {'endpoint': endpoint, 'cells': {}}
     seeds: set[int] = set()
     n_min = None
     missing: dict[str, list[str]] = {}
-    labels_used = [l for cell in cells for l in ctx.arms[cell].values()]
 
-    for ax, cell in zip(axes, cells):
+    # --- pass 1: estimate everything, so the y range can be shared ---------
+    # The panels share a y axis, so a per-panel `set_ylim` would leave the last
+    # call governing every panel and clip the others' markers. Everything is
+    # therefore estimated first and the limits are set once.
+    prepared: dict[str, dict] = {}
+    for cell in cells:
         labels = ctx.arms[cell]
-        present = [c for c in CONTRAST_ORDER if c in labels]
-        absent = [c for c in CONTRAST_ORDER if c not in labels]
-        # Restrict to seeds where every present condition has a run: the
-        # contrasts are estimated from one shared resampling of seeds
-        # (ANALYSIS_PLAN.md 3), which requires one common seed set.
-        per_cond: dict[str, pd.Series] = {}
         dupes: list[str] = []
-        for cond in list(present):
-            s = _seed_series(ctx, labels[cond], endpoint, dupes)
-            if s.empty:
-                present.remove(cond)
-                absent.append(cond)
-            else:
-                per_cond[cond] = s
+        per_cond: dict[str, pd.Series] = {}
+        for cond in CONTRAST_ORDER:
+            if cond not in labels:
+                continue
+            series = _seed_series(ctx, labels[cond], endpoint, dupes)
+            if not series.empty:
+                per_cond[cond] = series
+        present = [c for c in CONTRAST_ORDER if c in per_cond]
+        absent = [c for c in CONTRAST_ORDER if c not in present]
+        missing[cell] = absent
         if not present:
-            _no_data(ax, 'no control runs for this cell')
-            ax.set_title(cell.replace('-', ' / '))
-            missing[cell] = absent
+            prepared[cell] = {'reason': 'no control runs for this cell',
+                              'absent': absent}
             continue
-        common = sorted(set.intersection(*[set(s.index) for s in
-                                           per_cond.values()]))
+        # One common seed set per cell: the contrasts come from a single
+        # shared resampling (ANALYSIS_PLAN.md 3), which a ragged seed set
+        # cannot support.
+        common = sorted(set.intersection(*[set(v.index)
+                                           for v in per_cond.values()]))
         if not common:
-            _no_data(ax, 'no seed has every condition')
-            ax.set_title(cell.replace('-', ' / '))
-            missing[cell] = absent
+            prepared[cell] = {'reason': 'no seed has a run in every condition',
+                              'absent': absent}
             continue
         units = np.column_stack([per_cond[c].reindex(common).to_numpy(float)
                                  for c in present])
-        seeds.update(common)
         n = len(common)
+        seeds.update(int(v) for v in common)
         n_min = n if n_min is None else min(n_min, n)
         idx = (stats.boot_indices(n, ctx.n_boot, ctx.boot_seed)
                if n >= stats.MIN_N_FOR_INFERENCE else None)
+        levels = {cond: estimate_mean(ctx, units, present.index(cond), idx)
+                  for cond in present}
+        contrasts: dict[str, dict] = {}
+        for hi_c, lo_c, name in CONTRAST_NAMES:
+            if hi_c not in present or lo_c not in present:
+                continue
+            est = estimate_difference(
+                ctx, units, present.index(hi_c), present.index(lo_c), idx)
+            contrasts[name] = {'contrast': f'{hi_c} - {lo_c}',
+                               'hi_cond': hi_c, 'lo_cond': lo_c,
+                               **{k: est[k] for k in ('estimate', 'lo', 'hi',
+                                                      'method')}}
+        prepared[cell] = {'present': present, 'absent': absent, 'units': units,
+                          'common': common, 'levels': levels,
+                          'contrasts': contrasts, 'n': n,
+                          'duplicate_arm_seeds': sorted(set(dupes))}
+        meta['cells'][cell] = {
+            'n': n, 'seeds': common, 'order': present,
+            'levels': {k: {kk: v[kk] for kk in ('estimate', 'lo', 'hi',
+                                                'method')}
+                       for k, v in levels.items()},
+            'contrasts': contrasts, 'conditions_absent': absent,
+            'duplicate_arm_seeds': sorted(set(dupes))}
 
+    # --- the shared y range, with the top of each panel reserved ----------
+    values: list[float] = []
+    for rec in prepared.values():
+        if 'units' not in rec:
+            continue
+        values.extend(float(v) for v in np.asarray(rec['units']).ravel()
+                      if np.isfinite(v))
+        for est in rec['levels'].values():
+            values.extend(float(est[k]) for k in ('lo', 'hi')
+                          if np.isfinite(est[k]))
+    if values:
+        y_bot, y_top = min(values), max(values)
+    else:
+        y_bot, y_top = 0.0, 1.0
+    span = max(y_top - y_bot, 1e-6)
+    ylim = (y_bot - 0.08 * span, y_top + 0.58 * span)
+    # Annotation rows live in the reserved band above the data, in axes
+    # fractions, so they cannot collide with the panel title however the data
+    # happen to fall. Adjacent gaps alternate between two heights, because two
+    # labels centred over neighbouring gaps would otherwise overlap.
+    arrow_fracs = (0.87, 0.68, 0.87)
+
+    fig, axes = plt.subplots(1, max(len(cells), 1),
+                             figsize=(FULL_WIDTH, 3.1), sharey=True)
+    axes = np.atleast_1d(axes)
+
+    for ax, cell in zip(axes, cells):
+        rec = prepared.get(cell, {})
+        ax.set_title(cell.replace('-', ' / '))
+        if 'units' not in rec:
+            _no_data(ax, rec.get('reason', 'no runs for this cell'))
+            continue
+        present, units, n = rec['present'], rec['units'], rec['n']
         xs = list(range(len(present)))
-        levels = {}
         for x, cond in zip(xs, present):
             style = CONDITION_STYLE[cond]
-            col = present.index(cond)
-            est = estimate_mean(ctx, units, col, idx)
-            ax.plot([x] * n, units[:, col], marker='|', linestyle='none',
-                    color=_GREY, markersize=4.5, markeredgewidth=0.8, zorder=2)
+            est = rec['levels'][cond]
+            ax.plot([x] * n, units[:, present.index(cond)], marker='|',
+                    linestyle='none', color=_GREY, markersize=4.5,
+                    markeredgewidth=0.8, zorder=2)
             if np.isfinite(est['lo']):
                 ax.plot([x, x], [est['lo'], est['hi']], color=style['colour'],
                         linewidth=1.3, zorder=3)
             ax.plot([x], [est['estimate']], marker=style['marker'],
-                    color=style['colour'], markersize=4.6, zorder=4)
-            levels[cond] = {k: est[k] for k in ('estimate', 'lo', 'hi',
-                                                'method')}
-        # The three named contrasts, annotated on the adjacent gaps.
-        contrasts = {}
-        y_top = float(np.nanmax(units))
-        y_bot = float(np.nanmin(units))
-        span = max(y_top - y_bot, 1e-6)
+                    color=style['colour'], markersize=4.8, zorder=4)
         for k, (hi_c, lo_c, name) in enumerate(CONTRAST_NAMES):
-            if hi_c not in present or lo_c not in present:
+            if name not in rec['contrasts']:
                 continue
-            a, b = present.index(hi_c), present.index(lo_c)
-            est = estimate_difference(ctx, units, a, b, idx)
-            contrasts[name] = {'contrast': f'{hi_c} - {lo_c}',
-                               **{kk: est[kk] for kk in ('estimate', 'lo',
-                                                         'hi', 'method')}}
+            est = rec['contrasts'][name]
             xa, xb = present.index(lo_c), present.index(hi_c)
-            ylev = y_top + span * (0.12 + 0.13 * k)
-            ax.annotate('', xy=(xb, ylev), xytext=(xa, ylev),
+            frac = arrow_fracs[k % len(arrow_fracs)]
+            ax.annotate('', xy=(xb, frac), xytext=(xa, frac),
+                        xycoords=('data', 'axes fraction'),
+                        textcoords=('data', 'axes fraction'),
                         arrowprops=dict(arrowstyle='<->', linewidth=0.6,
                                         color=_GREY, shrinkA=0, shrinkB=0))
-            ci = ('' if not np.isfinite(est['lo'])
-                  else f" [{est['lo']:+.2f}, {est['hi']:+.2f}]")
-            ax.annotate(f"{name}\n{est['estimate']:+.3f}{ci}",
-                        xy=((xa + xb) / 2.0, ylev), xytext=(0, 2),
-                        textcoords='offset points', fontsize=5.8,
+            text = (f"{CONDITION_CODE[hi_c]}-{CONDITION_CODE[lo_c]}"
+                    f"\n{est['estimate']:+.3f}")
+            if np.isfinite(est['lo']):
+                text += f"\n[{est['lo']:+.2f},{est['hi']:+.2f}]"
+            ax.annotate(text, xy=((xa + xb) / 2.0, frac),
+                        xycoords=('data', 'axes fraction'), xytext=(0, 2),
+                        textcoords='offset points', fontsize=5.4,
                         color='#333333', ha='center', va='bottom')
         ax.set_xticks(xs)
-        ax.set_xticklabels([CONDITION_STYLE[c]['name'].split(' ')[0]
-                            for c in present])
+        ax.set_xticklabels([CONDITION_CODE[c] for c in present])
+        ax.set_xlim(-0.55, len(present) - 0.45)
         ax.set_title(f"{cell.replace('-', ' / ')}  (n={n})")
-        ax.set_ylim(y_bot - span * 0.12, y_top + span * (0.2 + 0.14 *
-                                                        max(len(contrasts), 1)))
         ax.grid(axis='x', visible=False)
-        meta['cells'][cell] = {'n': n, 'seeds': common, 'order': present,
-                               'levels': levels, 'contrasts': contrasts,
-                               'conditions_absent': absent,
-                               'duplicate_arm_seeds': sorted(set(dupes))}
-        missing[cell] = absent
     for ax in axes[len(cells):]:
         _no_data(ax, 'cell not present in the supplied table')
+    axes[0].set_ylim(*ylim)
     axes[0].set_ylabel(f'{endpoint} (normalised)')
+
+    handles = [Line2D([], [], color=CONDITION_STYLE[c]['colour'],
+                      marker=CONDITION_STYLE[c]['marker'], linestyle='none',
+                      label=f"{CONDITION_CODE[c]} = "
+                            f"{CONDITION_STYLE[c]['name'].split(' ', 1)[1]}")
+               for c in CONTRAST_ORDER]
+    handles.append(Line2D([], [], color=_GREY, marker='|', linestyle='none',
+                          label='individual runs'))
+    fig.tight_layout(rect=(0, 0.13, 1, 1))
+    _legend(fig, handles, ncol=5)
 
     absent_all = sorted({c for v in missing.values() for c in v})
     absent_text = (' Conditions with no runs in this table, and therefore no '
@@ -1381,9 +1500,9 @@ def fig_interaction_2x2(ctx: Context) -> None:
     meta: dict[str, Any] = {'cells': {}, 'interaction': {}}
     seeds: set[int] = set()
     n_min = None
-    labels_used = [l for cell in CELL_ORDER
-                   for l in (ctx.arms.get(cell, {}).get('scratch'),
-                             ctx.arms.get(cell, {}).get('transfer')) if l]
+    labels_used = [lbl for cell in CELL_ORDER
+                   for lbl in (ctx.arms.get(cell, {}).get('scratch'),
+                               ctx.arms.get(cell, {}).get('transfer')) if lbl]
 
     for ax, endpoint in zip(axes, endpoints):
         deltas: dict[str, pd.Series] = {}
@@ -1448,9 +1567,9 @@ def fig_interaction_2x2(ctx: Context) -> None:
                 def inter(u: np.ndarray) -> float:
                     return float(np.mean((u[:, i_dd] - u[:, i_dv])
                                          - (u[:, i_md] - u[:, i_mv])))
-                est = stats.bootstrap_statistic(units, inter,
-                                               n_boot=ctx.n_boot,
-                                               seed=ctx.boot_seed, idx=idx)
+                est = stats.bootstrap_statistic(
+                    units, inter, n_boot=ctx.n_boot, seed=ctx.boot_seed,
+                    idx=idx)
                 est.pop('reps', None)
                 meta['interaction'][endpoint] = {
                     'definition': '(d[dueling-double] - d[dueling-vanilla]) - '
@@ -1581,7 +1700,7 @@ def fig_shift_gradient(ctx: Context) -> None:
                         color='#6B5B3E', ha='left', va='bottom')
         if not points:
             _no_data(ax, f'no {family.split("_")[-1]}-family runs in the '
-                         f'supplied table')
+                         f'supplied table', hide_x=True)
             ax.set_title(title, fontsize=7.6)
             meta['families'][family] = {'levels': 0}
             continue
@@ -1640,7 +1759,8 @@ def fig_shift_gradient(ctx: Context) -> None:
         ax.set_xlim(-0.7, len(corner) - 0.3)
         ax.grid(axis='x', visible=False)
     else:
-        _no_data(ax, 'no interface-only runs in the supplied table')
+        _no_data(ax, 'no interface-only runs in the supplied table',
+                 hide_x=True)
     ax.set_title('interface change,\nzero dynamics shift', fontsize=7.0)
     meta['interface_corner'] = corner
     axes[0].set_ylabel(f'delta {endpoint} (transfer - scratch)')
@@ -1746,14 +1866,19 @@ def fig_freeze_duration(ctx: Context) -> None:
             pts = []
             for k in levels:
                 rows = sub[sub['freeze_updates'] == k]
-                for label in sorted(set(rows['label'].tolist())):
-                    p = pair(ctx, base, label, endpoint)
-                    if p.n == 0:
-                        continue
-                    seeds.update(p.seeds)
-                    n_min = p.n if n_min is None else min(n_min, p.n)
-                    est = estimate_shift(ctx, p.delta)
-                    pts.append((pos[k], k, label, est, p.n))
+                if rows.empty:
+                    continue
+                # Paired on the rows at THIS window length, not on the arm
+                # label: the same label can carry two window lengths, and
+                # pairing by label would return one level's runs for both.
+                arm_labels = ', '.join(sorted(set(rows['label'].tolist())))
+                p = pair(ctx, base, f'K={k}', endpoint, treat_rows=rows)
+                if p.n == 0:
+                    continue
+                seeds.update(p.seeds)
+                n_min = p.n if n_min is None else min(n_min, p.n)
+                est = estimate_shift(ctx, p.delta)
+                pts.append((pos[k], k, arm_labels, est, p.n))
             if not pts:
                 continue
             pts.sort(key=lambda t: t[0])
@@ -1767,7 +1892,7 @@ def fig_freeze_duration(ctx: Context) -> None:
                     ax.plot([x, x], [est['lo'], est['hi']], color=st['colour'],
                             linewidth=1.1)
             meta['cells'][cell] = [
-                {'freeze_updates': k, 'label': lab, 'n': n,
+                {'freeze_updates': k, 'labels': lab, 'n': n,
                  'estimate': est['estimate'], 'lo': est['lo'], 'hi': est['hi'],
                  'x_position': x, 'off_scale': k <= 0}
                 for x, k, lab, est, n in pts]
@@ -1848,6 +1973,21 @@ def fig_diagnostics(ctx: Context) -> None:
         {'key': 'cka_drift', 'columns': ['cka_drift'],
          'ylabel': 'CKA(trunk ep0, trunk t)', 'log': False,
          'dueling_only': False},
+        # The plasticity-loss signatures. These are here because the plasticity
+        # literature supplies a complete, architecture-free rival explanation
+        # for degradation after pretraining -- feature-rank collapse and
+        # parameter-norm growth -- that the weight-scale control (C3) does not
+        # exclude: preserving a weight multiset says nothing about the rank of
+        # the features those weights produce. Instrumenting them and then not
+        # plotting them would leave the rival account unaddressed in exactly the
+        # figure a reviewer would look at (paper/LITERATURE.md 3.4).
+        {'key': 'effective_rank', 'columns': ['effective_rank'],
+         'ylabel': 'effective rank, trunk features', 'log': False,
+         'dueling_only': False},
+        {'key': 'param_norm', 'columns': [c for c in ('param_norm_trunk',
+                                                      'param_norm_total')],
+         'ylabel': 'parameter L2 norm', 'log': False,
+         'dueling_only': False},
     ]
     rows = [r for r in rows if any(c in ctx.curves.columns for c in r['columns'])]
     if not rows:
@@ -1872,6 +2012,7 @@ def fig_diagnostics(ctx: Context) -> None:
     meta: dict[str, Any] = {'rows': [r['key'] for r in rows],
                             'gradient_columns': grad_cols, 'panels': {}}
     dash_by_col = {}
+    drew_boundary = False
     for i, spec in enumerate(rows):
         for j, col in enumerate(spec['columns']):
             dash_by_col[col] = [(None, None), (4, 1.6), (1.4, 1.4),
@@ -1882,8 +2023,10 @@ def fig_diagnostics(ctx: Context) -> None:
             ax = axes[i][j]
             drew = False
             if spec['dueling_only'] and not cell.startswith('dueling'):
-                _no_data(ax, 'value/advantage streams do not exist in this '
-                             'architecture')
+                # y is not shared across this row, so the empty panel's own
+                # scale means nothing and is hidden with the ticks.
+                _no_data(ax, 'no value/advantage streams here',
+                         hide_y=True)
             else:
                 x0, x1, n_runs = _support(
                     [frames.get((cell, c), pd.DataFrame())
@@ -1917,7 +2060,7 @@ def fig_diagnostics(ctx: Context) -> None:
                                 .setdefault(cell, {})[f'{cond}:{col}'] = {
                                     'n': int(mat.shape[0]),
                                     'final': float(b['mean'][-1])}
-                    draw_boundary(ax, freeze_boundary(
+                    drew_boundary |= draw_boundary(ax, freeze_boundary(
                         ctx, frames.get((cell, 'transfer'), pd.DataFrame())))
                 if not drew:
                     _no_data(ax, 'no measurements for this signal')
@@ -1933,12 +2076,16 @@ def fig_diagnostics(ctx: Context) -> None:
     handles = [Line2D([], [], color=CONDITION_STYLE[c]['colour'],
                       label=CONDITION_STYLE[c]['name'])
                for c in ('scratch', 'transfer')]
+    multi = {c for spec in rows if len(spec['columns']) > 1
+             for c in spec['columns']}
     for col, dashes in dash_by_col.items():
-        handles.append(Line2D([], [], color=_GREY,
-                              dashes=dashes if dashes[0] else (10, 0),
-                              label=col))
-    handles.append(Line2D([], [], color=_GREY, dashes=(3, 2),
-                          label='freeze window ends'))
+        if col in multi:            # a dash pattern only means something where
+            handles.append(Line2D(  # one panel carries more than one signal
+                [], [], color=_GREY,
+                dashes=dashes if dashes[0] else (10, 0), label=col))
+    if drew_boundary:
+        handles.append(Line2D([], [], color=_GREY, dashes=(3, 2),
+                              label='freeze window ends (vertical rule)'))
     fig.tight_layout(rect=(0, 0.10, 1, 1))
     _legend(fig, handles, ncol=4)
 
@@ -1985,7 +2132,8 @@ def fig_performance_profiles(ctx: Context) -> None:
     seeds: set[int] = set()
     n_min = None
     meta: dict[str, Any] = {'endpoint': endpoint, 'cells': {}}
-    labels_used = [l for cell in cells for l in ctx.arms[cell].values()]
+    labels_used = [lbl for cell in cells
+                   for lbl in ctx.arms[cell].values()]
 
     values: dict[tuple[str, str], np.ndarray] = {}
     for cell in cells:
@@ -2039,7 +2187,7 @@ def fig_performance_profiles(ctx: Context) -> None:
     for ax in axes[2:]:
         ax.set_xlabel(f'score threshold tau ({endpoint})')
     for ax in (axes[0], axes[2]):
-        ax.set_ylabel('fraction of runs with score > tau')
+        ax.set_ylabel('fraction of runs > tau')
 
     handles = [Line2D([], [], color=CONDITION_STYLE[c]['colour'],
                       dashes=CONDITION_STYLE[c]['dashes']
@@ -2092,9 +2240,9 @@ def fig_km_threshold(ctx: Context) -> None:
     seeds: set[int] = set()
     n_min = None
     meta: dict[str, Any] = {'levels': {}, 'logrank': {}}
-    labels_used = [l for cell in cells for l in
+    labels_used = [lbl for cell in cells for lbl in
                    (ctx.arms[cell].get('scratch'),
-                    ctx.arms[cell].get('transfer')) if l]
+                    ctx.arms[cell].get('transfer')) if lbl]
 
     for i, (tag, value) in enumerate(levels):
         tcol, ccol = f'steps_to_threshold_{tag}', f'censored_{tag}'
@@ -2122,8 +2270,12 @@ def fig_km_threshold(ctx: Context) -> None:
                 style = CONDITION_STYLE[cond]
                 xs = [0.0] + [row['t'] for row in km['curve']]
                 ys = [0.0] + [1.0 - row['survival'] for row in km['curve']]
+                # The two arms coincide whenever neither reaches the
+                # threshold, so the baseline is drawn wider: two identical
+                # curves must not look like one arm.
                 line, = ax.step(xs, ys, where='post', color=style['colour'],
-                                label=style['name'])
+                                label=style['name'],
+                                linewidth=2.0 if cond == 'scratch' else 1.1)
                 if style['dashes'][0] is not None:
                     line.set_dashes(style['dashes'])
                 cx = [row['t'] for row in km['curve'] if row['censored'] > 0]
@@ -2135,12 +2287,13 @@ def fig_km_threshold(ctx: Context) -> None:
                             markeredgewidth=1.0)
                 drew = True
             if drew:
-                notes = ' | '.join(
-                    f"{c[:4]} {d['k']}/{d['n']} "
-                    f"[{d['cp'][0]:.2f},{d['cp'][1]:.2f}]"
+                notes = chr(10).join(
+                    f"{CONDITION_STYLE[c]['name'].split(' ')[0]} "
+                    f"{d['k']}/{d['n']} reached, 95% CI "
+                    f"[{d['cp'][0]:.2f}, {d['cp'][1]:.2f}]"
                     for c, d in arms_data.items())
-                ax.annotate(notes, xy=(0.02, 0.96), xycoords='axes fraction',
-                            fontsize=5.6, color='#333333', va='top')
+                ax.annotate(notes, xy=(0.03, 0.97), xycoords='axes fraction',
+                            fontsize=5.4, color='#333333', va='top')
                 ax.set_ylim(-0.05, 1.05)
             else:
                 _no_data(ax, 'no threshold times for this cell')

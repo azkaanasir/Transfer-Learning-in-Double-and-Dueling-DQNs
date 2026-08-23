@@ -3,7 +3,8 @@
     python experiments/audit.py --out-root runs
     python experiments/audit.py --out-root runs --experiments E1 E2
     python experiments/audit.py --out-root runs --json runs/audit.json
-    python experiments/audit.py --out-root runs_demo --experiments E1         --seeds 0-2 --overrides num_episodes=14 freeze_updates=150
+    python experiments/audit.py --out-root runs_demo --experiments E1
+        --seeds 0-2 --overrides num_episodes=14 freeze_updates=150
 
 Exit status is 0 only when every check passes. `report.py` gates on
 `audit_ok(out_root, experiments)`, and `DESIGN.md` §8.4 requires that gate: an
@@ -188,7 +189,6 @@ class Check:
     why: str                                  # the defect this check prevents
     findings: list[Finding] = field(default_factory=list)
     detail: dict = field(default_factory=dict)
-    skipped: Optional[str] = None
 
     def add(self, level: str, code: str, message: str,
             runs: Iterable[str] = (), **detail) -> None:
@@ -198,8 +198,6 @@ class Check:
         return sum(1 for f in self.findings if f.level == level)
 
     def status(self, strict: bool = False) -> str:
-        if self.skipped:
-            return 'SKIP'
         if self.count(ERROR) or (strict and self.count(WARN)):
             return 'FAIL'
         if self.count(WARN):
@@ -332,7 +330,7 @@ DISCRIMINATING = discriminating_fields()
 
 
 def _norm(name: str, value: Any) -> Any:
-    """Comparable form of a config value: canonical env strings, tuples not lists."""
+    """Comparable form of a config value: canonical envs, tuples not lists."""
     if name in ('env', 'source_env') and isinstance(value, str) and value:
         try:
             return envs.parse(value).canonical()
@@ -385,7 +383,7 @@ class Declared:
 
 def declare(seeds=None, observed_seeds: Iterable[int] = (),
             overrides: dict | None = None) -> Declared:
-    """Resolve the whole catalogue into concrete (experiment, arm, seed) configs.
+    """Resolve the catalogue into concrete (experiment, arm, seed) configs.
 
     Built over every experiment, not only the selected ones, because the
     equivalence classes are what identify a shared run: auditing E2 alone still
@@ -433,7 +431,7 @@ def declare(seeds=None, observed_seeds: Iterable[int] = (),
 
 
 def attribute(runs: list[Run], exp_ids: Iterable[str], declared: Declared):
-    """membership[experiment][arm] -> runs, the orphans, and the full mapping."""
+    """membership[experiment][arm] -> runs, the orphans, and the whole map."""
     membership: dict[str, dict[str, list[Run]]] = {
         eid: {arm.label: [] for arm in registry.EXPERIMENTS[eid].arms}
         for eid in exp_ids}
@@ -476,7 +474,8 @@ def check_invariants(membership, exps, declared: Declared) -> Check:
         for name in exp.invariants():
             groups: dict[Any, list[str]] = defaultdict(list)
             for rel, run in sorted(runs.items()):
-                value = _norm(name, run.cfg.get(name, CONFIG_DEFAULTS.get(name)))
+                value = _norm(name,
+                              run.cfg.get(name, CONFIG_DEFAULTS.get(name)))
                 groups[value].append(rel)
             if len(groups) > 1:
                 chk.add(ERROR, 'invariant_violated',
@@ -766,7 +765,7 @@ def _trajectory_digests_on_disk(run: Run) -> dict[str, str]:
     return found
 
 
-def check_run_dir_uniqueness(runs: list[Run], out_root: str) -> Check:
+def check_run_dir_uniqueness(runs: list[Run]) -> Check:
     chk = Check(
         'RUN-DIRECTORY UNIQUENESS',
         'nine conditions from six experiments collided onto one path and a '
@@ -1057,12 +1056,12 @@ def check_source_validity(runs: list[Run]) -> Check:
 
 
 def check_source_lineage(runs: list[Run],
-                        universe: list[Run] | None = None) -> Check:
+                         universe: list[Run] | None = None) -> Check:
     """Iterated over the selected runs; resolved against the whole tree.
 
-    Resolution has to see every run, not only the selection: E8i's
-    positive control draws its donors from the disjoint `C4SRC` block, so
-    auditing E8i alone must still be able to find them.
+    Resolution has to see every run, not only the selection: E8i's positive
+    control draws its donors from the disjoint `C4SRC` block, so auditing
+    E8i alone must still be able to find them.
     """
     chk = Check(
         'SOURCE LINEAGE',
@@ -1092,7 +1091,8 @@ def check_source_lineage(runs: list[Run],
                     f'checkpoint', runs=[run.rel])
             continue
 
-        src_dir = os.path.dirname(os.path.normpath(checkpoint.replace('\\', os.sep)))
+        src_dir = os.path.dirname(
+            os.path.normpath(checkpoint.replace('\\', os.sep)))
         source = by_path.get(os.path.normcase(src_dir))
         if source is None and recorded_digest:
             source = by_digest.get(recorded_digest)
@@ -1272,7 +1272,8 @@ def check_plan_hash(runs: list[Run]) -> Check:
         stale = {h: rs for h, rs in seen.items() if h != current.get(name)}
         if stale:
             chk.add(level, 'plan_hash_stale',
-                    f'{name} has changed since {sum(len(rs) for rs in stale.values())} '
+                    f'{name} has changed since '
+                    f'{sum(len(rs) for rs in stale.values())} '
                     f'run(s) were produced; under ANALYSIS_PLAN.md 1 the '
                     f'affected results are exploratory until the change is '
                     f'recorded in its 11',
@@ -1318,14 +1319,21 @@ def check_reference_coverage(runs: list[Run]) -> Check:
         'a missing reference return would put one variant\'s scores on a '
         'different scale from every other\'s (DESIGN.md 5.1)')
     envs_seen: Counter = Counter()
+    # Aggregated by environment: a missing or a moved reference affects
+    # every run on that environment at once, and one line per run would
+    # say the same thing two hundred times.
+    missing: dict[str, list[str]] = defaultdict(list)
+    missing_why: dict[str, str] = {}
+    drift: dict[tuple, list[str]] = defaultdict(list)
+    drift_values: dict[tuple, tuple] = {}
     for run in runs:
         spec = run.cfg.get('env')
         envs_seen[str(spec)] += 1
         try:
             ref = envs.reference(spec)
         except Exception as exc:                            # noqa: BLE001
-            chk.add(ERROR, 'reference_missing',
-                    f'{run.rel}: {exc}', runs=[run.rel], env=spec)
+            missing[str(spec)].append(run.rel)
+            missing_why[str(spec)] = str(exc)
             continue
         stored = run.manifest.get('reference') or {}
         if not stored:
@@ -1334,14 +1342,13 @@ def check_reference_coverage(runs: list[Run]) -> Check:
                     f'so its scores cannot be recomputed', runs=[run.rel])
             continue
         for key in ('random_return', 'threshold'):
-            a, b = stored.get(key), ref.get(key)
-            if a is None or b is None or abs(float(a) - float(b)) > REFERENCE_TOLERANCE:
-                chk.add(ERROR, 'reference_drift',
-                        f'{run.rel}: normalised against {key}={a} but the '
-                        f'committed reference is now {b}; this run\'s scores are '
-                        f'on a different scale from a freshly measured one',
-                        runs=[run.rel], env=spec, key=key,
-                        stored=a, current=b)
+            was, now = stored.get(key), ref.get(key)
+            drifted = (was is None or now is None
+                       or abs(float(was) - float(now))
+                       > REFERENCE_TOLERANCE)
+            if drifted:
+                drift[(str(spec), key)].append(run.rel)
+                drift_values[(str(spec), key)] = (was, now)
         try:
             es = envs.parse(spec)
         except Exception:                                   # noqa: BLE001
@@ -1353,6 +1360,19 @@ def check_reference_coverage(runs: list[Run]) -> Check:
                         f'{run.rel}: recorded {key}={got} but {spec} has '
                         f'{key}={want}; the run did not train on the interface '
                         f'its config names', runs=[run.rel])
+    for spec, rels in sorted(missing.items()):
+        chk.add(ERROR, 'reference_missing',
+                f'{len(rels)} run(s) on {spec}: {missing_why[spec]}',
+                runs=rels[:MAX_LISTED], env=spec, n=len(rels))
+    for (spec, key), rels in sorted(drift.items()):
+        was, now = drift_values[(spec, key)]
+        chk.add(ERROR, 'reference_drift',
+                f'{len(rels)} run(s) on {spec} were normalised against '
+                f'{key}={was} but the committed reference is now {now}; '
+                f'their scores are on a different scale from a freshly '
+                f'measured run, and the two must not be pooled',
+                runs=rels[:MAX_LISTED], env=spec, key=key, stored=was,
+                current=now, n=len(rels))
     chk.detail['environments'] = dict(envs_seen)
     return chk
 
@@ -1418,11 +1438,29 @@ def check_attribution(runs: list[Run], membership, selected,
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
-CHECK_ORDER = ('INVARIANTS', 'SEED COMPLETENESS', 'TUNE LEAKAGE',
-               'CONFIG/DIGEST CONSISTENCY', 'RUN-DIRECTORY UNIQUENESS',
-               'METRICS INTEGRITY', 'FREEZE VERIFICATION', 'SOURCE VALIDITY',
-               'SOURCE LINEAGE', 'TRANSFERRED-FRACTION MATCHING', 'PLAN HASH',
-               'PROVENANCE', 'REFERENCE COVERAGE', 'RUN ATTRIBUTION')
+def multiplicity_ledger(selected: Iterable[str]) -> dict:
+    """The ledger `ANALYSIS_PLAN.md` §7 requires on every invocation.
+
+    Recorded as data in every report, and printed unless the caller asked for
+    the verdict alone, so the count of analyses carrying no p-value is a fact on
+    the record rather than a claim. The audit is one of them: it tests nothing
+    and spends no part of the error budget. The family is read from the plan and
+    from `registry`, never accepted as an argument -- which is what stops a
+    result from being rescued by relocating it into a family of one.
+    """
+    return {
+        'family': 'confirmatory -- the only one (ANALYSIS_PLAN.md 2)',
+        'members': '8 = 4 cells x 2 co-primary endpoints '
+                   '(final_score, auc_score)',
+        'procedure': 'Holm-Bonferroni, step-down from alpha=0.00625',
+        'confirmatory_experiments_in_selection': [
+            eid for eid in selected
+            if registry.EXPERIMENTS[eid].family == 'confirmatory'],
+        'analyses_carrying_no_p_value': 'every check in this file; the audit is '
+                                       'a precondition for inference, not '
+                                       'inference',
+        'p_values_emitted': 0,
+    }
 
 
 def audit(out_root: str, experiments: Iterable[str] | None = None,
@@ -1459,7 +1497,7 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
         check_seed_completeness(membership, exps, seeds, declared),
         check_tune_leakage(membership, exps),
         check_digests(scoped),
-        check_run_dir_uniqueness(scoped, out_root),
+        check_run_dir_uniqueness(scoped),
         check_metrics_integrity(scoped),
         check_freeze(scoped),
         check_source_validity(scoped),
@@ -1517,6 +1555,7 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
         'runs_in_scope': len(in_scope),
         'runs_unattributed': len(orphans),
         'plan_hash': provenance.plan_hashes().get('ANALYSIS_PLAN.md'),
+        'multiplicity_ledger': multiplicity_ledger(selected),
         'errors': n_err,
         'warnings': n_warn,
         'checks': [{'name': c.name, 'why': c.why, 'status': c.status(strict),
@@ -1545,8 +1584,7 @@ def audit_ok(out_root: str, experiments: Iterable[str] | None = None,
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
-_MARK = {'PASS': '[ok]  ', 'WARN': '[warn]', 'FAIL': '[FAIL]',
-         'SKIP': '[skip]'}
+_MARK = {'PASS': '[ok]  ', 'WARN': '[warn]', 'FAIL': '[FAIL]'}
 
 
 def _render_finding(finding: dict, verbose: bool) -> list[str]:
@@ -1568,14 +1606,16 @@ def render(report: dict, verbose: bool = False, notes: bool = False) -> str:
     out: list[str] = []
     out.append('=' * 78)
     out.append(f'AUDIT  {report["out_root"]}')
-    out.append(f'  experiments : {", ".join(report["experiments_selected"]) or "none"}'
+    chosen = ', '.join(report['experiments_selected']) or 'none'
+    out.append(f'  experiments : {chosen}'
                + ('' if report['experiments_explicit']
                   else '   (default: those with runs on disk)'))
     out.append(f'  runs        : {report["runs_in_scope"]} in scope of '
                f'{report["runs_discovered"]} discovered')
     seeds = report['seeds_requested'] or 'the block each experiment declares'
     out.append(f'  seeds       : {seeds}')
-    out.append(f'  plan hash   : {report["plan_hash"]}  (ANALYSIS_PLAN.md, current)')
+    out.append(f'  plan hash   : {report["plan_hash"]}  '
+               f'(ANALYSIS_PLAN.md, current)')
     if report.get('overrides_declared'):
         out.append('  overrides   : '
                    + ', '.join(f'{k}={v}' for k, v in
@@ -1653,19 +1693,17 @@ def render(report: dict, verbose: bool = False, notes: bool = False) -> str:
     # so that it is unambiguous that the audit is not one of them.
     out.append('')
     out.append('-- multiplicity ledger ' + '-' * 55)
-    out.append('  family        : confirmatory -- the only one '
-               '(ANALYSIS_PLAN.md 2)')
-    out.append('  members       : 8 = 4 cells x 2 co-primary endpoints '
-               '(final_score, auc_score)')
-    out.append('  procedure     : Holm-Bonferroni, step-down from alpha=0.00625')
+    ledger = report.get('multiplicity_ledger') or {}
+    out.append(f'  family        : {ledger.get("family")}')
+    out.append(f'  members       : {ledger.get("members")}')
+    out.append(f'  procedure     : {ledger.get("procedure")}')
     out.append('  confirmatory experiments in this selection: '
-               + (', '.join(eid for eid in report['experiments_selected']
-                            if registry.EXPERIMENTS[eid].family == 'confirmatory')
-                  or 'none'))
-    out.append('  analyses carrying no p-value: every check in this file. The '
-               'audit tests nothing;')
-    out.append('    it is a precondition for inference, and it spends no part of '
-               'the error budget.')
+               + (', '.join(ledger.get(
+                   'confirmatory_experiments_in_selection') or []) or 'none'))
+    out.append(f'  p-values emitted by this file: '
+               f'{ledger.get("p_values_emitted")}. Analyses carrying no '
+               f'p-value:')
+    out.append(f'    {ledger.get("analyses_carrying_no_p_value")}.')
 
     out.append('')
     out.append('=' * 78)
@@ -1698,10 +1736,13 @@ def main(argv=None) -> int:
                         'STANDING_INSTRUCTIONS S8 validation invocation, and it '
                         'is recorded in the report')
     p.add_argument('--overrides', nargs='*', default=None,
-                   help='launch-level overrides that were in force, as '
-                        'field=value (e.g. freeze_updates=150). Stated '
-                        'explicitly they suppress the inference described '
-                        'in infer_launch_overrides')
+                   help='the launch-level overrides that were in force, as '
+                        'field=value (e.g. freeze_updates=150 '
+                        'num_episodes=14). Without them a scaled launch is '
+                        'audited against the full declared configuration and '
+                        'every difference is reported; with them it is audited '
+                        'against what it meant. Arm-level values still win, '
+                        'exactly as in registry.jobs')
     p.add_argument('--strict', action='store_true',
                    help='treat warnings as errors')
     p.add_argument('--notes', action='store_true',
@@ -1711,7 +1752,9 @@ def main(argv=None) -> int:
     p.add_argument('--json', dest='json_out', default=None,
                    help='write the full report dict here')
     p.add_argument('--quiet', action='store_true',
-                   help='write the JSON report and print only the verdict')
+                   help='print only the one-line verdict. The multiplicity '
+                        'ledger ANALYSIS_PLAN.md 7 requires is recorded in the '
+                        'report dict either way, and --json still writes it')
     args = p.parse_args(argv)
 
     try:

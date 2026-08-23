@@ -346,12 +346,20 @@ def recalibrate_value_head(model: keras.Model, states: np.ndarray,
     """Rescale the transferred value head to the target task's return range.
 
     A source-trained V(s) carries the source's return scale in its output bias.
-    Under `Q = V + (A - mean A)`, adding a constant to V shifts every Q equally,
-    so this intervention **does not change the greedy policy at all** -- stating
-    that plainly matters, because the tempting claim "recalibration improves the
-    initial policy" would be false by construction. What it changes is the
-    magnitude of the TD targets relative to the target task's rewards, and hence
-    the early optimisation dynamics. That is the hypothesis being tested.
+    Under `Q = V + (A - mean A)`, changing V(s) shifts every action's Q at that
+    state by the **same** amount, so the argmax at each state is untouched and
+    this intervention **does not change the greedy policy at all**. Stating that
+    plainly matters, because the tempting claim "recalibration improves the
+    initial policy" is false by construction.
+
+    Note the precise form of the invariance, which differs between the modes:
+    `center` subtracts one global constant, so every Q in the network shifts
+    equally; `center_scale` also divides the head, so the shift is constant
+    across *actions at a given state* but varies across states. Both leave the
+    greedy policy identical -- that is what `validate.py` asserts -- and only
+    the first is a uniform shift of the whole Q function. What either changes is
+    the magnitude of the TD targets relative to the target task's rewards, and
+    hence the early optimisation dynamics. That is the hypothesis being tested.
 
     mode='center'        subtract the mean V over `states` (offset only)
     mode='center_scale'  also divide the head's kernel and bias by the observed

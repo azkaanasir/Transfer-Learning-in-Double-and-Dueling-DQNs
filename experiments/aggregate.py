@@ -113,6 +113,13 @@ PER_SEED_COLUMNS: tuple[str, ...] = (
     'v_abs_mean', 'a_abs_mean', 'a_spread', 'grad_norm_trunk',
     'grad_norm_value', 'grad_norm_adv', 'grad_norm_head', 'grad_norm_global',
     'dead_unit_frac', 'cka_drift', 'q_mean', 'td_error_abs',
+    # Plasticity signatures. The plasticity-loss literature supplies an
+    # architecture-free rival explanation for degradation after pretraining --
+    # dead units, parameter-norm growth, feature-rank collapse -- that the
+    # weight-scale control (C3) does not exclude, because preserving a weight
+    # multiset says nothing about the rank of the features those weights
+    # produce. See paper/LITERATURE.md 3.4.
+    'effective_rank', 'stable_rank', 'param_norm_total', 'param_norm_trunk',
     'source_final_score', 'source_valid',
     'prefix_score_250', 'prefix_score_500', 'prefix_score_750',
     'metrics_contiguous', 'freeze_verified', 'git_commit', 'git_dirty',
@@ -123,7 +130,11 @@ CURVE_COLUMNS: tuple[str, ...] = (
     'run_dir', 'cell', 'condition', 'label', 'seed', 'episode', 'env_steps',
     'updates', 'epsilon', 'score', 'eval_score', 'held_out_score', 'loss',
     'grad_norm', 'td_error_abs', 'q_mean', 'v_abs_mean', 'a_abs_mean',
-    'a_spread', 'dead_unit_frac', 'cka_drift', 'frozen',
+    'a_spread', 'dead_unit_frac', 'cka_drift',
+    'effective_rank', 'stable_rank', 'feature_var_mean',
+    'param_norm_total', 'param_norm_trunk', 'param_norm_value',
+    'param_norm_adv', 'param_norm_head',
+    'frozen',
 )
 
 # `ANALYSIS_PLAN.md` §5: pre-declared, so a threshold metric exists even when no
@@ -139,6 +150,10 @@ TRAILING_WINDOW = 100
 # Prefix checkpoints reported as columns. Fixed by the schema, not by whatever a
 # particular run happened to save, so the column set never depends on the data
 # (`Config.prefix_checkpoints` default, and `DESIGN.md` RQ6).
+# 500 is the only prefix a research question attaches to (the published budget,
+# measured before epsilon floors at about episode 891) and is the only one runs
+# now produce; 250 and 750 are retained in the schema so the column set stays
+# fixed for older runs rather than varying with the data.
 PREFIX_CHECKPOINTS: tuple[int, ...] = (250, 500, 750)
 
 # Diagnostics are logged on the evaluation cadence (`DESIGN.md` §5.5), so their
@@ -151,7 +166,9 @@ DIAG_EPISODE_TAIL = 100
 EVAL_CADENCE_COLUMNS = ('v_abs_mean', 'a_abs_mean', 'a_spread',
                         'grad_norm_trunk', 'grad_norm_value', 'grad_norm_adv',
                         'grad_norm_head', 'grad_norm_global', 'dead_unit_frac',
-                        'cka_drift')
+                        'cka_drift',
+                        'effective_rank', 'stable_rank', 'param_norm_total',
+                        'param_norm_trunk')
 EPISODE_CADENCE_COLUMNS = ('q_mean', 'td_error_abs')
 
 # Priority order for naming a seed's block. The blocks of `DESIGN.md` §3.4 are
