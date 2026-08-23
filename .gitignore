@@ -6,6 +6,13 @@ analysis/_out/
 
 # experiment outputs (regenerable: python experiments/sweep.py)
 runs/
+# tiny structurally-complete dataset used to develop the analysis layer;
+# regenerable and not evidence of anything
+runs_demo/
+# generated results bundles (regenerable: python experiments/report.py)
+paper/results/
+paper/figures/
+paper/tables/
 __pycache__/
 *.pyc
 

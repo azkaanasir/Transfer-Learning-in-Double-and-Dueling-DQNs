@@ -1,4 +1,11 @@
-# Pinned environment for the Phase 1 2x2 sweep.
+# Pinned environment for the controlled transfer study.
+#
+# Reproducibility note: bitwise reproducibility holds on an identical software
+# and hardware stack and does NOT hold across stacks. oneDNN is enabled by
+# default in this TensorFlow build and changes floating-point reduction order;
+# the launcher sets TF_ENABLE_ONEDNN_OPTS=0 and PYTHONHASHSEED=0 and pins thread
+# counts, and every run records what was actually in force
+# (src/dqn/provenance.py). The honest claim is in DESIGN.md section 8.2.
 # Addresses IJCNN R4's reproducibility ask (REVIEW_REPORT.md P1-9): the original
 # repo shipped only an unpinned dependencies.txt.
 #
@@ -16,5 +23,14 @@ scipy==1.17.1
 pandas==3.0.3
 h5py==3.14.0
 
+matplotlib==3.11.0
+
 # Only needed to re-read the archived TensorBoard logs (analysis/extract_logs.py)
 tensorboard==2.20.0
+
+# Deliberately NOT dependencies:
+#   seaborn      -- plots.py uses matplotlib only, so figure style is explicit
+#                   and reproducible rather than inherited from a theme default
+#   scikit-learn -- the statistics here are exact or bootstrap, and are
+#                   implemented in experiments/statlib.py so that every
+#                   procedure in the paper is readable in one file
