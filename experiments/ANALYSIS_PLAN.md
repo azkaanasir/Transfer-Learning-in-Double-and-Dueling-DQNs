@@ -250,9 +250,20 @@ doubled without a post-hoc decision. Pre-committed rule:
   no alpha adjustment for sequential testing is required. If that discipline is
   ever broken, it is recorded in §11 and the affected results become
   exploratory.
-* At n=20 the paired MDE falls to about 0.68 sigma_delta at alpha=0.05, which
-  brings the between-cell RQ3 contrast within reach of being testable rather
-  than estimation-only. That is the main scientific reason to run it.
+* At n=20 the minimum detectable effects, computed the same way and verified
+  against `statlib.self_test`, are:
+
+  | Test | n=10 | n=20 |
+  |---|---|---|
+  | paired sign-flip, alpha=0.05 | 1.009 | **0.662** |
+  | paired sign-flip, Holm over 8 (0.00625) | 1.535 | **0.890** |
+  | unpaired Mann-Whitney, alpha=0.05 | 1.406 | **0.940** |
+
+  Doubling the sample therefore cuts the confirmatory MDE from 1.54 to 0.89
+  sigma_delta, which brings the between-cell RQ3 contrast (whose standard error
+  is sqrt(2) times a single delta's) within reach of being testable rather than
+  estimation-only. That is the main scientific reason to run `REPLICATE`, and
+  it is stated here so the decision is not made on the basis of an n=10 result.
 
 ---
 

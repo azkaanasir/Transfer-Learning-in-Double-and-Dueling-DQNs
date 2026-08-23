@@ -2,12 +2,21 @@
 
     python experiments/audit.py --out-root runs
     python experiments/audit.py --out-root runs --experiments E1 E2
-    python experiments/audit.py --out-root runs_demo --experiments E1 --seeds 0-2
     python experiments/audit.py --out-root runs --json runs/audit.json
+    python experiments/audit.py --out-root runs_demo --experiments E1         --seeds 0-2 --overrides num_episodes=14 freeze_updates=150
 
 Exit status is 0 only when every check passes. `report.py` gates on
 `audit_ok(out_root, experiments)`, and `DESIGN.md` §8.4 requires that gate: an
 override is permitted but must be stamped into the output.
+
+Severity has exactly three levels, and the distinction is load-bearing.
+`error` fails the audit and blocks reporting. `warning` is a fact the reader
+must be told but which does not make the runs wrong -- a reduced-budget
+validation launch, a dirty git tree, an intensity-confounded cross-architecture
+pair -- and `--strict` promotes every warning to an error, which is the setting
+a confirmatory campaign should be audited under. `note` is inventory the report
+needs: which sources the validity gate excluded, which experiments are below
+n=3 and therefore pipeline validation rather than result.
 
 Why this file exists
 --------------------
@@ -86,6 +95,30 @@ hypothetical; each was found, by execution, either in the published study
   reference return would silently put one variant's scores on a different scale
   from every other's, which is what made the published cross-variant comparisons
   meaningless (`DESIGN.md` §5.1).
+
+How a run is attributed to an experiment
+---------------------------------------
+Not by resemblance. A run records the `experiment` and `label` the runner was
+given, both of which came from the registry, and that is the primary key.
+Because identical configurations are deliberately shared between experiments,
+the registry is then asked which `(experiment, arm, seed)` triples resolve to
+the same `run_digest` -- the equivalence `registry.all_jobs` de-duplicates on --
+and the run is attributed to every member of its class. So auditing E2 alone
+still recognises that its scratch denominators are runs E1 launched, and no
+heuristic has to guess at it.
+
+The two routes are then cross-examined against each other: the stored config is
+compared, field by field, with the config the registry declares for that arm.
+`registry.SCALING_FIELDS` decides how a difference is graded. A difference in a
+budget or measurement field means the runs are the declared arms at a reduced
+setting -- a validation launch under `STANDING_INSTRUCTIONS` S8, which is worth
+auditing and is not a result -- and is a warning. A difference in a *factor* is
+an error, because a run whose factors differ is not the arm its label names;
+`registry.jobs` refuses such an override unless asked and stamps a note in the
+manifest when it is, so a deliberate one is recognised and downgraded. Passing
+`--overrides` reconstructs the configuration a launch actually used, which is
+how a scaled launch is audited against what it meant rather than against what
+it is not.
 
 The audit computes no statistic and emits no p-value. It is a precondition for
 inference, not inference; the ledger printed at the end says so explicitly.
@@ -498,12 +531,17 @@ def check_invariants(membership, exps, declared: Declared) -> Check:
                     f'which is an experimental factor and not a budget setting: '
                     f'declared {sorted(entry["declared"])}, found '
                     f'{sorted(entry["observed"])}. '
-                    + ('The runs record the override in their notes, so it was '
-                       'deliberate; pass --overrides to audit them against the '
-                       'configuration actually intended.'
+                    + ('The runs record the override in their notes, so it '
+                       'was deliberate.'
                        if entry['stamped'] else
                        'A run whose factors differ is not the arm its label '
-                       'names.'),
+                       'names, and registry.jobs refuses such an override '
+                       'unless asked.')
+                    + f' If the launch meant it, re-run the audit with '
+                      f'--overrides {name}='
+                    + sorted(entry['observed'])[0]
+                    + ' so the runs are checked against the configuration that '
+                      'was actually intended.',
                     runs=entry['runs'][:MAX_LISTED], experiment=eid, field=name,
                     declared=sorted(entry['declared']),
                     observed=sorted(entry['observed']))
@@ -545,18 +583,26 @@ def check_seed_completeness(membership, exps, seeds, declared: Declared) -> Chec
         # estimates of one quantity that a reader would take for two arms --
         # the failure mode the digest-keyed run directory exists to prevent, so
         # if it appears here it means two launches wrote under one label.
+        twinned: list[str] = []
+        twin_runs: list[str] = []
         for label, group in sorted(arms.items()):
             by_seed: dict[Optional[int], list[Run]] = defaultdict(list)
             for run in group:
                 by_seed[run.seed].append(run)
             for seed, twins in sorted(by_seed.items(), key=lambda kv: str(kv[0])):
                 if len(twins) > 1:
-                    chk.add(ERROR, 'duplicate_runs_for_arm_seed',
-                            f'{eid}/{label} at seed {seed} has {len(twins)} '
-                            f'runs; one arm at one seed is one run, and two are '
-                            f'two independent estimates of the same quantity',
-                            runs=[t.rel for t in twins][:MAX_LISTED],
-                            experiment=eid, arm=label, seed=seed)
+                    twinned.append(f'{label}@s{seed}x{len(twins)}')
+                    twin_runs.extend(t.rel for t in twins)
+        if twinned:
+            chk.add(ERROR, 'duplicate_runs_for_arm_seed',
+                    f'{eid}: {len(twinned)} arm x seed slot(s) hold more than '
+                    f'one run ({", ".join(twinned[:4])}'
+                    + (f', +{len(twinned) - 4} more' if len(twinned) > 4 else '')
+                    + f'). One arm at one seed is one run; two are two '
+                      f'independent estimates of one quantity, which a reader '
+                      f'would take for two arms',
+                    runs=twin_runs[:MAX_LISTED], experiment=eid,
+                    slots=twinned[:24], n=len(twinned))
         missing = sorted(pairs - observed)
         extra = sorted(p for p in observed - pairs if p[1] in target)
         per_arm = {label: sorted({r.seed for r in group})
@@ -574,6 +620,7 @@ def check_seed_completeness(membership, exps, seeds, declared: Declared) -> Chec
             'pipeline_validation': (max(n_by_arm.values()) < MIN_N_FOR_A_RESULT
                                     if n_by_arm else True),
             'max_n_per_arm': max(n_by_arm.values()) if n_by_arm else 0,
+            'runs_attributed': sum(len(g) for g in arms.values()),
         }
         if not (observed & pairs):
             chk.add(NOTE, 'experiment_not_run',
@@ -1125,7 +1172,13 @@ def check_transferred_fraction(membership, exps) -> Check:
         'TRANSFERRED-FRACTION MATCHING',
         'the same layer list transfers 97 % of the mlp and 51 % of the dueling '
         'network, confounding arch with treatment intensity (DESIGN.md 3.1)')
-    keys = tuple(k for k in DISCRIMINATING if k != 'arch')
+    # A cross-architecture comparison is a pair of runs that agree on
+    # everything the catalogue varies except `arch`. `aggregation` is excluded
+    # from the key because it is architecture-specific by construction --
+    # `Config` forces `mean` for mlp -- so requiring it to agree would leave no
+    # mlp/dueling pair to compare at all.
+    keys = tuple(k for k in DISCRIMINATING
+                 if k not in ('arch', 'aggregation'))
     for eid, arms in membership.items():
         groups: dict[tuple, dict[str, list[tuple[str, float]]]] = defaultdict(
             lambda: defaultdict(list))
@@ -1139,21 +1192,27 @@ def check_transferred_fraction(membership, exps) -> Check:
                     chk.add(ERROR, 'fraction_unrecorded',
                             f'{run.rel}: a {run.condition} run with no '
                             f'transferred-parameter fraction; the intensity of '
-                            f'the treatment is unknown', runs=[run.rel])
+                            f'the treatment it received is unknown',
+                            runs=[run.rel])
                     continue
                 sig = _run_signature(run)
                 groups[tuple(sig[k] for k in keys)][str(sig['arch'])].append(
                     (run.rel, float(frac)))
+
+        # Name each group by the fields that actually differ between the groups
+        # of this experiment, so the printed table identifies a row without
+        # carrying eighteen columns of constants.
+        varying = tuple(k for i, k in enumerate(keys)
+                        if len({g[i] for g in groups}) > 1)
         for key, by_arch in sorted(groups.items(), key=lambda kv: str(kv[0])):
             described = dict(zip(keys, key))
             for arch, entries in by_arch.items():
                 spread = max(f for _, f in entries) - min(f for _, f in entries)
                 if spread > 1e-9:
                     chk.add(WARN, 'fraction_varies_within_arm',
-                            f'{eid}: {arch} runs at the same configuration '
-                            f'report transferred fractions spanning '
-                            f'{spread:.4f}; the treatment intensity is not '
-                            f'constant across seeds',
+                            f'{eid}: {arch} runs at one configuration report '
+                            f'transferred fractions spanning {spread:.4f}; the '
+                            f'treatment intensity is not constant across seeds',
                             runs=[r for r, _ in entries][:MAX_LISTED],
                             experiment=eid)
             if len(by_arch) < 2:
@@ -1161,30 +1220,27 @@ def check_transferred_fraction(membership, exps) -> Check:
             means = {arch: sum(f for _, f in e) / len(e)
                      for arch, e in by_arch.items()}
             gap = max(means.values()) - min(means.values())
-            record = {'experiment': eid,
+            name = ' '.join(f'{k}={described[k]}' for k in varying) or 'all runs'
+            record = {'experiment': eid, 'group': name,
                       'condition': described.get('condition'),
-                      'target_rule': described.get('target_rule'),
-                      'transfer_set': described.get('transfer_set'),
-                      'freeze_updates': described.get('freeze_updates'),
-                      'env': described.get('env'),
                       'fractions': {a: round(f, 4) for a, f in means.items()},
-                      'gap': round(gap, 4)}
+                      'gap': round(gap, 4),
+                      'n_runs': sum(len(e) for e in by_arch.values())}
             chk.detail.setdefault('cross_arch_groups', []).append(
                 {**record, 'intensity_confounded': gap > FRACTION_TOLERANCE})
             if gap > FRACTION_TOLERANCE:
-                # DESIGN.md 3.1 permits the contrast only when it is explicitly
-                # labelled, so the label is emitted here for `report.py` to
-                # carry rather than the contrast being refused outright.
+                # DESIGN.md 3.1 permits such a contrast only when it is
+                # explicitly labelled, so the label is emitted here for
+                # `report.py` to carry rather than the contrast being refused
+                # outright here.
                 chk.add(WARN, 'intensity_confounded',
-                        f'{eid}: cross-arch group '
-                        f'(condition={described.get("condition")}, '
-                        f'target_rule={described.get("target_rule")}, '
-                        f'transfer_set={described.get("transfer_set")}) has '
-                        f'fractions '
-                        f'{", ".join(f"{a}={f:.3f}" for a, f in sorted(means.items()))} '
-                        f'-- a gap of {gap:.3f} exceeds the {FRACTION_TOLERANCE} '
-                        f'tolerance, so any arch contrast here is '
-                        f'intensity-confounded and must be labelled so',
+                        f'{eid}: the cross-arch group [{name}] has fractions '
+                        + ', '.join(f'{a}={f:.3f}'
+                                    for a, f in sorted(means.items()))
+                        + f' -- a gap of {gap:.3f} beyond the '
+                          f'{FRACTION_TOLERANCE} tolerance. Any architecture '
+                          f'contrast drawn here is intensity-confounded and '
+                          f'must be labelled so',
                         **record)
     return chk
 
@@ -1547,16 +1603,24 @@ def render(report: dict, verbose: bool = False, notes: bool = False) -> str:
         out.append('')
         out.append('-- inventory ' + '-' * 65)
         out.append(f'  {"experiment":11s} {"family":13s} {"declared":>8s} '
-                   f'{"present":>8s}  status')
+                   f'{"present":>8s} {"runs":>6s}  status')
         for eid, det in seedchk['detail'].items():
             if not isinstance(det, dict) or 'declared_runs' not in det:
                 continue
-            flag = ('PIPELINE VALIDATION - NOT A RESULT'
-                    if det.get('pipeline_validation') else 'complete'
-                    if det['observed_runs'] == det['declared_runs']
-                    else 'INCOMPLETE')
+            if not det['observed_runs']:
+                flag = ('NOT RUN at the declared seeds'
+                        + (f' ({det.get("runs_attributed")} run(s) present at '
+                           f'other seeds)' if det.get('runs_attributed')
+                           else ''))
+            elif det.get('pipeline_validation'):
+                flag = 'PIPELINE VALIDATION - NOT A RESULT'
+            elif det['observed_runs'] == det['declared_runs']:
+                flag = 'complete'
+            else:
+                flag = 'INCOMPLETE'
             out.append(f'  {eid:11s} {det.get("family", "?"):13s} '
-                       f'{det["declared_runs"]:8d} {det["observed_runs"]:8d}  {flag}')
+                       f'{det["declared_runs"]:8d} {det["observed_runs"]:8d} '
+                       f'{det.get("runs_attributed", 0):6d}  {flag}')
 
     val = next((c for c in report['checks'] if c['name'] == 'SOURCE VALIDITY'),
                None)
@@ -1573,18 +1637,16 @@ def render(report: dict, verbose: bool = False, notes: bool = False) -> str:
     if groups:
         out.append('')
         out.append('-- transferred fraction, cross-arch groups ' + '-' * 35)
-        out.append('   every mlp/dueling pair the selection permits, at fixed '
-                   'target_rule and protocol')
+        out.append('   every mlp/dueling pair the selection permits; the group '
+                   'key names what differs between rows')
     for group in groups:
-        out.append(f'  {group["experiment"]:4s} {str(group["condition"]):19s} '
-                   f'{str(group["target_rule"]):8s} '
-                   f'set={str(group["transfer_set"]):8s} '
-                   f'K={str(group["freeze_updates"]):>6s}  '
+        out.append(f'  {group["experiment"]:4s} '
                    + '  '.join(f'{arch}={f:.3f}'
                                for arch, f in sorted(group['fractions'].items()))
                    + f'  gap={group["gap"]:.3f}'
-                   + ('  INTENSITY-CONFOUNDED'
-                      if group['intensity_confounded'] else ''))
+                   + ('  INTENSITY-CONFOUNDED  '
+                      if group['intensity_confounded'] else '  ')
+                   + str(group['group'])[:96])
 
     # ANALYSIS_PLAN.md 7. Printed on every invocation so that the count of
     # analyses carrying no p-value is a recorded fact rather than a claim -- and

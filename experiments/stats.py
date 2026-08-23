@@ -408,14 +408,39 @@ def bca_interval(theta_hat: float, reps: np.ndarray, jack: np.ndarray,
             'note': note}
 
 
+def hl_vec(samples: np.ndarray) -> np.ndarray:
+    """Vectorised Hodges-Lehmann over the last axis of a stack of samples.
+
+    `bootstrap_statistic` calls its statistic 10,000 times per contrast and
+    there are several dozen contrasts, so the Walsh-average median is computed
+    for the whole bootstrap stack at once. Same numbers as
+    `hodges_lehmann_paired`, which `--self-test` checks.
+    """
+    n = samples.shape[-1]
+    iu, ju = np.triu_indices(n)
+    w = (samples[..., iu] + samples[..., ju]) / 2.0
+    return np.median(w, axis=-1)
+
+
+def mean_vec(samples: np.ndarray) -> np.ndarray:
+    return np.mean(samples, axis=-1)
+
+
+def median_vec(samples: np.ndarray) -> np.ndarray:
+    return np.median(samples, axis=-1)
+
+
 def bootstrap_statistic(units: np.ndarray, stat: Callable[[np.ndarray], float],
                         n_boot: int = N_BOOT, seed: int = BOOT_SEED,
-                        alpha: float = ALPHA, idx: np.ndarray | None = None
+                        alpha: float = ALPHA, idx: np.ndarray | None = None,
+                        vec: Optional[Callable[[np.ndarray], np.ndarray]] = None
                         ) -> dict:
     """Point estimate plus a BCa interval for a statistic of seed-level units.
 
     `units` is indexed by seed on its first axis, so a paired quantity is
-    resampled as a unit and the pairing survives the bootstrap.
+    resampled as a unit and the pairing survives the bootstrap. `vec`, when
+    given, computes the statistic for the whole stack of resamples at once; it
+    must agree with `stat`, and the two are cross-checked in `--self-test`.
     """
     units = np.asarray(units, dtype=float)
     n = units.shape[0]
@@ -427,7 +452,10 @@ def bootstrap_statistic(units: np.ndarray, stat: Callable[[np.ndarray], float],
                         f'(ANALYSIS_PLAN.md §9)'}
     if idx is None:
         idx = boot_indices(n, n_boot, seed)
-    reps = np.array([stat(units[row]) for row in idx], dtype=float)
+    if vec is not None:
+        reps = np.asarray(vec(units[idx]), dtype=float).ravel()
+    else:
+        reps = np.array([stat(units[row]) for row in idx], dtype=float)
     jack = np.array([stat(np.delete(units, i, axis=0)) for i in range(n)],
                     dtype=float)
     ci = bca_interval(theta, reps, jack, alpha)
@@ -1274,23 +1302,31 @@ def section_descriptives(df: pd.DataFrame, opts: Options, ledger: Ledger,
        f'threshold = 1)')
     ledger.est(f'descriptives on {metric}')
     rows = []
-    for (cell, cond, label), g in df.groupby(['cell', 'condition', 'label'],
-                                             dropna=False):
+    # Grouped by environment as well as by arm. Scores are normalised per
+    # environment, so rows from different environments are not comparable and
+    # must not be presented as though they were (DESIGN.md §5.1); the env
+    # column makes that visible instead of leaving it to be inferred.
+    for (env, cell, cond, label), g in df.groupby(
+            ['env', 'cell', 'condition', 'label'], dropna=False):
         x = _clean(g[metric])
         if not len(x):
             continue
         boot = bootstrap_statistic(x, lambda a: float(np.mean(a)),
-                                   opts.n_boot, opts.boot_seed)
-        rows.append({'cell': cell, 'condition': cond, 'label': label,
+                                   opts.n_boot, opts.boot_seed, vec=mean_vec)
+        rows.append({'env': env, 'cell': cell, 'condition': cond,
+                     'label': label, 'seed_block':
+                         '/'.join(sorted(set(str(b) for b in
+                                             g['seed_block'].dropna()))),
                      'n': len(x), 'mean': float(np.mean(x)), 'sd': sd(x),
                      'median': float(np.median(x)),
                      'ci_lo': boot['lo'], 'ci_hi': boot['hi'],
                      'min': float(np.min(x)), 'max': float(np.max(x))})
     order = {c: i for i, c in enumerate(CELL_ORDER)}
-    rows.sort(key=lambda r: (order.get(r['cell'], 99), str(r['condition']),
-                             str(r['label'])))
-    print(table(rows, ('cell', 'condition', 'label', 'n', 'mean', 'sd',
-                       'median', 'ci_lo', 'ci_hi', 'min', 'max')))
+    rows.sort(key=lambda r: (str(r['env']), order.get(r['cell'], 99),
+                             str(r['condition']), str(r['label'])))
+    print(table(rows, ('env', 'cell', 'condition', 'label', 'seed_block', 'n',
+                       'mean', 'sd', 'median', 'ci_lo', 'ci_hi', 'min',
+                       'max')))
     print('  CI: bias-corrected-and-accelerated seed-level bootstrap on the '
           'mean. No')
     print('  normality-assuming interval appears anywhere in this module '
@@ -1363,7 +1399,7 @@ def section_convergence(df: pd.DataFrame, opts: Options,
         if not len(s):
             continue
         boot = bootstrap_statistic(s, lambda a: float(np.median(a)),
-                                   opts.n_boot, opts.boot_seed)
+                                   opts.n_boot, opts.boot_seed, vec=median_vec)
         k = int(np.sum(s > 0))
         lo, hi = clopper_pearson(k, len(s))
         moving = bool(np.isfinite(boot['lo']) and np.isfinite(boot['hi'])
@@ -1509,7 +1545,7 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
 
             idx = boot_indices(n, opts.n_boot, opts.boot_seed)
             hl = bootstrap_statistic(d, hodges_lehmann_paired, opts.n_boot,
-                                     opts.boot_seed, idx=idx)
+                                     opts.boot_seed, idx=idx, vec=hl_vec)
             sf = sign_flip_test(d, seed=opts.boot_seed)
             try:
                 w_stat, w_p = sps.wilcoxon(d, zero_method='wilcox',
@@ -1802,6 +1838,29 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
     print('  C2K0 untrained source with freeze_updates=0, C3 permuted source '
           '(entry-wise')
     print('  shuffle), C3b permuted source (spectrum-matched).')
+    print()
+    print('  THE TELESCOPING IDENTITY, stated once: '
+          '(C2-C0) + (C3-C2) + (C1-C3) = C1-C0.')
+    print('  It is an ARITHMETIC IDENTITY. It holds for any four numbers and '
+          'is shown only to')
+    print('  fix notation. It is NOT evidence of additivity, NOT a '
+          'decomposition of a causal')
+    print('  effect, and nothing about it is testable (DESIGN.md §4.1). '
+          'Revision 1 of the')
+    print('  design called it "an additive decomposition, each term estimable '
+          'at n=10", which')
+    print('  implied an empirical finding where there is none. Each cell below '
+          'prints the')
+    print('  arithmetic residual only, as a check that the numbers are the '
+          'numbers.')
+    print()
+    print('  EXCLUSION RESTRICTION each mechanistic reading requires, stated '
+          'once:')
+    for key, restriction in CONTROL_EXCLUSION_RESTRICTIONS.items():
+        print(f'    {key:<8} {restriction}')
+    print()
+    print('  Contrasts are named after WHAT WAS MANIPULATED, never after a '
+          'mechanism.')
 
     for cell in CELL_ORDER:
         cdf = df[df['cell'] == cell]
@@ -1859,13 +1918,17 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
             ia, ib = col[a], col[b]
             return lambda m: hodges_lehmann_paired(m[:, ia] - m[:, ib])
 
+        def make_vec(a: str, b: str) -> Callable[[np.ndarray], np.ndarray]:
+            ia, ib = col[a], col[b]
+            return lambda S: hl_vec(S[..., ia] - S[..., ib])
+
         rows = []
         reps: dict[str, np.ndarray] = {}
         per_seed_contrast: dict[str, np.ndarray] = {}
         for key, name, a, b in usable:
             stat = make_stat(a, b)
             res = bootstrap_statistic(mat, stat, opts.n_boot, opts.boot_seed,
-                                      idx=idx)
+                                      idx=idx, vec=make_vec(a, b))
             d = mat[:, col[a]] - mat[:, col[b]]
             per_seed_contrast[key] = d
             reps[key] = res.pop('reps', np.array([]))
@@ -1881,11 +1944,8 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
                                             'the contrast'))
 
         keys = [r['contrast'] for r in rows]
+        crows = []
         if len(keys) > 1:
-            print()
-            print('  Across-seed correlation of the per-seed contrast values '
-                  '(Spearman):')
-            crows = []
             for a, b in combinations(keys, 2):
                 x, y = per_seed_contrast[a], per_seed_contrast[b]
                 rho = (float(sps.spearmanr(x, y)[0]) if n > 2
@@ -1894,14 +1954,27 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
                         if len(reps[a]) and len(reps[b]) else float('nan'))
                 crows.append({'a': a, 'b': b, 'rho_seeds': rho,
                               'rho_bootstrap_estimators': brho})
-            print(table(crows, ('a', 'b', 'rho_seeds',
-                                'rho_bootstrap_estimators')))
-            print('  rho_seeds is the correlation across seeds; '
-                  'rho_bootstrap_estimators is the')
-            print('  correlation of the estimators induced by the shared '
-                  'resampling. Both come')
-            print('  from the ONE bootstrap, which is the point of estimating '
-                  'jointly.')
+            print()
+            print('  Contrast correlation matrix. Lower triangle: Spearman '
+                  'rho across seeds.')
+            print('  Upper triangle: correlation of the bootstrap estimators '
+                  'induced by the shared')
+            print('  resampling -- which is what estimating jointly buys, and '
+                  'what four separate')
+            print('  two-sample tests on overlapping groups would throw away.')
+            lookup = {(r['a'], r['b']): r for r in crows}
+            mrows = []
+            for a in keys:
+                row: dict[str, Any] = {'contrast': a}
+                for b in keys:
+                    if a == b:
+                        row[b] = 1.0
+                    elif (a, b) in lookup:
+                        row[b] = lookup[(a, b)]['rho_bootstrap_estimators']
+                    else:
+                        row[b] = lookup[(b, a)]['rho_seeds']
+                mrows.append(row)
+            print(table(mrows, ('contrast',) + tuple(keys), nd=2))
 
         if all(k in per_seed_contrast for k in ('C2-C0', 'C3-C2', 'C1-C3',
                                                'C1-C0')):
@@ -1910,26 +1983,9 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
             rhs = per_seed_contrast['C1-C0']
             resid = float(np.max(np.abs(lhs - rhs)))
             print()
-            print('  Telescoping identity: (C2-C0) + (C3-C2) + (C1-C3) = '
-                  'C1-C0')
-            print(f'    max |lhs - rhs| over seeds = {resid:.3e}')
-            print('    THIS IS AN ARITHMETIC IDENTITY. It holds for any four '
-                  'numbers and is')
-            print('    shown only to fix notation. It is NOT evidence of '
-                  'additivity, NOT a')
-            print('    decomposition of a causal effect, and nothing about it '
-                  'is testable')
-            print('    (DESIGN.md §4.1). Revision 1 of the design called it '
-                  '"an additive')
-            print('    decomposition, each term estimable at n=10", which '
-                  'implied an empirical')
-            print('    finding where there is none.')
-
-        print()
-        print('  Exclusion restriction each mechanistic reading requires:')
-        for r in rows:
-            print(f'    {r["contrast"]}: '
-                  f'{CONTROL_EXCLUSION_RESTRICTIONS.get(r["contrast"], "-")}')
+            print(f'  Telescoping identity residual (an identity, see the '
+                  f'header): max |lhs - rhs|')
+            print(f'  over seeds = {resid:.3e}')
 
         if 'C2-C0' in per_seed_contrast and 'C1-C3' in per_seed_contrast:
             h2_mech = phrase_magnitude_comparison(
@@ -2028,7 +2084,7 @@ def section_c4(df: pd.DataFrame, opts: Options, ledger: Ledger,
             ledger.suppressed.append(f'C4 {cell}: n={len(d)}')
         else:
             res = bootstrap_statistic(d, hodges_lehmann_paired, opts.n_boot,
-                                      opts.boot_seed)
+                                      opts.boot_seed, vec=hl_vec)
             passed = bool(np.isfinite(res['lo']) and res['lo'] > C4_LOWER_BOUND)
             rec.update({'hl': res['estimate'], 'ci_lo': res['lo'],
                         'ci_hi': res['hi'],
@@ -2155,13 +2211,15 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
         idx = boot_indices(len(common), opts.n_boot, opts.boot_seed)
         raw = bootstrap_statistic(
             mat, lambda m: hodges_lehmann_paired(m[:, 0] - m[:, 1]),
-            opts.n_boot, opts.boot_seed, idx=idx)
+            opts.n_boot, opts.boot_seed, idx=idx,
+            vec=lambda S: hl_vec(S[..., 0] - S[..., 1]))
         ha, hb = headroom.get(a, float('nan')), headroom.get(b, float('nan'))
         if np.isfinite(ha) and np.isfinite(hb) and ha > 0 and hb > 0:
             adj = bootstrap_statistic(
                 mat, lambda m: hodges_lehmann_paired(m[:, 0] / ha
                                                      - m[:, 1] / hb),
-                opts.n_boot, opts.boot_seed, idx=idx)
+                opts.n_boot, opts.boot_seed, idx=idx,
+                vec=lambda S: hl_vec(S[..., 0] / ha - S[..., 1] / hb))
         else:
             adj = {'estimate': float('nan'), 'lo': float('nan'),
                    'hi': float('nan')}
@@ -2220,8 +2278,10 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
                 return hodges_lehmann_paired(
                     (m[:, 3] - m[:, 2]) - (m[:, 1] - m[:, 0]))
 
-            res = bootstrap_statistic(mat, interaction, opts.n_boot,
-                                      opts.boot_seed)
+            res = bootstrap_statistic(
+                mat, interaction, opts.n_boot, opts.boot_seed,
+                vec=lambda S: hl_vec((S[..., 3] - S[..., 2])
+                                     - (S[..., 1] - S[..., 0])))
             print()
             print(f'  2x2 interaction (target_rule effect on delta, dueling '
                   f'minus mlp), n={len(common)}:')
@@ -2350,12 +2410,22 @@ def sub_rq6(df: pd.DataFrame, opts: Options, ledger: Ledger,
                                        else None)}
             if len(d) >= MIN_N_FOR_INFERENCE:
                 res = bootstrap_statistic(d, hodges_lehmann_paired,
-                                          opts.n_boot, opts.boot_seed)
+                                          opts.n_boot, opts.boot_seed,
+                                          vec=hl_vec)
                 rec.update({'hl': res['estimate'], 'ci_lo': res['lo'],
                             'ci_hi': res['hi']})
             rows.append(rec)
     print(table(rows, ('cell', 'prefix', 'n', 'delta_at_prefix',
                        'delta_at_budget', 'hl', 'ci_lo', 'ci_hi')))
+    if all(r['n'] == 0 for r in rows):
+        print(f'  The prefix columns {prefixes} exist but hold no values in '
+              f'this dataset, so RQ6')
+        print('  is not estimable here. Nothing is substituted for a prefix '
+              'evaluation that was')
+        print('  never run.')
+        ledger.deviations.append(
+            'RQ6 not estimable: prefix_score_* columns are present but empty, '
+            'so no episode-prefix re-evaluation exists in this dataset')
     print('  A sign change between a prefix and the budget would mean the '
           'conclusion is')
     print('  budget-dependent, which is itself a finding and is reported as '
@@ -2399,7 +2469,19 @@ def sub_dispersion(df: pd.DataFrame, opts: Options, ledger: Ledger,
                 a, b = np.std(m[:, 0], ddof=1), np.std(m[:, 1], ddof=1)
                 return float(a / b) if b > 0 else float('nan')
 
-            res = bootstrap_statistic(mat, ratio, opts.n_boot, opts.boot_seed)
+            def ratio_vec(S: np.ndarray) -> np.ndarray:
+                # A resample can draw one seed three times, making the
+                # denominator SD exactly zero. Such a replicate carries no
+                # information about the ratio and is dropped by bca_interval's
+                # finite filter -- it is never silently read as an infinity.
+                num = np.std(S[..., 0], axis=-1, ddof=1)
+                den = np.std(S[..., 1], axis=-1, ddof=1)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    out = num / den
+                return np.where(den > 0, out, np.nan)
+
+            res = bootstrap_statistic(mat, ratio, opts.n_boot, opts.boot_seed,
+                                      vec=ratio_vec)
             bf = sps.levene(pair['a'], pair['b'], center='median')
             rec.update({'sd_ratio': res['estimate'], 'ci_lo': res['lo'],
                         'ci_hi': res['hi'],
@@ -2542,7 +2624,8 @@ def sub_secondary(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
                                     else None)}
             if len(d) >= MIN_N_FOR_INFERENCE:
                 res = bootstrap_statistic(d, hodges_lehmann_paired,
-                                          opts.n_boot, opts.boot_seed)
+                                          opts.n_boot, opts.boot_seed,
+                                          vec=hl_vec)
                 rec.update({'hl_delta': res['estimate'], 'ci_lo': res['lo'],
                             'ci_hi': res['hi']})
             rows.append(rec)
@@ -2639,7 +2722,8 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
                        'n': len(d)}
                 if len(d) >= MIN_N_FOR_INFERENCE:
                     res = bootstrap_statistic(d, hodges_lehmann_paired,
-                                              opts.n_boot, opts.boot_seed)
+                                              opts.n_boot, opts.boot_seed,
+                                              vec=hl_vec)
                     sf = sign_flip_test(d, seed=opts.boot_seed)
                     rec.update({'hl': res['estimate'], 'ci_lo': res['lo'],
                                 'ci_hi': res['hi'], 'p_raw': sf['p']})
@@ -2671,14 +2755,25 @@ def section_estimation(df: pd.DataFrame, opts: Options, ledger: Ledger,
     print('  a seed-level bootstrap 95% CI and NO p-value at all. Where a '
           'directional claim')
     print('  is wanted, the licensed form is what the interval excludes.')
+    # Per-arm summary tables below are restricted to the target environment.
+    # Scores are normalised per environment, so a table that mixed a CartPole
+    # source arm with a LunarLander target arm would invite exactly the
+    # cross-scale comparison DESIGN.md §5.1 forbids -- and the per-cell
+    # survival comparison would silently pit a source arm against a target one.
+    tdf = target_side(df[df['env'] == opts.target_env])
+    print(f'  Per-arm tables in 9f-9j are restricted to '
+          f'{opts.target_env}: {len(tdf)} of {len(df)} run(s). Scores are')
+    print('  normalised per environment, so arms on different environments are '
+          'never placed')
+    print('  in one comparison (DESIGN.md §5.1).')
     return {'rq1': sub_rq1(df, opts, ledger, metric),
             'rq3': sub_rq3(df, opts, ledger, metric, gate),
             'rq5': sub_rq5(df, opts, ledger, metric),
             'rq6': sub_rq6(df, opts, ledger, metric),
             'dispersion': sub_dispersion(df, opts, ledger, metric),
-            'censored': sub_censored(df, opts, ledger),
-            'secondary': sub_secondary(df, opts, ledger),
-            'screens': sub_screens(df, opts, ledger, metric)}
+            'censored': sub_censored(tdf, opts, ledger),
+            'secondary': sub_secondary(tdf, opts, ledger),
+            'screens': sub_screens(tdf, opts, ledger, metric)}
 
 
 def section_power(df: pd.DataFrame, conf: dict, opts: Options,
@@ -2945,6 +3040,16 @@ def self_test() -> int:
     check('HL is shift-equivariant',
           abs(hodges_lehmann_paired([1.0, 2.0, 3.0])
               - hodges_lehmann_paired([0.0, 1.0, 2.0]) - 1.0) < 1e-12)
+    rng = np.random.default_rng(7)
+    stack = rng.normal(size=(200, 9))
+    check('the vectorised HL agrees with the scalar one everywhere',
+          float(np.max(np.abs(hl_vec(stack)
+                              - np.array([hodges_lehmann_paired(r)
+                                          for r in stack])))) < 1e-12)
+    check('the vectorised mean and median agree with the scalar ones',
+          float(np.max(np.abs(mean_vec(stack) - stack.mean(axis=1)))) < 1e-12
+          and float(np.max(np.abs(median_vec(stack)
+                                  - np.median(stack, axis=1)))) < 1e-12)
 
     h2('Holm over a fixed family size')
     adj = holm_adjust({'a': 0.001, 'b': 0.02, 'c': 0.04}, 8)
@@ -2988,7 +3093,8 @@ def self_test() -> int:
 
     h2('BCa interval')
     x = np.array([0.1, 0.2, 0.15, 0.3, 0.25, 0.05, 0.35, 0.2, 0.1, 0.4])
-    res = bootstrap_statistic(x, lambda a: float(np.mean(a)), n_boot=2000)
+    res = bootstrap_statistic(x, lambda a: float(np.mean(a)), n_boot=2000,
+                              vec=mean_vec)
     check('the interval brackets the estimate',
           res['lo'] <= res['estimate'] <= res['hi'], str(res))
     small = bootstrap_statistic(np.array([1.0, 2.0]),
@@ -3194,11 +3300,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             'secondary), not the primary valid-sources-only estimand')
 
     primary_metric = opts.metrics[0]
-    conf = section_confirmatory(analysis, opts, ledger)
     report['s3_descriptives'] = {
         m: section_descriptives(analysis, opts, ledger, m)
         for m in opts.metrics}
     report['s4_convergence'] = section_convergence(analysis, opts, ledger)
+    conf = section_confirmatory(analysis, opts, ledger)
     report['s5_confirmatory'] = conf
     report['s6_equivalence'] = section_equivalence(conf, analysis, opts, ledger)
     report['s7_controls'] = {

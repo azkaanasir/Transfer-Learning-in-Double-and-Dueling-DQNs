@@ -348,6 +348,43 @@ def shift_labels() -> dict[str, list[dict[str, Any]]]:
     return out
 
 
+def resolve_selection(per_seed: pd.DataFrame) -> tuple[set[str], list[dict]]:
+    """One run directory per (arm label, seed), chosen deterministically.
+
+    An arm label plus a seed is supposed to name exactly one run: the label is
+    the arm's identity, and revision 1's fourth fatal defect was nine
+    conditions from six experiments collapsing onto one run directory
+    (`DESIGN.md` §11). Two run directories under one (label, seed) therefore
+    means the table mixes *configurations* inside one arm -- runs produced
+    under different registry settings, or a directory left behind by an earlier
+    protocol. Averaging across them would silently pool two treatments, which
+    is the published study's original error.
+
+    The figure is still drawn, because refusing to draw is `audit.py`'s job and
+    not a plotting decision, but the collision is reported loudly, the
+    surviving run is chosen by sorted path so the figure is reproducible, and
+    the discarded paths go into every provenance record.
+    """
+    keep: set[str] = set()
+    collisions: list[dict] = []
+    for (label, seed), group in per_seed.groupby(['label', 'seed'], sort=True):
+        run_dirs = sorted(str(r) for r in group['run_dir'].tolist())
+        keep.add(run_dirs[0])
+        if len(run_dirs) > 1:
+            varying = sorted(
+                col for col in ('freeze_updates', 'num_episodes', 'lr',
+                                'transfer_set', 'freeze_group', 'permute_kind',
+                                'aggregation', 'value_recal', 'target_update',
+                                'hidden', 'head_units', 'env', 'source_env')
+                if col in group.columns
+                and group[col].astype(str).nunique() > 1)
+            collisions.append({'label': str(label), 'seed': int(seed),
+                               'kept': run_dirs[0],
+                               'discarded': run_dirs[1:],
+                               'fields_that_differ': varying})
+    return keep, collisions
+
+
 @dataclass
 class Context:
     """Everything a figure function needs, resolved once."""
@@ -371,7 +408,26 @@ class Context:
     hashes: dict = field(default_factory=dict)
     written: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: One run directory per (label, seed). See `resolve_selection`.
+    selected: set[str] = field(default_factory=set)
+    #: (label, seed) pairs that resolved to more than one run directory.
+    collisions: list[dict] = field(default_factory=list)
     _manifests: dict[str, dict] = field(default_factory=dict)
+
+    # -- label -> runs ----------------------------------------------------
+    def rows_for_labels(self, labels: Iterable[str]) -> pd.DataFrame:
+        wanted = [l for l in dict.fromkeys(labels) if l]
+        rows = self.per_seed[self.per_seed['label'].isin(wanted)]
+        if self.selected:
+            rows = rows[rows['run_dir'].isin(self.selected)]
+        return rows
+
+    def run_dirs_for_labels(self, labels: Iterable[str]) -> list[str]:
+        return self.rows_for_labels(labels)['run_dir'].tolist()
+
+    def envs_for_labels(self, labels: Iterable[str]) -> list[str]:
+        return list(dict.fromkeys(
+            self.rows_for_labels(labels)['env'].dropna().tolist()))
 
     # -- manifest access, best effort ------------------------------------
     def manifest(self, run_dir: str) -> dict:
@@ -475,7 +531,10 @@ def load(per_seed_path: str, curves_path: Optional[str]) -> tuple[pd.DataFrame,
 # 4. Selection and pairing
 # ---------------------------------------------------------------------------
 def arm_rows(ctx: Context, label: str) -> pd.DataFrame:
-    return ctx.per_seed[ctx.per_seed['label'] == label]
+    rows = ctx.per_seed[ctx.per_seed['label'] == label]
+    if ctx.selected:
+        rows = rows[rows['run_dir'].isin(ctx.selected)]
+    return rows
 
 
 @dataclass
@@ -503,7 +562,8 @@ def _seed_series(ctx: Context, label: str, metric: str,
     rows = arm_rows(ctx, label)
     if metric not in rows.columns:
         return pd.Series(dtype=float)
-    rows = rows[['seed', metric]].dropna(subset=[metric])
+    rows = (rows[['run_dir', 'seed', metric]].dropna(subset=[metric])
+            .sort_values('run_dir'))
     dupe = rows['seed'].duplicated(keep=False)
     if bool(dupe.any()):
         for seed in sorted(set(rows.loc[dupe, 'seed'].tolist())):
@@ -609,9 +669,18 @@ def equivalence_sentence(est: dict, sd: float,
 #    boundary
 # ---------------------------------------------------------------------------
 def curve_rows(ctx: Context, label: str) -> pd.DataFrame:
+    """The episode rows of one arm, restricted to the canonical run per seed.
+
+    The restriction matters: without it a label carrying two configurations
+    (see `resolve_selection`) would have both averaged into one band, and a
+    band over two freeze windows is not a curve of either.
+    """
     if ctx.curves.empty or 'label' not in ctx.curves.columns:
         return ctx.curves
-    return ctx.curves[ctx.curves['label'] == label]
+    rows = ctx.curves[ctx.curves['label'] == label]
+    if ctx.selected and 'run_dir' in rows.columns:
+        rows = rows[rows['run_dir'].isin(ctx.selected)]
+    return rows
 
 
 def _support(frames: Sequence[pd.DataFrame], column: str) -> tuple[float, float,
@@ -886,6 +955,8 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
         'seeds': seeds,
         'analyses_carrying_a_p_value': 0,
         'arm_labels': ctx.arms,
+        'arm_seed_collisions': ctx.collisions,
+        'runs_selected': len(ctx.selected),
         'evaluation_protocol': protocol,
         'normalisation_references': refs,
         'figure_specific': meta or {},
@@ -908,11 +979,13 @@ def fig_learning_curves(ctx: Context) -> None:
         return
 
     frames: dict[tuple[str, str], pd.DataFrame] = {}
+    labels_used: list[str] = []
     for cell in cells:
         for cond in ('scratch', 'transfer'):
             label = ctx.arms.get(cell, {}).get(cond)
             if label:
                 frames[(cell, cond)] = curve_rows(ctx, label)
+                labels_used.append(label)
     x0, x1, n_runs = _support(list(frames.values()), 'eval_score')
     if n_runs == 0 or not np.isfinite(x0) or x1 <= x0:
         print(f'{WARN} learning_curves: no common env-step support across the '
@@ -984,8 +1057,9 @@ def fig_learning_curves(ctx: Context) -> None:
     total = sum(b['runs'] for b in boundaries.values())
     max_upd = max([b['max_updates'] for b in boundaries.values()
                    if np.isfinite(b['max_updates'])] or [float('nan')])
-    ks = sorted({int(v) for v in
-                 ctx.per_seed[ctx.per_seed['condition'] == 'transfer']
+    transfer_labels = [ctx.arms[c]['transfer'] for c in cells
+                       if 'transfer' in ctx.arms.get(c, {})]
+    ks = sorted({int(v) for v in ctx.rows_for_labels(transfer_labels)
                  ['freeze_updates'].dropna().tolist()})
     if exited:
         bnd_text = (f'The freeze boundary is drawn per cell at the mean env '
@@ -1011,9 +1085,8 @@ def fig_learning_curves(ctx: Context) -> None:
                'runs\' ranges, so no point of any band is an extrapolation and '
                'every point rests on the same number of seeds. ' + bnd_text),
          seeds=sorted(seeds), n_min=n_min,
-         protocol=ctx.protocol(
-             [r for f in frames.values() for r in f['run_dir'].unique()]),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
+         refs=ctx.references(ctx.envs_for_labels(labels_used)),
          interval=(f'shaded band = 95% percentile bootstrap over seeds, '
                    f'{ctx.n_boot} resamples, fixed seed {ctx.boot_seed} '
                    f'(stats.boot_indices); suppressed where n < '
@@ -1040,6 +1113,9 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
     seeds: set[int] = set()
     n_min = None
     margin = stats.EQUIVALENCE_MARGIN
+    labels_used = [l for cell in cells for l in
+                   (ctx.arms[cell].get('scratch'),
+                    ctx.arms[cell].get('transfer')) if l]
 
     for ax, endpoint in zip(axes, endpoints):
         ax.axvspan(-margin, margin, color=_GREY, alpha=0.13, linewidth=0,
@@ -1125,8 +1201,8 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
                'test, and a CI that merely covers zero is not evidence of '
                'equivalence.'),
          seeds=sorted(seeds), n_min=n_min,
-         protocol=ctx.protocol(ctx.per_seed['run_dir'].tolist()),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
+         refs=ctx.references(ctx.envs_for_labels(labels_used)),
          interval=(f'Hodges-Lehmann paired shift with a bias-corrected (BCa) '
                    f'seed-level bootstrap 95% CI, {ctx.n_boot} resamples, '
                    f'fixed seed {ctx.boot_seed} (stats.bootstrap_statistic); '
@@ -1157,6 +1233,7 @@ def fig_control_decomposition(ctx: Context) -> None:
     seeds: set[int] = set()
     n_min = None
     missing: dict[str, list[str]] = {}
+    labels_used = [l for cell in cells for l in ctx.arms[cell].values()]
 
     for ax, cell in zip(axes, cells):
         labels = ctx.arms[cell]
@@ -1270,8 +1347,8 @@ def fig_control_decomposition(ctx: Context) -> None:
                'because an entry-wise shuffle preserves the Frobenius norm but '
                'not the singular-value spectrum.' + absent_text),
          seeds=sorted(seeds), n_min=n_min,
-         protocol=ctx.protocol(ctx.per_seed['run_dir'].tolist()),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
+         refs=ctx.references(ctx.envs_for_labels(labels_used)),
          interval=(f'one joint seed-level bootstrap per cell -- a single shared '
                    f'resampling of seeds ({ctx.n_boot} resamples, fixed seed '
                    f'{ctx.boot_seed}) supplies every level and every contrast, '
@@ -1304,6 +1381,9 @@ def fig_interaction_2x2(ctx: Context) -> None:
     meta: dict[str, Any] = {'cells': {}, 'interaction': {}}
     seeds: set[int] = set()
     n_min = None
+    labels_used = [l for cell in CELL_ORDER
+                   for l in (ctx.arms.get(cell, {}).get('scratch'),
+                             ctx.arms.get(cell, {}).get('transfer')) if l]
 
     for ax, endpoint in zip(axes, endpoints):
         deltas: dict[str, pd.Series] = {}
@@ -1412,8 +1492,8 @@ def fig_interaction_2x2(ctx: Context) -> None:
                'interval and no p-value (ANALYSIS_PLAN.md 3, 6). Non-parallel '
                'lines here are not a finding.'),
          seeds=sorted(seeds), n_min=n_min,
-         protocol=ctx.protocol(ctx.per_seed['run_dir'].tolist()),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
+         refs=ctx.references(ctx.envs_for_labels(labels_used)),
          interval=(f'Hodges-Lehmann paired shift per cell with a '
                    f'bias-corrected bootstrap 95% CI; the interaction contrast '
                    f'is a paired mean under one joint resampling of the seeds '
@@ -1455,6 +1535,11 @@ def fig_shift_gradient(ctx: Context) -> None:
                                        else 'declared manipulated level')}
     seeds: set[int] = set()
     n_min = None
+    labels_used: list[str] = []
+    for cell in CELL_ORDER:
+        for rec in ctx.shifts.get(cell, []):
+            labels_used.extend(v for k, v in rec.items() if k != 'env')
+        labels_used.extend(ctx.iface.get(cell, {}).values())
 
     for ax, (family, title, confounded) in zip(axes[:2], families):
         base_value = None
@@ -1595,8 +1680,8 @@ def fig_shift_gradient(ctx: Context) -> None:
                'against that variant\'s own scratch arm, which is what keeps a '
                'variant\'s changed return scale out of the effect. ' + x_note),
          seeds=sorted(seeds), n_min=n_min,
-         protocol=ctx.protocol(ctx.per_seed['run_dir'].tolist()),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
+         refs=ctx.references(ctx.envs_for_labels(labels_used)),
          interval=(f'Hodges-Lehmann paired shift per level with a '
                    f'bias-corrected bootstrap 95% CI, {ctx.n_boot} resamples, '
                    f'seed {ctx.boot_seed}. The ordered-alternative trend '
@@ -1722,7 +1807,8 @@ def fig_freeze_duration(ctx: Context) -> None:
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(fam['run_dir'].tolist() if not fam.empty
                                else []),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         refs=ctx.references(list(fam['env'].dropna().unique())
+                             if not fam.empty else []),
          interval=(f'Hodges-Lehmann paired shift against the same cell\'s '
                    f'scratch arm with a bias-corrected bootstrap 95% CI, '
                    f'{ctx.n_boot} resamples, seed {ctx.boot_seed}'),
@@ -1770,11 +1856,13 @@ def fig_diagnostics(ctx: Context) -> None:
         return
 
     frames: dict[tuple[str, str], pd.DataFrame] = {}
+    labels_used: list[str] = []
     for cell in cells:
         for cond in ('scratch', 'transfer'):
             label = ctx.arms.get(cell, {}).get(cond)
             if label:
                 frames[(cell, cond)] = curve_rows(ctx, label)
+                labels_used.append(label)
 
     fig, axes = plt.subplots(len(rows), len(cells),
                              figsize=(FULL_WIDTH, 1.55 * len(rows) + 0.9),
@@ -1874,9 +1962,8 @@ def fig_diagnostics(ctx: Context) -> None:
                'magnitudes are undefined for the mlp cells and those panels '
                'say so rather than showing an empty axis.' + gap),
          seeds=sorted(seeds), n_min=n_min,
-         protocol=ctx.protocol(
-             [r for f in frames.values() for r in f['run_dir'].unique()]),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
+         refs=ctx.references(ctx.envs_for_labels(labels_used)),
          interval=(f'shaded band = 95% percentile bootstrap over seeds, '
                    f'{ctx.n_boot} resamples, seed {ctx.boot_seed}; suppressed '
                    f'where n < {stats.MIN_N_FOR_INFERENCE}'),
@@ -1898,6 +1985,7 @@ def fig_performance_profiles(ctx: Context) -> None:
     seeds: set[int] = set()
     n_min = None
     meta: dict[str, Any] = {'endpoint': endpoint, 'cells': {}}
+    labels_used = [l for cell in cells for l in ctx.arms[cell].values()]
 
     values: dict[tuple[str, str], np.ndarray] = {}
     for cell in cells:
@@ -1978,8 +2066,8 @@ def fig_performance_profiles(ctx: Context) -> None:
                'curves mean no arm dominates, which a difference in means '
                'would conceal.'),
          seeds=sorted(seeds), n_min=n_min,
-         protocol=ctx.protocol(ctx.per_seed['run_dir'].tolist()),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
+         refs=ctx.references(ctx.envs_for_labels(labels_used)),
          interval=('none -- this is an empirical distribution function, drawn '
                    'without a confidence band because at these seed counts a '
                    'band would be wider than the distance between the arms and '
@@ -2004,6 +2092,9 @@ def fig_km_threshold(ctx: Context) -> None:
     seeds: set[int] = set()
     n_min = None
     meta: dict[str, Any] = {'levels': {}, 'logrank': {}}
+    labels_used = [l for cell in cells for l in
+                   (ctx.arms[cell].get('scratch'),
+                    ctx.arms[cell].get('transfer')) if l]
 
     for i, (tag, value) in enumerate(levels):
         tcol, ccol = f'steps_to_threshold_{tag}', f'censored_{tag}'
@@ -2106,8 +2197,8 @@ def fig_km_threshold(ctx: Context) -> None:
                f'no run reaches "solved"; {total_events} event(s) are observed '
                'in total in this table.'),
          seeds=sorted(seeds), n_min=n_min,
-         protocol=ctx.protocol(ctx.per_seed['run_dir'].tolist()),
-         refs=ctx.references(ctx.per_seed['env'].dropna().unique()),
+         protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
+         refs=ctx.references(ctx.envs_for_labels(labels_used)),
          interval=('Kaplan-Meier step estimate (stats.kaplan_meier); the '
                    'annotated interval is the exact Clopper-Pearson binomial '
                    'interval on P(reached), not a bootstrap'),
@@ -2260,6 +2351,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             hashes={'per_seed': provenance.file_hash(args.per_seed),
                     'curves': (provenance.file_hash(args.curves)
                                if os.path.isfile(args.curves) else None)})
+        ctx.selected, ctx.collisions = resolve_selection(per_seed)
         if args.shift_metrics:
             try:
                 with open(args.shift_metrics, 'r', encoding='utf-8') as fh:
@@ -2294,6 +2386,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       f'metrics-integrity check. They are plotted, because '
                       f'dropping them silently is the defect under repair, but '
                       f'no window statistic from them is trustworthy.')
+        if ctx.collisions:
+            print()
+            print('!' * 72)
+            print(f'{WARN} {len(ctx.collisions)} (arm label, seed) pair(s) '
+                  f'resolve to MORE THAN ONE run directory. An arm label plus '
+                  f'a seed names one run by construction, so this table mixes '
+                  f'configurations inside one arm identity -- exactly the '
+                  f'collision DESIGN.md 11 exists to prevent. Figures are '
+                  f'drawn from the lexicographically first path per pair, '
+                  f'deterministically, and every discarded path is in each '
+                  f'figure provenance record. audit.py is the enforcement '
+                  f'point; a result must not be reported from this table until '
+                  f'it passes.')
+            fields = sorted({f for c in ctx.collisions
+                             for f in c['fields_that_differ']})
+            labels = sorted({c['label'] for c in ctx.collisions})
+            print(f'  affected arms ({len(labels)}): '
+                  + ', '.join(labels[:8])
+                  + (f', ... (+{len(labels) - 8} more)' if len(labels) > 8
+                     else ''))
+            print(f'  fields that differ between the colliding runs: '
+                  f'{fields or "none -- identical configs, duplicated on disk"}')
+            print('!' * 72)
         if 'seed_block' in per_seed.columns:
             tuned = per_seed[per_seed['seed_block'] == 'TUNE']
             if len(tuned):

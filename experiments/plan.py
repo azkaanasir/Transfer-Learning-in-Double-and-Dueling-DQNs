@@ -10,7 +10,9 @@
 `--jobs`, disk, and **the seed block of every run** be printed before anything
 launches. This file is that requirement. It launches nothing and writes into no
 analysis run tree; the one exception is `--measure`, whose calibration runs go to
-a separate root (`runs/_calibration`) that the analysis globs cannot reach.
+a root of their own (`runs_calibration/`) outside `runs/` altogether, because
+`audit.py` globs `runs/**/manifest.json` recursively and a nested directory would
+be audited as data however it were named.
 
 Why each section exists -- each one is a defect made visible in advance:
 
@@ -80,7 +82,10 @@ from src.dqn.config import Config                                # noqa: E402
 
 THROUGHPUT_FILE = os.path.join(REPO, 'experiments', 'throughput.json')
 THROUGHPUT_SCHEMA = 'throughput-v1'
-CALIBRATION_ROOT = os.path.join('runs', '_calibration')
+# Outside `runs/`, not merely underneath it: `audit.py` walks
+# `runs/**/manifest.json` recursively, so a calibration run parked in a nested
+# directory would be read as data no matter what the directory was called.
+CALIBRATION_ROOT = 'runs_calibration'
 
 # ---------------------------------------------------------------------------
 # Disk. Both figures are per run: the durable figure is the manifest, the three
@@ -1014,7 +1019,7 @@ def report(inv: Inventory, jobs_selected: Optional[int], list_runs: bool,
             tag = '+'.join(r.experiments)
             pairs[tag] = pairs.get(tag, 0) + 1
         for tag, count in sorted(pairs.items(), key=lambda kv: -kv[1])[:10]:
-            print(f'      {tag:30s} {count:4d} runs')
+            print(f'      {elide(tag, 34):34s} {count:4d} runs')
     print(f'  already complete under {inv.out_root}: '
           f'{inv.total - len(inv.pending)} / {inv.total}')
 
@@ -1328,8 +1333,8 @@ def main(argv=None) -> int:
                         'experiments/throughput.json')
     p.add_argument('--measure-episodes', type=int, default=25)
     p.add_argument('--measure-root', default=CALIBRATION_ROOT,
-                   help='where calibration runs go; deliberately outside the '
-                        'analysis globs')
+                   help='where calibration runs go; deliberately outside runs/, '
+                        'which audit.py globs recursively')
     p.add_argument('--measure-seed', type=int, default=900,
                    help='outside every declared seed block, so a calibration '
                         'run can never be mistaken for data')

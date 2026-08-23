@@ -115,6 +115,11 @@ class Trainer:
         }
 
         self.start_episode = 0
+        # The episode currently executing. The freeze schedule is indexed in
+        # gradient updates, but the *event* also records the episode it fired
+        # in, and recording `start_episode` there would have labelled every
+        # mid-run transition with the episode the session began at.
+        self._episode = 0
         self._frozen: bool | None = None
         self._fp_at_freeze: dict | None = None
         self._diag_baseline: np.ndarray | None = None
@@ -124,6 +129,7 @@ class Trainer:
         if cfg.is_transfer:
             self._setup_transfer()
         self._maybe_resume()
+        self._episode = self.start_episode
         self._apply_freeze(initial=True)
 
     # ---- setup -----------------------------------------------------------
@@ -313,7 +319,7 @@ class Trainer:
         # key of the same name silently replaced the set with the report dict,
         # losing the record of which layers the freeze actually targeted -- the
         # single most important fact in the event.
-        event = {'kind': 'freeze', 'episode': self.start_episode,
+        event = {'kind': 'freeze', 'episode': self._episode,
                  'updates': self.agent.update_counter, 'frozen': want,
                  'freeze_group': self.cfg.freeze_group,
                  'freeze_layers': list(layers),
@@ -569,6 +575,7 @@ class Trainer:
 
         try:
             for episode in range(self.start_episode, cfg.num_episodes):
+                self._episode = episode
                 state, _ = self.env.reset(
                     seed=int(self.seeds.episode_seed(episode)) % (2 ** 31 - 1))
                 state = np.asarray(state, dtype=np.float32)
