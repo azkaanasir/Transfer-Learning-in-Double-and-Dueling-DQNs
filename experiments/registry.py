@@ -70,12 +70,12 @@ PROTOCOL = dict(transfer_set='matched', input_policy='partial',
 # (DESIGN.md §3.3). E3 is the only experiment that varies them.
 COMMON = dict(lr=5e-4, target_update='hard', target_update_freq=1_000,
               gamma=0.99, batch_size=64, num_episodes=1000,
-              epsilon_anneal_steps=300_000, hidden=(128, 128), head_units=64)
+              epsilon_anneal_episodes=900, hidden=(128, 128), head_units=64)
 
 # Fields audited for constancy across an experiment's runs unless the experiment
 # declares that it varies one of them.
 CORE_INVARIANTS = ('lr', 'gamma', 'batch_size', 'num_episodes', 'max_steps',
-                   'epsilon_start', 'epsilon_min', 'epsilon_anneal_steps',
+                   'epsilon_start', 'epsilon_min', 'epsilon_anneal_episodes',
                    'target_update', 'target_update_freq', 'replay_capacity',
                    'learning_starts', 'train_every', 'grad_clip_norm',
                    'hidden', 'head_units')

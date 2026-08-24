@@ -84,6 +84,11 @@ class Agent:
         self.buffer = ReplayBuffer(cfg.replay_capacity, state_dim,
                                    self.seeds.rng('buffer'))
         self.env_steps = 0
+        # The episode the agent is in. Set by the trainer at the top of each
+        # episode, and the index of the exploration schedule -- which is
+        # episode-indexed because a step-indexed horizon is endogenous to policy
+        # quality (see `Config.epsilon_at`).
+        self.episode = 0
         self.update_counter = 0
         self.clip_events = 0
         self._train_fn = None            # rebuilt when the freeze state changes
@@ -94,9 +99,10 @@ class Agent:
     # ---- exploration -----------------------------------------------------
     @property
     def epsilon(self) -> float:
-        """Closed form in env steps, so it is independent of the evaluation
-        cadence and replayable at any point without simulating history."""
-        return self.cfg.epsilon_at(self.env_steps)
+        """Closed form in episodes: independent of the evaluation cadence,
+        replayable without simulating history, and exogenous to how well the
+        policy happens to be doing."""
+        return self.cfg.epsilon_at(self.episode)
 
     # ---- freezing --------------------------------------------------------
     def set_frozen(self, layer_names, frozen: bool) -> dict:

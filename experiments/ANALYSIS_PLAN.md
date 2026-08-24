@@ -198,8 +198,8 @@ that justify §2's single-family decision; they are not decoration.
 | Unpaired Mann–Whitney | 1.39 sigma | 1.87 sigma |
 
 The 1.00 versus 1.39 gap is why the paired test is primary: at this sample size
-the matched-seed design is worth roughly a 40 % reduction in the detectable
-effect, which is larger than any gain available from anything else in the plan.
+the matched-seed design reduces the detectable effect by about 28 % --
+equivalently, the unpaired test needs an effect about 39 % larger to reach the same power (1.41 against 1.01 sigma), which is the largest single power gain available to us.
 
 ### 6.3 Translated into score and return units
 

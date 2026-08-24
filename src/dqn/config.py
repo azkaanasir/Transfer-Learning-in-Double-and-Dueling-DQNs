@@ -116,10 +116,20 @@ class Config:
 
     epsilon_start: float = 1.0
     epsilon_min: float = 0.01
-    # Closed form in env steps (see `epsilon_at`). The published code decayed
-    # epsilon *inside* the evaluation branch, which made the exploration
-    # schedule a function of `eval_every`; nothing here couples them.
-    epsilon_anneal_steps: int = 300_000
+    # Closed form in *episodes* (see `epsilon_at`). The published code decayed
+    # epsilon inside the evaluation branch, which made the exploration schedule
+    # a function of `eval_every`; nothing here couples them.
+    #
+    # Episodes, not env steps, and the reason is empirical. A step-indexed
+    # horizon makes the exploration schedule endogenous to policy quality: a
+    # poor policy ends episodes quickly, so few steps accumulate, so epsilon
+    # barely anneals, so the policy stays poor. Measured on CartPole, a
+    # 1000-episode run delivered 24,708 steps against a 300,000-step horizon and
+    # epsilon fell only to 0.684; every source failed the validity gate. An
+    # episode is a trial and the number of trials is fixed by the budget, so the
+    # episode is the exogenous unit. 900 reproduces the published schedule
+    # (0.95 per 10 episodes, floor at episode 898) to within 0.001 throughout.
+    epsilon_anneal_episodes: int = 900
 
     target_update: str = 'hard'            # 'hard' | 'soft'
     target_update_freq: int = 1_000        # gradient steps, when 'hard'
@@ -239,20 +249,27 @@ class Config:
     def source_env_spec(self) -> Optional[envs.EnvSpec]:
         return envs.parse(self.source_env) if self.source_env else None
 
-    def epsilon_at(self, env_step: int) -> float:
-        """Closed-form exploration schedule, in env steps.
+    def epsilon_at(self, episode: int) -> float:
+        """Closed-form exploration schedule, indexed in episodes.
 
         Geometric interpolation from `epsilon_start` to `epsilon_min`, reaching
-        the floor exactly at `epsilon_anneal_steps`. Being closed form is what
-        makes it independent of the evaluation cadence, replayable at any point
-        without simulating history, and -- because it never reads
-        `num_episodes` -- what licenses the budget analysis in `DESIGN.md` RQ6:
-        a 500-episode prefix of a longer run is exactly what a 500-episode run
-        would have produced.
+        the floor exactly at `epsilon_anneal_episodes`. Three properties, each
+        of which matters:
+
+        * **Closed form**, so it is independent of the evaluation cadence and
+          replayable at any point without simulating history.
+        * **Indexed on episodes**, so the horizon is exogenous to policy
+          quality. A step-indexed horizon is not: a poor policy ends episodes
+          quickly, accumulates few steps, and therefore keeps a high epsilon,
+          which keeps it poor. That failure was measured, not hypothesised.
+        * **Blind to the budget** -- it never reads `num_episodes` -- which is
+          what licenses the budget analysis in `DESIGN.md` RQ6: a 500-episode
+          prefix of a longer run has exactly the exploration schedule a
+          500-episode run would have had.
         """
-        if self.epsilon_anneal_steps <= 0:
+        if self.epsilon_anneal_episodes <= 0:
             return float(self.epsilon_min)
-        frac = min(1.0, max(0.0, env_step / float(self.epsilon_anneal_steps)))
+        frac = min(1.0, max(0.0, episode / float(self.epsilon_anneal_episodes)))
         ratio = self.epsilon_min / self.epsilon_start
         return float(max(self.epsilon_min, self.epsilon_start * (ratio ** frac)))
 
@@ -380,7 +397,7 @@ TRAJECTORY_FIELDS: tuple[str, ...] = (
     'reset_head_at_unfreeze', 'shrink_perturb',
     'num_episodes', 'max_steps', 'lr', 'gamma', 'batch_size',
     'replay_capacity', 'learning_starts', 'train_every', 'grad_clip_norm',
-    'epsilon_start', 'epsilon_min', 'epsilon_anneal_steps',
+    'epsilon_start', 'epsilon_min', 'epsilon_anneal_episodes',
     'target_update', 'target_update_freq', 'tau', 'hidden', 'head_units',
 )
 

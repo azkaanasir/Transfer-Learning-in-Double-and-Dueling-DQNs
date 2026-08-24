@@ -130,6 +130,7 @@ class Trainer:
             self._setup_transfer()
         self._maybe_resume()
         self._episode = self.start_episode
+        self.agent.episode = self.start_episode
         self._apply_freeze(initial=True)
 
     # ---- setup -----------------------------------------------------------
@@ -576,6 +577,7 @@ class Trainer:
         try:
             for episode in range(self.start_episode, cfg.num_episodes):
                 self._episode = episode
+                self.agent.episode = episode
                 state, _ = self.env.reset(
                     seed=int(self.seeds.episode_seed(episode)) % (2 ** 31 - 1))
                 state = np.asarray(state, dtype=np.float32)

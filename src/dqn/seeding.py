@@ -45,8 +45,9 @@ name). Two consequences, both deliberate:
   `target_rule` levels are initialised identically throughout.
 * Because conditions at a given seed share their initialisation, the design is
   *matched by seed*. That is what licenses the paired analysis in
-  `ANALYSIS_PLAN.md` §2, where it buys roughly a 40% reduction in the minimum
-  detectable effect -- the largest single power gain available at n=10.
+  `ANALYSIS_PLAN.md` §2: at n=10 the paired test's minimum detectable effect is
+  1.01 sigma against the unpaired test's 1.41, a reduction of about 28% and the
+  largest single power gain available here.
 """
 from __future__ import annotations
 

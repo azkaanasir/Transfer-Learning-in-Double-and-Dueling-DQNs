@@ -610,7 +610,7 @@ def _identity_variants() -> list[tuple[str, dict]]:
         ('train_every=2', {'train_every': 2}),
         ('replay_capacity=50k', {'replay_capacity': 50_000}),
         ('grad_clip_norm=5', {'grad_clip_norm': 5.0}),
-        ('epsilon_anneal_steps=100k', {'epsilon_anneal_steps': 100_000}),
+        ('epsilon_anneal_episodes=300', {'epsilon_anneal_episodes': 300}),
         ('epsilon_min=0.05', {'epsilon_min': 0.05}),
         # measurement -- changes the reported number, so it changes identity
         ('eval_every=20', {'eval_every': 20}),
@@ -839,14 +839,14 @@ def test_field_classification_complete(ctx: Ctx) -> None:
 @case('DESIGN.md §3.2, §2.4 RQ6 -- epsilon is a closed form in env steps, '
       'coupled to neither the evaluation cadence nor the budget')
 def test_epsilon_closed_form(ctx: Ctx) -> None:
-    """Monotone, floors at epsilon_anneal_steps, blind to budget and cadence."""
+    """Monotone, floors at epsilon_anneal_episodes, blind to budget and cadence."""
     import inspect
 
     from src.dqn.config import Config
 
     base = Config(experiment='validate', condition='scratch',
                   env='LunarLander-v3', seed=0)
-    anneal = int(base.epsilon_anneal_steps)
+    anneal = int(base.epsilon_anneal_episodes)
 
     # -- monotone, and exactly at the endpoints.
     grid = list(range(0, anneal + 1, max(1, anneal // 400)))
@@ -862,10 +862,10 @@ def test_epsilon_closed_form(ctx: Ctx) -> None:
     same(base.epsilon_at(0), float(base.epsilon_start),
          'epsilon does not start at epsilon_start')
     same(base.epsilon_at(anneal), float(base.epsilon_min),
-         f'epsilon does not floor EXACTLY at epsilon_anneal_steps={anneal}. '
+         f'epsilon does not floor EXACTLY at epsilon_anneal_episodes={anneal}. '
          f'An off-by-a-fraction floor makes the schedule\'s horizon a '
          f'different number from the one the config declares, and '
-         f'epsilon_anneal_steps was promoted to a factor (DESIGN.md §3) so '
+         f'epsilon_anneal_episodes was promoted to a factor (DESIGN.md §3) so '
          f'that budget and exploration horizon are not confounded.')
     for beyond in (anneal + 1, 2 * anneal, 10 * anneal):
         same(base.epsilon_at(beyond), float(base.epsilon_min),

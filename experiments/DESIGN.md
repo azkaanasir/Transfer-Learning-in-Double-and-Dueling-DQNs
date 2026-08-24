@@ -149,7 +149,7 @@ support. **Inference type is binding on wording.**
 | `freeze_updates` | 0, 5k, 10k, 20k, 50k, `inf` | **gradient updates, not episodes** (§3.2) |
 | `aggregation` | `mean`, `max`, `naive` | dueling only |
 | `env_pair` | §6 | source -> target |
-| `epsilon_anneal_steps` | default, and one faster level | promoted to a factor so budget and exploration horizon are not confounded |
+| `epsilon_anneal_episodes` | default 900, and one faster level | promoted to a factor so budget and exploration horizon are not confounded. **Episodes, not steps** — see §3.2 |
 | `lr`, `target_update` | screening grid, E3 only | §3.3 fixes the tuning policy |
 | `seed` | disjoint blocks, §3.4 | never re-used across selection and estimation |
 
@@ -191,10 +191,43 @@ means a different amount of *learning* in every arm, so E4's levels would not
 have been comparable. Consequently:
 
 * the freeze window is `freeze_updates` (gradient updates);
-* `epsilon` is a closed-form function of elapsed env steps, evaluated at the top
-  of each episode, and **not** coupled to the evaluation cadence — in the
+* `epsilon` is a closed-form function of the **episode index**, evaluated at the
+  top of each episode, and **not** coupled to the evaluation cadence — in the
   published code the decay lived inside the evaluation branch, which made the
   exploration schedule a function of `eval_every`;
+
+**Why exploration is indexed on episodes while freezing is indexed on updates.**
+Revision 2 of this document indexed *both* on steps, and the exploration half of
+that was wrong. It was corrected after measurement, not after argument, and the
+measurement is worth recording because the failure mode is not obvious.
+
+A step-indexed exploration horizon is **endogenous to policy quality**. A poor
+policy ends episodes quickly, so few environment steps accumulate, so epsilon
+barely anneals, so the policy stays poor. On CartPole the loop closed: a
+1000-episode run delivered **24,708 environment steps against a 300,000-step
+horizon** — 8.2 % of it — so epsilon fell only from 1.000 to **0.684**, the agent
+explored at 0.7–1.0 throughout, and **all four sources failed the validity gate**
+(scores 0.18–0.49 against a 0.60 threshold). The same schedule was healthy on
+LunarLander, which delivered 248,762 steps and reached epsilon 0.022, which is
+exactly why a single global step horizon is the wrong instrument: it was
+calibrated on the environment where episode length is long and applied to one
+where it is short.
+
+Episodes are the exogenous unit. An episode is a trial, and the number of trials
+is fixed by the budget rather than by how well the agent is doing. A geometric
+anneal to the floor at episode 900 reproduces the published schedule (0.95 per
+ten episodes, floor at episode 898) to within 0.001 at every episode, so the
+correction also improves comparability with the published runs. Re-measured, a
+CartPole source now reaches a normalised score of **0.772** and 127,502 steps,
+and clears the gate.
+
+The freeze window keeps its step indexing, because its argument is different and
+survives: it concerns how much *optimisation* has been applied to the trainable
+subset, and gradient updates are the unit of that.
+
+The identifying condition for RQ6 is unaffected. Epsilon still never reads
+`num_episodes`, so a 500-episode prefix of a longer run has exactly the
+exploration schedule a 500-episode run would have had; `validate.py` asserts it.
 * evaluation uses a **separate environment instance**, so evaluation cannot
   touch training state;
 * `env_steps` and `gradient_updates` are logged per episode and carry the
@@ -702,5 +735,6 @@ error the Phase 0 audit found in the published paper.
 |---|---|---|
 | 2026-08-24 | Revision 1: initial specification. | — |
 | 2026-08-24 | Revision 2: the twelve items in §11, following adversarial review. No confirmatory run had launched, so no result is affected. | None — nothing had been run |
+| 2026-08-24 | **Revision 5, forced by P0.** The exploration schedule was indexed on environment steps, which makes the horizon endogenous to policy quality; on CartPole a 1000-episode run delivered 8.2 % of the 300,000-step horizon, epsilon fell only to 0.684, and all four sources failed the validity gate. Exploration is now indexed on episodes with the floor at 900, which reproduces the published schedule to within 0.001 and restores the sources (score 0.268 -> 0.772). Freezing keeps its step indexing. **This is why P0 exists**: 3 h of compute bought the finding, and every run made under the old schedule is discarded. | None reported — the affected runs were the single-seed validation pass, and no result had been claimed from them |
 | 2026-08-24 | Revision 4, from self-audit during implementation: the measurement-cost claim was wrong by an order of magnitude (1–2% asserted, ~22% measured) and is corrected with the measurement; the 250- and 750-episode prefix checkpoints were cut because no question attached to them; RQ6's comparison was made like-with-like (single checkpoint against single checkpoint); `E9` was documented but unimplemented and is now in the registry; `E13` implemented with head-reset and shrink-and-perturb; the catalogue table is generated from `registry.py` so it cannot drift. | None — nothing had been run |
 | 2026-08-24 | Revision 3, after the literature audit (`paper/LITERATURE.md`): thesis narrowed and scoped; the two refuting outcomes named; prior art conceded explicitly; effective-rank and parameter-norm instrumentation added against the plasticity rival explanation; `E13` added; RQ1 demoted to a sanity check with a pre-registered external-validity comparison. | None — nothing had been run |
