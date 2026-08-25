@@ -1,4 +1,4 @@
-# Experimental Design — Transfer in Value-Based Deep RL
+# Experimental Design: Transfer in Value-Based Deep RL
 
 **Status:** authoritative specification. Revision 2 (2026-08-24), after an
 adversarial review of revision 1 that found four fatal defects; see §11.
@@ -33,7 +33,7 @@ Each becomes a constraint the infrastructure enforces *mechanically*:
 
 ## 2. Thesis, hypotheses, and scope
 
-### 2.1 Scope statement — inherited by every claim
+### 2.1 Scope statement: inherited by every claim
 
 > All effects are defined over the finite seed set actually run, for the stated
 > `(arch, target_rule)` implementations at `hidden=(128,128)`,
@@ -47,8 +47,8 @@ Each becomes a constraint the infrastructure enforces *mechanically*:
 
 > Under a fixed layer-wise transfer protocol between discrete-action value-based
 > agents on classic-control tasks, the transfer effect is governed by the
-> **Q-target rule** and by **knowledge-free protocol mechanics** — partial weight
-> copy, head reinitialisation and the freeze schedule — rather than by the
+> **Q-target rule** and by **knowledge-free protocol mechanics**: partial weight
+> copy, head reinitialisation and the freeze schedule: rather than by the
 > **dueling value/advantage decomposition**. Any architecture-level
 > DDQN-versus-Dueling transfer gap measured without a 2x2 factorial and without
 > untrained- and permuted-source controls is therefore **not identified**.
@@ -68,14 +68,14 @@ inductive bias in the regime it was designed for.
 2. **There is no transfer effect to explain.** All four cells' deltas are
    indistinguishable and every decomposition term is null, yet a large
    between-cell gap persists. The published gap was target-task suitability, not
-   transfer — ICANN #5's Q1 vindicated in full.
+   transfer: ICANN #5's Q1 vindicated in full.
 
 Both are publishable, and the second is what the published framing was most at
 risk from.
 
 **What this thesis does *not* claim, and why** (`paper/LITERATURE.md` §3):
 negative transfer in the DQN family, failed self-transfer, and a head/body
-mismatch mechanism are **established prior art** — Sabatelli & Geurts
+mismatch mechanism are **established prior art**: Sabatelli & Geurts
 demonstrated all three, including by transplanting a head between agents. The
 scratch comparison across three of these four cells is also prior art, at n=100,
 on these very environments (Obando-Ceron & Castro). The contribution here is
@@ -88,13 +88,13 @@ defeated by one search.
 
 Directions are stated in **normalised score** units (§5.1), so they are
 comparable across environments. `mechanics`, `weight-statistics` and
-`structure` name the three contrasts in §4 — as contrasts, not as proven
+`structure` name the three contrasts in §4: as contrasts, not as proven
 mechanisms.
 
 | # | Hypothesis | Refuted if |
 |---|---|---|
 | **H1** | The untrained-source contrast (C2−C0) is non-zero and negative in at least 3 of the 4 cells: freezing a copied-but-uninformative trunk for the protocol's window costs performance by itself | The contrast's interval covers zero in 2 or more cells, or is positive in any cell |
-| **H2** | The trained-vs-permuted contrast (C1−C3) — the only quantity that can be called transferred knowledge — is **smaller in magnitude** than the untrained-source contrast (C2−C0) in the cross-interface pair | \|C1−C3\| exceeds \|C2−C0\| in 2 or more cells. That would mean learned structure dominates mechanics, and the thesis in §2.2 is wrong |
+| **H2** | The trained-vs-permuted contrast (C1−C3): the only quantity that can be called transferred knowledge: is **smaller in magnitude** than the untrained-source contrast (C2−C0) in the cross-interface pair | \|C1−C3\| exceeds \|C2−C0\| in 2 or more cells. That would mean learned structure dominates mechanics, and the thesis in §2.2 is wrong |
 | **H3** | The cell-to-cell spread in the total effect (C1−C0) shrinks once transferred-parameter fraction is matched across architectures (§3.1) | The spread is unchanged or larger at matched intensity, which would mean the architecture effect is real and not an intensity artifact |
 | **H4** | The transfer effect degrades monotonically with measured dynamics shift along the **wind** axis, at fixed interface and fixed protocol | No monotone trend (ordered-alternative test's interval covers zero), or a non-monotone pattern |
 | **H5** | The interface-change corner (same dynamics, changed observation/action interface) reproduces most of the cross-interface effect | It reproduces little of it, which would relocate the cause to dynamics shift and refute the mechanics-first thesis |
@@ -102,8 +102,7 @@ mechanisms.
 
 **Every hypothesis above can come out the other way, and several would be more
 interesting if they did.** H2 and H3 in particular are set up so that the
-result the paper's previous framing assumed — a genuine architectural effect —
-is the *refuting* outcome, and it would be reported as such.
+result the paper's previous framing assumed, a genuine architectural effect, is the *refuting* outcome, and it would be reported as such.
 
 ### 2.4 Research questions
 
@@ -113,11 +112,11 @@ support. **Inference type is binding on wording.**
 | RQ | Question | Estimand | Inference and its warrant |
 |---|---|---|---|
 | **RQ1** | On the target task from scratch, how do the four cells compare? | Normalised final score per cell | **Associational.** Cells are different algorithms, not treatments assigned to units |
-| **RQ2** | Does the transfer protocol change performance relative to *the same cell's own* scratch baseline? | delta = transfer − scratch, within cell, per seed | **Causal w.r.t. the protocol**, warranted by *ceteris paribus*: every non-protocol factor is held bit-identical at matched seeds. Seed is a **blocking factor, not a randomisation device** — the warrant is a controlled computational experiment, not randomisation |
-| **RQ3** | Is delta attributable to the dueling decomposition, the double-Q update, or their interaction? | Between-cell contrasts on delta, and the 2x2 interaction | **Effect modification** — how a causal effect varies across populations. Not "architecture causes the difference". **Estimation-only**: its MDE is ~2.7 sigma (`ANALYSIS_PLAN` §6), larger than the plausible effect, so it carries an interval and no p-value |
+| **RQ2** | Does the transfer protocol change performance relative to *the same cell's own* scratch baseline? | delta = transfer − scratch, within cell, per seed | **Causal w.r.t. the protocol**, warranted by *ceteris paribus*: every non-protocol factor is held bit-identical at matched seeds. Seed is a **blocking factor, not a randomisation device**: the warrant is a controlled computational experiment, not randomisation |
+| **RQ3** | Is delta attributable to the dueling decomposition, the double-Q update, or their interaction? | Between-cell contrasts on delta, and the 2x2 interaction | **Effect modification**: how a causal effect varies across populations. Not "architecture causes the difference". **Estimation-only**: its MDE is ~2.7 sigma (`ANALYSIS_PLAN` §6), larger than the plausible effect, so it carries an interval and no p-value |
 | **RQ4** | Which part of the transferred parameters produces delta, and how much is not learned content at all? | The three contrasts of §4, plus layer-set and freeze ablations | **Causal w.r.t. each manipulated component**, under the exclusion restrictions named in §4 |
 | **RQ5** | How does delta vary with the magnitude and the *type* of shift? | delta as a function of measured shift, crossed with interface change (§6.4) | **Causal w.r.t. shift level and interface change** (both set by us); associational across shift *families* |
-| **RQ6** | Does any conclusion depend on the training budget? | delta at episode prefixes 500 / 1000 | **Causal w.r.t. budget**, and only because the exploration schedule is a closed-form function of elapsed steps that never reads the budget — so a 500-prefix *is* what a 500-episode run would have produced. That identifying condition is asserted in `validate.py`. The comparison is made **like with like**: the 500-prefix score is a single held-out checkpoint, so it is compared against the *single* final checkpoint (recorded per checkpoint in the manifest), never against the three-checkpoint mean |
+| **RQ6** | Does any conclusion depend on the training budget? | delta at episode prefixes 500 / 1000 | **Causal w.r.t. budget**, and only because the exploration schedule is a closed-form function of elapsed steps that never reads the budget: so a 500-prefix *is* what a 500-episode run would have produced. That identifying condition is asserted in `validate.py`. The comparison is made **like with like**: the 500-prefix score is a single held-out checkpoint, so it is compared against the *single* final checkpoint (recorded per checkpoint in the manifest), never against the three-checkpoint mean |
 
 ### 2.5 The two confounds this design exists to separate
 
@@ -145,11 +144,11 @@ support. **Inference type is binding on wording.**
 | `arch` | `mlp`, `dueling` | architecture axis |
 | `target_rule` | `vanilla`, `double` | Q-target axis, orthogonal to `arch` |
 | `condition` | `scratch`, `transfer`, `transfer_untrained`, `transfer_permuted` | the protocol axis (§4) |
-| `transfer_set` | `matched` (default), `trunk`, `fc1`, `fc2`, `all_compatible` | see §3.1 — **not** a raw layer list, because a raw list is not comparable across architectures |
+| `transfer_set` | `matched` (default), `trunk`, `fc1`, `fc2`, `all_compatible` | see §3.1: **not** a raw layer list, because a raw list is not comparable across architectures |
 | `freeze_updates` | 0, 5k, 10k, 20k, 50k, `inf` | **gradient updates, not episodes** (§3.2) |
 | `aggregation` | `mean`, `max`, `naive` | dueling only |
 | `env_pair` | §6 | source -> target |
-| `epsilon_anneal_episodes` | default 900, and one faster level | promoted to a factor so budget and exploration horizon are not confounded. **Episodes, not steps** — see §3.2 |
+| `epsilon_anneal_episodes` | default 900, and one faster level | promoted to a factor so budget and exploration horizon are not confounded. **Episodes, not steps**: see §3.2 |
 | `lr`, `target_update` | screening grid, E3 only | §3.3 fixes the tuning policy |
 | `seed` | disjoint blocks, §3.4 | never re-used across selection and estimation |
 
@@ -167,13 +166,13 @@ actual networks at 8-dim observations and 4 actions:
 | `dueling` | 17,664 of 34,501 | **51.2 %** | 4 (both heads) |
 
 So the `arch` factor was confounded with treatment intensity by a factor of
-about two — **the same class of error the Phase 0 audit found in the published
+about two: **the same class of error the Phase 0 audit found in the published
 study, reconstituted inside the corrected design.** The fix has three parts:
 
 1. `transfer_set='matched'` is the default and the primary level: the maximal
-   **shape-compatible** set per architecture — `mlp`:
+   **shape-compatible** set per architecture: `mlp`:
    {`trunk_fc1`, `trunk_fc2`}; `dueling`: {`trunk_fc1`, `trunk_fc2`,
-   `value_fc`, `adv_fc`, `value_out`} — which puts both arms near 97 %.
+   `value_fc`, `adv_fc`, `value_out`}: which puts both arms near 97 %.
 2. `transfer_set='trunk'` is retained as a **pre-declared secondary**, because
    it is what the published protocol did and the comparison is informative.
 3. `transferred_param_fraction` and `reinitialised_layer_count` are recorded in
@@ -192,7 +191,7 @@ have been comparable. Consequently:
 
 * the freeze window is `freeze_updates` (gradient updates);
 * `epsilon` is a closed-form function of the **episode index**, evaluated at the
-  top of each episode, and **not** coupled to the evaluation cadence — in the
+  top of each episode, and **not** coupled to the evaluation cadence: in the
   published code the decay lived inside the evaluation branch, which made the
   exploration schedule a function of `eval_every`;
 
@@ -205,7 +204,7 @@ A step-indexed exploration horizon is **endogenous to policy quality**. A poor
 policy ends episodes quickly, so few environment steps accumulate, so epsilon
 barely anneals, so the policy stays poor. On CartPole the loop closed: a
 1000-episode run delivered **24,708 environment steps against a 300,000-step
-horizon** — 8.2 % of it — so epsilon fell only from 1.000 to **0.684**, the agent
+horizon**, 8.2 % of it, so epsilon fell only from 1.000 to **0.684**, the agent
 explored at 0.7–1.0 throughout, and **all four sources failed the validity gate**
 (scores 0.18–0.49 against a 0.60 threshold). The same schedule was healthy on
 LunarLander, which delivered 248,762 steps and reached epsilon 0.022, which is
@@ -236,18 +235,18 @@ exploration schedule a 500-episode run would have had; `validate.py` asserts it.
 `validate.py` asserts the epsilon trace is bit-identical when `eval_every` and
 `eval_episodes` change. That assertion is the test of §8.1's central claim.
 
-### 3.3 Tuning policy — both objections answered, neither fudged
+### 3.3 Tuning policy: both objections answered, neither fudged
 
 Two commitments appear to collide: "identical hyperparameters across arms,
 machine-checked" (the control claim) and "a fair per-architecture baseline"
 (ICANN #5 Q1/Q5, which requires that the arms *not* share one learning rate).
 Both are honoured, in a declared order:
 
-* **Primary — common configuration.** One learning rate and target-update rule
+* **Primary: common configuration.** One learning rate and target-update rule
   for all four cells, fixed a priori at `lr=5e-4`, hard target update every
   1000 updates. Invariance is enforced across every cell. This is the setting
   in which "identical hyperparameters" is a verified fact.
-* **Secondary — per-cell tuned.** Each cell's own E3-selected configuration.
+* **Secondary: per-cell tuned.** Each cell's own E3-selected configuration.
   Under this policy `lr` is an invariant *within* a cell across
   {scratch, transfer, C2, C3} but not across cells, and `audit.py` enforces it
   at that scope.
@@ -279,10 +278,10 @@ Four conditions per (cell, pair) at matched seeds.
 
 | Condition | Source weights | What it manipulates |
 |---|---|---|
-| **C0 `scratch`** | none | the cell's own target-task ability — the denominator for every delta |
+| **C0 `scratch`** | none | the cell's own target-task ability: the denominator for every delta |
 | **C1 `transfer`** | trained same-cell source, same seed | the protocol as studied |
 | **C2 `transfer_untrained`** | randomly initialised source of the same shape | the protocol's *mechanics* with no learned content: same partial copy, same reinitialised head, same freeze window |
-| **C3 `transfer_permuted`** | trained source, each transferred kernel independently shuffled entry-wise | the trained weights' *marginal distribution* — norm and scale preserved exactly, structure destroyed |
+| **C3 `transfer_permuted`** | trained source, each transferred kernel independently shuffled entry-wise | the trained weights' *marginal distribution*: norm and scale preserved exactly, structure destroyed |
 
 ### 4.1 The identity, and what it is not
 
@@ -299,7 +298,7 @@ after **what was manipulated**, never after a mechanism:
 
 | Contrast | Name used everywhere | Mechanistic reading requires assuming |
 |---|---|---|
-| C2 − C0 | untrained-source contrast | that a random source of matched shape carries no task-relevant content — safe |
+| C2 − C0 | untrained-source contrast | that a random source of matched shape carries no task-relevant content: safe |
 | C3 − C2 | permuted-source contrast | that shuffling changes nothing but structure. Preserved exactly: the multiset of weights, hence the Frobenius norm. **Not** preserved: per-row and per-column norms and the singular-value spectrum, so this contrast also absorbs spectral effects |
 | C1 − C3 | trained-vs-permuted contrast | that the permutation removed all and only the learned structure |
 
@@ -311,16 +310,16 @@ assumed away.
 
 The no-interaction assumption is not asserted. It is **partly tested**: C2 runs
 at both `freeze_updates=0` and the protocol value, so the mechanics contrast's
-dependence on freezing is measured. Estimation is **joint** — the per-seed
+dependence on freezing is measured. Estimation is **joint**: the per-seed
 vector (C0, C1, C2, C3) is bootstrapped over seeds so all contrasts and their
 correlations come from one resampling, rather than four independent two-sample
 tests that ignore the shared groups.
 
-### 4.2 C4 — positive control, redefined so it can fail informatively
+### 4.2 C4: positive control, redefined so it can fail informatively
 
 Revision 1's positive control used the same environment for source and target,
 which means matched shapes, hence a full copy with no partial copy and no head
-reinitialisation — so it exercised **none** of the mechanics under study, and it
+reinitialisation: so it exercised **none** of the mechanics under study, and it
 had no pass criterion.
 
 C4 now uses the **interface-change-only** pair of §6.4: LunarLander to
@@ -333,10 +332,10 @@ independent of E1's.
 **Pass criterion, pre-registered:** the Hodges–Lehmann estimate of the paired
 delta has a 95 % bootstrap CI whose lower bound exceeds −0.10 in normalised-score
 units. Failure means the protocol degrades performance even with no dynamics
-shift at all — which would not invalidate the study, but would make "negative
+shift at all: which would not invalidate the study, but would make "negative
 transfer" the wrong name for the finding, and the paper would say so.
 
-### 4.3 Source validity — normalised, and not called ITT
+### 4.3 Source validity: normalised, and not called ITT
 
 A multiplicative gate on raw return is neither sign- nor origin-safe: at
 Acrobot's registered threshold of −100, "0.6 x threshold" is −60, which is
@@ -349,7 +348,7 @@ Revision 1 called the all-seeds analysis "intent-to-treat". That framing is
 wrong: source competence is known *before* the target run begins, so it is not
 a post-randomisation compliance event, and averaging over it would mean the
 primary estimand pools transfer-from-a-competent-source with
-transfer-from-a-source-that-never-learned — the published study's actual error.
+transfer-from-a-source-that-never-learned: the published study's actual error.
 Therefore:
 
 * **Primary: valid sources only**, with source seeds drawn in order from
@@ -364,7 +363,7 @@ Therefore:
 
 ## 5. Metrics
 
-### 5.1 Normalised score — the scale everything is expressed on
+### 5.1 Normalised score: the scale everything is expressed on
 
 ```
 score = (return − random_return_env) / (threshold_env − random_return_env)
@@ -398,7 +397,7 @@ sensitive to transfer.
 
 | # | Endpoint | Definition |
 |---|---|---|
-| **P1** | `final_score` | mean normalised score over 100 held-out greedy episodes, at each of the final **k=3** evaluation checkpoints, averaged. The multi-checkpoint mean is what removes the "phase of oscillation at episode 1000" variance component, which is a property of the measurement moment rather than of the algorithm — the pilot in `METHODS_ACTUAL` §6 shows a solve-then-destabilise pattern that a single snapshot would fold into the mean. Evaluation seeds are disjoint from training and from the monitoring evaluations |
+| **P1** | `final_score` | mean normalised score over 100 held-out greedy episodes, at each of the final **k=3** evaluation checkpoints, averaged. The multi-checkpoint mean is what removes the "phase of oscillation at episode 1000" variance component, which is a property of the measurement moment rather than of the algorithm: the pilot in `METHODS_ACTUAL` §6 shows a solve-then-destabilise pattern that a single snapshot would fold into the mean. Evaluation seeds are disjoint from training and from the monitoring evaluations |
 | **P2** | `auc_score` | area under the normalised-score evaluation curve, **over env steps**, divided by total env steps. Budget-free, and the sample-efficiency endpoint that a transfer claim actually needs. Built from the periodic 5-episode evaluations, whose initial states are drawn **independently at each checkpoint**: that adds variance to any single point but leaves the area unbiased, which is the right trade for an average over ~100 points |
 
 Holm over the confirmatory family, which is these two endpoints x the four
@@ -407,14 +406,14 @@ alongside P1: the OLS slope of the score curve over the final 200 episodes per
 run, with the fraction of non-converged runs stated. Where runs have not
 converged, P1 is named *performance at budget*, not asymptotic performance.
 
-### 5.3 Secondary endpoints — estimation-only, no p-values
+### 5.3 Secondary endpoints: estimation-only, no p-values
 
 | Metric | Definition and the correction it embodies |
 |---|---|
 | `jumpstart` | 100-episode greedy score **at episode 0, before any gradient step**. Interpretable *only* where the output head is transferred: with a reinitialised head the zero-shot policy is an argmax over a random readout, so jumpstart is structurally at chance and comparing it would be meaningless |
 | `probe_jumpstart` | for head-reinit arms: freeze the transferred trunk, fit **only** the head for a declared number of steps on a fixed batch of target transitions, then evaluate. This is the quantity that measures whether transferred features carry usable information |
 | `steps_to_threshold` | env steps until the trailing-100 mean score first reaches a declared level, **right-censored** at the budget. Analysed by survival methods; the primary summary is P(reached by budget) with a Clopper–Pearson interval. Never imputed, never dropped |
-| `episode_length` | final-100 mean — promised in the manuscript's §I and RQ3 and never reported |
+| `episode_length` | final-100 mean: promised in the manuscript's §I and RQ3 and never reported |
 | `within_run_sd` | SD of the score over the final 10 evaluation points: *training* instability |
 | `across_seed_sd` | SD of `final_score` across seeds: *seed* sensitivity. Descriptive; a dispersion comparison carries a bootstrap CI on the ratio, never a p-value, because its power at n=10 is negligible |
 
@@ -426,7 +425,7 @@ backwards. They are separate metrics here for that reason.
 `train_return` (final-100 mean, for continuity with the published numbers),
 `td_loss` with a stated window, the epsilon trace, `updates`, wall time. The
 registry declares these roles and `stats.py` refuses a confirmatory test on
-them — the mechanical fix for the published §V.A/§V.B contradiction.
+them: the mechanical fix for the published §V.A/§V.B contradiction.
 
 ### 5.5 Mechanism instrumentation
 
@@ -437,18 +436,18 @@ training and the same states are used at every measurement point.
 | Signal | Purpose |
 |---|---|
 | `v_abs_mean`, `a_abs_mean`, `a_spread` | dueling stream magnitudes: is V mis-scaled to the source's return range? |
-| `grad_norm_{trunk,value,adv,head}` | per-stream gradient norms across the freeze boundary — separates an *optimisation* mismatch from a *representational* one, which is what ICANN #5's Q5 turns on |
+| `grad_norm_{trunk,value,adv,head}` | per-stream gradient norms across the freeze boundary: separates an *optimisation* mismatch from a *representational* one, which is what ICANN #5's Q5 turns on |
 | `q_mean`, `q_max`, `td_error_abs` | overestimation behaviour: the mechanism the double-Q factor exists to control |
 | `cka_transfer_vs_scratch` | linear CKA between the transferred run's `trunk_fc2` activations and the **matched-seed scratch run's**, on the same fixed batch of target states: how different a representation transfer actually produced |
 | `cka_drift` | CKA between the trunk at episode 0 and at each evaluation point: how far fine-tuning had to move the transferred features |
-| `dead_unit_frac` | trunk units never active on target states — a concrete failure mode for a frozen transferred layer |
+| `dead_unit_frac` | trunk units never active on target states: a concrete failure mode for a frozen transferred layer |
 | `effective_rank` | entropy-based effective rank of the trunk activations on the fixed batch, plus the stable rank. Feature-rank collapse is the plasticity literature's account of degradation after pretraining, and it is a rival explanation the weight-scale control (C3) does not exclude |
 | `param_norm` | L2 norm of the trainable weights, per group. Parameter-norm growth is the other plasticity signature, and it distinguishes "the representation stopped being useful" from "the optimiser drifted into a bad region" |
 
 Revision 1 specified `cka_source_target`, CKA "between activations on source-env
 vs target-env states". That is ill-posed: CKA compares two representations of
 the *same* examples, so two different input sets give incomparable Gram
-matrices — and for CartPole -> LunarLander it is not even computable, the input
+matrices: and for CartPole -> LunarLander it is not even computable, the input
 dimensionalities differing. Both replacements above are on one fixed target-state
 batch.
 
@@ -466,7 +465,7 @@ batch.
 | `LunarLander-v3` variants | 8 | 4 | 200 | −202 to −463 | source and target, same-interface shift |
 | `LunarLander-v3` padded/extended | 8+k | 4+m | 200 | measured per variant | **interface change at zero dynamics shift** (§6.4) |
 | `CartPole-v1` variants | 4 | 2 | 475 | 22.5 to 32.1 | cheap same-interface shift |
-| `MountainCar-v0` | 2 | 3 | −110 | — | **excluded from confirmatory work**: DQN without shaping often fails it, which would reproduce the published invalid-source error |
+| `MountainCar-v0` | 2 | 3 | −110 | - | **excluded from confirmatory work**: DQN without shaping often fails it, which would reproduce the published invalid-source error |
 
 ### 6.2 Same-interface dynamics shift
 
@@ -489,17 +488,17 @@ consequence of the policy, the reward scale and the horizon cap.
 
 | Pair type | Computed | Not computed |
 |---|---|---|
-| Same interface | **paired trajectory divergence** — identical initial state and an identical action sequence driven into both environments, so separation is attributable to dynamics alone; validated by a self-check against an identical-environment control that must return exactly zero. Plus per-dimension W2 and energy distance on state-visitation distributions, standardised by the source's own per-dimension spread | — |
+| Same interface | **paired trajectory divergence**: identical initial state and an identical action sequence driven into both environments, so separation is attributable to dynamics alone; validated by a self-check against an identical-environment control that must return exactly zero. Plus per-dimension W2 and energy distance on state-visitation distributions, standardised by the source's own per-dimension spread | - |
 | Cross interface | a structured qualitative descriptor, plus the representation measures of §5.5 | **any scalar shift metric.** No distance between different state spaces is defined, and saying so is more defensible than inventing one |
 
-### 6.4 The shift x interface factorial — the missing corner
+### 6.4 The shift x interface factorial: the missing corner
 
 Revision 1 claimed to separate shift severity from interface mismatch and then
 supplied only two corners of the table. All four now exist:
 
 | | **Interface unchanged** | **Interface changed** |
 |---|---|---|
-| **Dynamics unchanged** | (identity — the null cell, used as a machinery check) | **the new corner**: LunarLander -> LunarLander with the observation padded by *k* uninformative dimensions and the action set extended by *m* duplicate actions. Dynamics identical by construction, yet the identical partial-copy + head-reinit + freeze pipeline runs. Also serves as C4 (§4.2) |
+| **Dynamics unchanged** | (identity: the null cell, used as a machinery check) | **the new corner**: LunarLander -> LunarLander with the observation padded by *k* uninformative dimensions and the action set extended by *m* duplicate actions. Dynamics identical by construction, yet the identical partial-copy + head-reinit + freeze pipeline runs. Also serves as C4 (§4.2) |
 | **Dynamics shifted** | E8: wind and gravity families | E1/E9: CartPole -> LunarLander, Acrobot -> LunarLander |
 
 Additionally, E8's same-interface arm is run in a **matched-protocol** variant
@@ -517,7 +516,7 @@ counterfactual each delta requires, which revision 1 omitted.
 
 | ID | Name | Tier | Family | Design | Runs |
 |---|---|---|---|---|---|
-| `E0` | `smoke` | — | estimation | tiny end-to-end validation of every code path, one seed | 7 |
+| `E0` | `smoke` | - | estimation | tiny end-to-end validation of every code path, one seed | 7 |
 | `E1` | `core2x2` | 1 | **confirmatory** | 4 cells x {CartPole source, LunarLander scratch, transfer at `matched`, transfer at `trunk`} | 160 |
 | `E2` | `controls` | 1 | estimation | 4 cells x {C2 untrained, C2 at K=0, C3 permuted, C3b spectrum-matched} plus their source and scratch prerequisites | 240 |
 | `E3` | `hpsens` | 1 | screen | 4 cells x lr{1e-4,3e-4,5e-4,1e-3} x update{hard,soft}, LunarLander scratch, on `TUNE` | 160 |
@@ -554,7 +553,7 @@ the only cell that isolates interface mechanics.
 
 `E13 plasticity` (Tier 3) exists because the plasticity-loss literature supplies
 a complete, architecture-free rival explanation for poor performance after
-pretraining — dead units, parameter-norm growth, feature-rank collapse — that the
+pretraining, dead units, parameter-norm growth, feature-rank collapse, that the
 control set does not exclude. C3 controls weight *scale*; nothing in it measures
 rank collapse. §5.5 now instruments effective feature rank and parameter norm,
 and E13 adds the reset and shrink-and-perturb arms that the literature would
@@ -579,7 +578,7 @@ Named, independently derived streams per run, spawned from one
 `SeedSequence(seed)`: `init`, `action`, `buffer`, `env_reset`, `eval_monitor`,
 `eval_final`, `diag`, `control`. Adding a diagnostic, changing the number of
 evaluation episodes, or altering a control condition cannot perturb the
-training trajectory of the parts it does not touch — an assertion
+training trajectory of the parts it does not touch: an assertion
 `validate.py` tests rather than a property the design asserts.
 
 Weight initialisation is seeded **per layer**, from a deterministic function of
@@ -689,13 +688,13 @@ stamped into the output.
 10. **The control conditions are not novel in themselves.** Random- and
     shuffled-source baselines exist in the transfer literature. The claim is
     their first use inside a head-structure x target-rule factorial in the DQN
-    family — not the controls.
+    family: not the controls.
 11. **The interface-change corner is not perfectly difficulty-neutral.**
     Surfaced by the generated environment table rather than by argument: the
     padded/extended variant's no-op score is 0.25 against the base
-    environment's 0.18. The *dynamics* are provably identical — the wrapped
+    environment's 0.18. The *dynamics* are provably identical: the wrapped
     environment reproduces the base trajectory bit-identically under aliased
-    actions, and `validate.py` asserts it — but extending the action set from 4
+    actions, and `validate.py` asserts it: but extending the action set from 4
     to 6 by aliasing actions 0 and 1 doubles their probability under a uniform
     random policy, so the random-policy *reference* shifts. Two consequences,
     both stated rather than absorbed: the normalisation denominator differs from
@@ -716,7 +715,7 @@ error the Phase 0 audit found in the published paper.
 |---|---|---|
 | 1 | "Same protocol" transferred 97 % of the mlp and 51 % of the dueling net, confounding `arch` with treatment intensity | §3.1 matched transfer sets; fraction reported and audited |
 | 2 | Hyperparameters selected on seeds 0–4 and confirmatory arms run on 0–9, so selection leaked into every headline number; and the design never said whether arms shared one lr or were tuned per cell | §3.4 disjoint blocks; §3.3 explicit dual tuning policy with pre-registered arbitration |
-| 3 | Six research questions and zero hypotheses — every RQ was phrased so any outcome confirmed it | §2.3, six hypotheses with directions and refutation conditions |
+| 3 | Six research questions and zero hypotheses: every RQ was phrased so any outcome confirmed it | §2.3, six hypotheses with directions and refutation conditions |
 | 4 | The primary endpoint was a terminal snapshot, the endpoint least sensitive to transfer, with no convergence check; all sample-efficiency metrics were demoted | §5.2 co-primary endpoints, multi-checkpoint, in env steps, with a convergence gate |
 | 5 | The "additive decomposition" was an arithmetic identity presented as an empirical finding | §4.1 stated as an identity; contrasts renamed after manipulations; joint bootstrap |
 | 6 | The positive control exercised none of the mechanics it was meant to validate, and had no pass criterion | §4.2 rebuilt on the interface-change-only pair, with a non-inferiority criterion |
@@ -733,8 +732,8 @@ error the Phase 0 audit found in the published paper.
 
 | Date | Change | Effect on claims |
 |---|---|---|
-| 2026-08-24 | Revision 1: initial specification. | — |
-| 2026-08-24 | Revision 2: the twelve items in §11, following adversarial review. No confirmatory run had launched, so no result is affected. | None — nothing had been run |
-| 2026-08-24 | **Revision 5, forced by P0.** The exploration schedule was indexed on environment steps, which makes the horizon endogenous to policy quality; on CartPole a 1000-episode run delivered 8.2 % of the 300,000-step horizon, epsilon fell only to 0.684, and all four sources failed the validity gate. Exploration is now indexed on episodes with the floor at 900, which reproduces the published schedule to within 0.001 and restores the sources (score 0.268 -> 0.772). Freezing keeps its step indexing. **This is why P0 exists**: 3 h of compute bought the finding, and every run made under the old schedule is discarded. | None reported — the affected runs were the single-seed validation pass, and no result had been claimed from them |
-| 2026-08-24 | Revision 4, from self-audit during implementation: the measurement-cost claim was wrong by an order of magnitude (1–2% asserted, ~22% measured) and is corrected with the measurement; the 250- and 750-episode prefix checkpoints were cut because no question attached to them; RQ6's comparison was made like-with-like (single checkpoint against single checkpoint); `E9` was documented but unimplemented and is now in the registry; `E13` implemented with head-reset and shrink-and-perturb; the catalogue table is generated from `registry.py` so it cannot drift. | None — nothing had been run |
-| 2026-08-24 | Revision 3, after the literature audit (`paper/LITERATURE.md`): thesis narrowed and scoped; the two refuting outcomes named; prior art conceded explicitly; effective-rank and parameter-norm instrumentation added against the plasticity rival explanation; `E13` added; RQ1 demoted to a sanity check with a pre-registered external-validity comparison. | None — nothing had been run |
+| 2026-08-24 | Revision 1: initial specification. | - |
+| 2026-08-24 | Revision 2: the twelve items in §11, following adversarial review. No confirmatory run had launched, so no result is affected. | None: nothing had been run |
+| 2026-08-24 | **Revision 5, forced by P0.** The exploration schedule was indexed on environment steps, which makes the horizon endogenous to policy quality; on CartPole a 1000-episode run delivered 8.2 % of the 300,000-step horizon, epsilon fell only to 0.684, and all four sources failed the validity gate. Exploration is now indexed on episodes with the floor at 900, which reproduces the published schedule to within 0.001 and restores the sources (score 0.268 -> 0.772). Freezing keeps its step indexing. **This is why P0 exists**: 3 h of compute bought the finding, and every run made under the old schedule is discarded. | None reported: the affected runs were the single-seed validation pass, and no result had been claimed from them |
+| 2026-08-24 | Revision 4, from self-audit during implementation: the measurement-cost claim was wrong by an order of magnitude (1–2% asserted, ~22% measured) and is corrected with the measurement; the 250- and 750-episode prefix checkpoints were cut because no question attached to them; RQ6's comparison was made like-with-like (single checkpoint against single checkpoint); `E9` was documented but unimplemented and is now in the registry; `E13` implemented with head-reset and shrink-and-perturb; the catalogue table is generated from `registry.py` so it cannot drift. | None: nothing had been run |
+| 2026-08-24 | Revision 3, after the literature audit (`paper/LITERATURE.md`): thesis narrowed and scoped; the two refuting outcomes named; prior art conceded explicitly; effective-rank and parameter-norm instrumentation added against the plasticity rival explanation; `E13` added; RQ1 demoted to a sanity check with a pre-registered external-validity comparison. | None: nothing had been run |

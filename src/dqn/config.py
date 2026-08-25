@@ -71,6 +71,14 @@ class Config:
     source_env: Optional[str] = None       # recorded for provenance and audit
     source_checkpoint: Optional[str] = None
     seed: int = 0
+    # The seed of the run that produced the source checkpoint. Defaults to this
+    # run's own seed, which is the canonical lineage. It differs only when the
+    # source-validity gate rejected the canonical source and the reserve rule of
+    # DESIGN.md 4.3 drew a replacement -- and in that case the run really is a
+    # different run, so it needs its own identity. A small integer, not a path,
+    # so it carries none of the objection that keeps `source_checkpoint` out of
+    # the digest.
+    source_seed: Optional[int] = None
 
     # ---- transfer protocol ----------------------------------------------
     # A *named* set, never a raw layer list: {trunk_fc1, trunk_fc2} copies 94%
@@ -227,6 +235,14 @@ class Config:
         if self.condition == 'transfer_permuted' and not self.source_checkpoint:
             raise ValueError("condition='transfer_permuted' permutes a *trained* "
                              'source, so it requires a source_checkpoint')
+        if self.source_seed is None and self.is_transfer:
+            self.source_seed = self.seed
+        if self.source_seed is not None and not self.is_transfer:
+            # A scratch run has no source, so a source seed on one is a
+            # configuration error rather than a harmless extra.
+            raise ValueError(
+                f'source_seed={self.source_seed} was set on a scratch run. '
+                f'Only a transfer condition draws from a source.')
         # Normalise the environment strings through the registry so that two
         # spellings of the same variant cannot produce two run directories.
         self.env = envs.parse(self.env).canonical()
@@ -305,6 +321,20 @@ class Config:
         data = self.to_dict()
         inert = TRANSFER_ONLY_FIELDS if self.condition == 'scratch' else frozenset()
         for name in fields:
+            # `source_seed` is tested before the inert branch, because the inert
+            # branch would write a sentinel and a sentinel is still a new key.
+            if name == 'source_seed':
+                # Only a *deviation* from the canonical lineage is identity-
+                # bearing: `source_seed == seed` is already implied by `seed`,
+                # which the digest covers. The key is omitted entirely in the
+                # canonical case rather than given a sentinel value, because a
+                # sentinel is still a new key and would change every digest
+                # computed before this field existed. Omitting it keeps every
+                # existing run at its original identity while still giving a
+                # replacement-source run a directory of its own.
+                if data[name] not in (None, data['seed']):
+                    payload[name] = data[name]
+                continue
             if name in inert:
                 payload[name] = '<inert-for-scratch>'
                 continue
@@ -386,7 +416,7 @@ class Config:
 TRANSFER_ONLY_FIELDS = frozenset({
     'source_env', 'transfer_set', 'input_policy', 'head_policy', 'freeze_group',
     'freeze_updates', 'permute_scope', 'permute_kind', 'value_recal',
-    'reset_head_at_unfreeze', 'shrink_perturb',
+    'reset_head_at_unfreeze', 'shrink_perturb', 'source_seed',
 })
 
 TRAJECTORY_FIELDS: tuple[str, ...] = (
@@ -394,7 +424,7 @@ TRAJECTORY_FIELDS: tuple[str, ...] = (
     'seed',
     'transfer_set', 'input_policy', 'head_policy', 'freeze_group',
     'freeze_updates', 'permute_scope', 'permute_kind', 'value_recal',
-    'reset_head_at_unfreeze', 'shrink_perturb',
+    'reset_head_at_unfreeze', 'shrink_perturb', 'source_seed',
     'num_episodes', 'max_steps', 'lr', 'gamma', 'batch_size',
     'replay_capacity', 'learning_starts', 'train_every', 'grad_clip_norm',
     'epsilon_start', 'epsilon_min', 'epsilon_anneal_episodes',

@@ -12,7 +12,7 @@ Companions: [`DESIGN.md`](DESIGN.md) (what is measured) ·
 
 ---
 
-## S1 — Build the whole pipeline, end to end
+## S1: Build the whole pipeline, end to end
 
 Every experiment must be runnable, and analysable, from committed code in this
 repository: launch → runs → aggregation → statistics → plots → tables. No step
@@ -22,9 +22,9 @@ infrastructure must cover experiments on **different environments**, on the
 
 *Applied in:* `DESIGN.md` §7 (catalogue), §8 (infrastructure requirements).
 
-## S2 — No compromise on scientific rigour
+## S2: No compromise on scientific rigour
 
-No logical, causal, or descriptive fallacy is acceptable — not in the
+No logical, causal, or descriptive fallacy is acceptable: not in the
 experimental design, not in the inference, not in the narrative. Specifically:
 a null result is never evidence of equivalence, a between-group difference is
 never a within-group effect, and a mechanism is never claimed from prose.
@@ -32,7 +32,7 @@ never a within-group effect, and a mechanism is never claimed from prose.
 *Applied in:* `DESIGN.md` §9 (guardrails enforced in code), §2 (inference type
 declared per research question and binding on wording).
 
-## S3 — Ablations and controls must be as clean as reproducibility allows
+## S3: Ablations and controls must be as clean as reproducibility allows
 
 An ablation changes exactly one thing. Its counterfactual is explicit. The
 control conditions must be strong enough that a positive finding cannot be
@@ -42,21 +42,21 @@ explained by protocol mechanics, weight scale, or initialisation luck.
 decomposition), §8.1 (per-role RNG streams, so an ablation cannot perturb the
 machinery it does not touch), §8.4 (machine-checked invariants).
 
-## S4 — Statistics: at least 10 seeds, and every test must be the right test
+## S4: Statistics: at least 10 seeds, and every test must be the right test
 
 Ten seeds is the floor for confirmatory claims. Mann–Whitney U remains the
-headline test — it is appropriate at this sample size and reviewers endorsed it
-— but it is not sufficient on its own: effect sizes with confidence intervals,
+headline test: it is appropriate at this sample size and reviewers endorsed it
+- but it is not sufficient on its own: effect sizes with confidence intervals,
 dispersion tests, equivalence tests, multiplicity control, and a stated
 minimum detectable effect are all required. Nothing decorative; every statistic
 must answer a declared question.
 
 *Applied in:* `ANALYSIS_PLAN.md` (whole document), `DESIGN.md` §5 (metric roles).
 
-## S5 — Keep asking Socratic questions; stress-test everything, continuously
+## S5: Keep asking Socratic questions; stress-test everything, continuously
 
 Interrogate the logic, the clarity of the research questions, the methodology,
-and the results — repeatedly and adversarially, including work already
+and the results: repeatedly and adversarially, including work already
 finished. Assume something is wrong and go looking for it. The method is
 Socratic: for every claim, ask what it would take to be false, what it is being
 compared against, what else could produce the same observation, and what is
@@ -74,7 +74,7 @@ The four questions to put to every result before it is written down:
 sections of `DESIGN.md` and `ANALYSIS_PLAN.md`; and `report.py`, which prints
 these four questions against each emitted claim.
 
-## S6 — Hold to the highest standards of research discipline
+## S6: Hold to the highest standards of research discipline
 
 Pre-register before running. Record provenance. Never drop a seed. Never
 hand-compute a number that appears in the paper. Report what was skipped and
@@ -83,16 +83,16 @@ why.
 *Applied in:* `DESIGN.md` §8.3–8.4, `ANALYSIS_PLAN.md` §1 (pre-registration
 discipline and change-log requirement).
 
-## S7 — Ground the thesis in the literature, and name the gap precisely
+## S7: Ground the thesis in the literature, and name the gap precisely
 
 Work through the literature the paper already cites, then sharpen the thesis
 against it. The gap must be stated as a specific, checkable deficiency in
-identified prior work — not as a generic "this is under-explored".
+identified prior work: not as a generic "this is under-explored".
 
 *Applied in:* `paper/LITERATURE.md` (per-source audit and the derived gap
 statement), `DESIGN.md` §2 (research questions written to close that gap).
 
-## S8 — Execution right now: one seed, to validate the machinery
+## S8: Execution right now: one seed, to validate the machinery
 
 Until the infrastructure is complete and validated, **run every experiment at a
 single seed**. The purpose of those runs is to exercise the pipeline end to end,
@@ -112,7 +112,7 @@ Two consequences, and they must not be confused with each other:
 *Applied in:* `EXPERIMENTS.md` (validation invocations), `plan.py` (`--seeds 0`
 cost estimates), and the n<3 guard in `stats.py`.
 
-## S9 — The eight peer reviews are paramount
+## S9: The eight peer reviews are paramount
 
 The reviews from IJCNN 2026 and ICANN 2026 are the specification for this
 revision, not background material. Every experiment must trace to a concern
@@ -126,10 +126,19 @@ the ordinary scope complaints, while the three that actually threatened the
 paper's validity were each raised by a single reviewer. **Prioritising by vote
 count would be a mistake.**
 
-*Applied in:* `REVIEW_COVERAGE.md` — the two-way traceability matrix, with
+*Applied in:* `REVIEW_COVERAGE.md`: the two-way traceability matrix, with
 per-item status and an explicit open-items list.
 
-## S10 — Keep this file current
+## S10 - No em-dashes
+
+Do not use em-dashes anywhere: not in chat, not in documentation, not in code
+comments, not in the manuscript. Use a colon, a semicolon, a comma, parentheses,
+or a full stop instead, whichever the sentence actually needs.
+
+This applies retrospectively as well: when editing a file that already contains
+them, remove them.
+
+## S11 - Keep this file current
 
 These instructions are the reference point when direction is unclear. Add new
 directives here as they arrive, with the section they affected.

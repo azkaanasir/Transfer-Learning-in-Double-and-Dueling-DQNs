@@ -25,8 +25,8 @@ everything, with intervals that state what the data exclude.
 
 | Role | Metric | Testable? |
 |---|---|---|
-| **Co-primary** | `final_score` (P1) — normalised score over 100 held-out greedy episodes at each of the final k=3 checkpoints, averaged | yes, confirmatory |
-| **Co-primary** | `auc_score` (P2) — area under the normalised-score curve over env steps, per step | yes, confirmatory |
+| **Co-primary** | `final_score` (P1): normalised score over 100 held-out greedy episodes at each of the final k=3 checkpoints, averaged | yes, confirmatory |
+| **Co-primary** | `auc_score` (P2): area under the normalised-score curve over env steps, per step | yes, confirmatory |
 | Secondary | `jumpstart`, `probe_jumpstart`, `steps_to_threshold`, `episode_length`, `within_run_sd`, `across_seed_sd` | estimation-only, **no p-values** |
 | Descriptive | `train_return`, `td_loss`, epsilon trace, `updates`, wall time | never tested; `stats.py` refuses |
 | Mechanism | `v_abs_mean`, `a_abs_mean`, `a_spread`, `grad_norm_*`, `q_mean`, `td_error_abs`, `cka_transfer_vs_scratch`, `cka_drift`, `dead_unit_frac` | estimation-only, used to support or refuse mechanism wording |
@@ -36,7 +36,7 @@ random-policy references measured in [`reference_returns.json`](reference_return
 
 ---
 
-## 2. The confirmatory family — the only one
+## 2. The confirmatory family: the only one
 
 **Exactly 8 tests**: the within-cell transfer effect
 `delta = transfer − scratch` for each of the 4 cells
@@ -45,7 +45,7 @@ random-policy references measured in [`reference_returns.json`](reference_return
 Nothing else in the study is confirmatory. Not RQ1's between-cell comparisons,
 not RQ3's interaction, not the control contrasts, not any ablation, not any
 secondary metric. Those are all estimation-only, and the paper will say so as a
-deliberate design decision forced by the sample size — not as an omission.
+deliberate design decision forced by the sample size: not as an omission.
 
 * **alpha** = 0.05, two-sided, family-wise, controlled by **Holm–Bonferroni over
   the 8 tests**.
@@ -76,7 +76,7 @@ Because that is an empirical question, the plan commits in advance:
 
 * the within-seed correlation `rho(scratch, transfer)` is **reported** for every
   cell, whatever it is;
-* the paired test is primary regardless of the observed `rho` — the decision is
+* the paired test is primary regardless of the observed `rho`: the decision is
   fixed here so it cannot be made after seeing which test gives a smaller p;
 * if `rho < 0` in a cell, that is reported as evidence the pairing does not hold
   there, and the unpaired result is given equal prominence in that cell.
@@ -118,7 +118,7 @@ form is what the interval excludes.
 
 ## 4. Equivalence and exclusion claims
 
-The claim the published paper needed — "DDQN avoids negative transfer" — is an
+The claim the published paper needed, "DDQN avoids negative transfer", is an
 equivalence claim, and a non-significant difference is not evidence for it.
 Revision 1 of the design proposed TOST, which is wrong twice over: it is
 parametric on data declared non-normal (LunarLander returns are structurally
@@ -129,7 +129,7 @@ the paired delta lies entirely inside the margin**, using the same interval
 already reported. No separate test, no new error budget.
 
 **The margin**, fixed here: **±0.05 normalised-score units**, which is ~20
-return points on LunarLander — one tenth of the distance from a random policy to
+return points on LunarLander: one tenth of the distance from a random policy to
 the solved threshold. Justification is substantive rather than convenient: 20
 points is smaller than the run-to-run measurement noise of a single evaluation
 and far smaller than the effects the paper discusses (the published transfer gap
@@ -155,7 +155,7 @@ claim, and it is the form the abstract will use.
 ## 5. Censored metrics
 
 `steps_to_threshold` is right-censored at the training budget, and the censoring
-is administrative — the same budget for every run, independent of the event time
+is administrative: the same budget for every run, independent of the event time
 by construction, which is the benign case.
 
 * **Never** impute the budget (biases the estimate and creates a tie mass that
@@ -187,8 +187,8 @@ that justify §2's single-family decision; they are not decoration.
 | Mann–Whitney U (unpaired) | 0.05 | U <= 23 or U >= 77 | 77 of 100 cross-pairs |
 | Mann–Whitney U | 0.0125 (Holm over 4) | U <= 17 or U >= 83 | 83 % |
 | Mann–Whitney U | 0.00625 (Holm over 8) | U <= 14 or U >= 86 | 86 % |
-| Mann–Whitney U | — | smallest attainable two-sided p = **1.08e-5** | |
-| Sign-flip / Wilcoxon (paired) | — | smallest attainable two-sided p = **0.00195** | all 10 deltas same sign |
+| Mann–Whitney U | - | smallest attainable two-sided p = **1.08e-5** | |
+| Sign-flip / Wilcoxon (paired) | - | smallest attainable two-sided p = **0.00195** | all 10 deltas same sign |
 
 ### 6.2 Minimum detectable effect at 80 % power
 
@@ -276,7 +276,7 @@ a claim.
 |---|---|---|---|
 | **Confirmatory** | 8 (4 cells x 2 co-primary endpoints) | Holm–Bonferroni | step-down from 0.00625 |
 | Screens (E3–E8, E12) | reported per experiment | Benjamini–Hochberg q, orientation only | no assertion permitted |
-| Everything else | — | none — estimation-only | no p-values emitted |
+| Everything else | - | none: estimation-only | no p-values emitted |
 
 Family membership is fixed by this document **before launch**. `stats.py` reads
 the family definitions from here rather than accepting them as arguments, which
@@ -308,7 +308,7 @@ the design, and each is refused in code.
 
 Single-seed runs exist to prove the pipeline executes (`STANDING_INSTRUCTIONS`
 S8). Under n < 3, `stats.py` emits no test and no interval, and `report.py`
-stamps every page **PIPELINE VALIDATION — NOT A RESULT**. A single-seed number
+stamps every page **PIPELINE VALIDATION: NOT A RESULT**. A single-seed number
 may not be quoted, compared, or used to choose between hypotheses.
 
 ---
@@ -341,4 +341,4 @@ may not be quoted, compared, or used to choose between hypotheses.
 
 | Date | Deviation | Affected results | Re-labelled? |
 |---|---|---|---|
-| — | none | — | — |
+| - | none | - | - |

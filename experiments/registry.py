@@ -27,10 +27,11 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import json
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Mapping, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -53,6 +54,27 @@ SEED_BLOCKS: dict[str, tuple[int, ...]] = {
     # not tell a smoke run from a real one by its seed alone.
     'SMOKE': (999,),
 }
+
+#: `DESIGN.md` §4.3. A source is valid when its **normalised** final score on
+#: the source environment reaches this gate. Normalised, not multiplicative:
+#: at Acrobot's registered threshold of -100 a "0.6 x threshold" rule reads -60,
+#: which is harder than solving the task, and it was that malformed gate which
+#: let the published study transfer from a CartPole agent scoring 26.94 out of
+#: 475 without anything noticing.
+#:
+#: The number is repeated from `src/dqn/train.py`, which stamps the verdict into
+#: every transfer run's manifest under ``source.validity``, rather than imported
+#: from it: the runner has to apply the gate *before* any dependent run exists,
+#: and importing the trainer would pull TensorFlow into the planner. The two
+#: must agree, and `sweep.py` prints the value it used into every rejection
+#: record so a disagreement is visible in the data rather than only in the code.
+SOURCE_VALIDITY_GATE = 0.6
+
+#: The order replacement source seeds are drawn in, fixed here so that the draw
+#: is a property of the catalogue rather than of when a sweep happened to run.
+#: `DESIGN.md` §4.3 says "drawn in order from RESERVE", and in order is what
+#: makes the assignment reproducible after an interruption.
+RESERVE_ORDER: tuple[int, ...] = SEED_BLOCKS['RESERVE']
 
 CELLS = tuple(itertools.product(('mlp', 'dueling'), ('vanilla', 'double')))
 
@@ -600,14 +622,133 @@ SCALING_FIELDS = frozenset({
 
 @dataclass
 class Job:
+    """One resolved run, plus the identity of the source it draws on.
+
+    The source fields exist because `DESIGN.md` §4.3 lets the source seed stop
+    being a pure function of the target seed. Until the reserve rule, a
+    consumer's source was always at the consumer's own seed (or the fixed
+    `C4SRC` mapping), so "which source" needed no recording. A rejected source
+    is replaced from `RESERVE`, and from then on the pair
+    (`source_default_seed`, `source_seed`) is the only thing that says whether a
+    replacement is in force -- `source_checkpoint` is a path and is deliberately
+    excluded from the run digest (`src/dqn/config.py`), so the run directory
+    will not say it.
+    """
+
     experiment: str
     arm: str
     role: str
     cfg: Config
     depends_on: Optional[str] = None      # run_dir of the source job
+    # Label of the arm that supplied the source, the seed it would have used
+    # with no replacement, and the seed it actually uses.
+    source_arm: Optional[str] = None
+    source_default_seed: Optional[int] = None
+    source_seed: Optional[int] = None
+    # Seed-independent identity of the source *configuration*: the pool a
+    # replacement is drawn within. Two consumers sharing a lineage must never
+    # share a replacement seed, or one source run would stand in for two arms.
+    source_lineage: Optional[str] = None
 
     def key(self) -> str:
         return self.cfg.run_dir()
+
+    @property
+    def source_replaced(self) -> bool:
+        """True when the validity gate moved this run off its default source."""
+        return (self.source_seed is not None
+                and self.source_seed != self.source_default_seed)
+
+
+#: Where `sweep.py` records every source the validity gate rejected. Read back
+#: here so that a caller which only knows the run tree -- `aggregate.py`,
+#: `audit.py` -- resolves the job graph the runner actually ran, rather than the
+#: one the catalogue would have produced with no rejections in it.
+REPLACEMENTS_RELPATH = os.path.join('_jobs', 'source_replacements.jsonl')
+
+
+def load_source_replacements(out_root: str
+                             ) -> tuple[dict[tuple[str, int], int],
+                                        dict[str, set[int]]]:
+    """The runner's rejection ledger, in the two shapes `jobs` needs.
+
+    Returns
+
+    * the **assignment**: (source arm label, the seed the source would default
+      to) -> the seed finally in force. Chains are followed, so a lineage
+      rejected twice yields one entry pointing at its second replacement.
+    * the **draws**: source arm label -> every reserve seed ever handed to it,
+      intermediate links included. A rejected replacement is still a run that
+      exists on disk and still has to be declarable, which the collapsed
+      assignment on its own cannot say.
+
+    Rows with no replacement seed are rejections the reserve could not cover.
+    They belong in the results table but not in either map, so they are skipped.
+
+    Deliberately silent about a missing or damaged file: the ledger records
+    something that may simply not have happened yet, and refusing to enumerate
+    the catalogue because a run tree contains no rejections would be absurd.
+    """
+    path = os.path.join(out_root, REPLACEMENTS_RELPATH)
+    chain: dict[tuple[str, int], int] = {}
+    draws: dict[str, set[int]] = {}
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rep = row.get('replacement_seed')
+                if rep is None:
+                    continue
+                try:
+                    arm, rejected, rep = (str(row['source_arm']),
+                                          int(row['rejected_seed']), int(rep))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                chain[(arm, rejected)] = rep
+                draws.setdefault(arm, set()).add(rep)
+    except OSError:
+        return {}, {}
+
+    assignment: dict[tuple[str, int], int] = {}
+    for arm, start in chain:
+        seed, seen = start, {start}
+        while (arm, seed) in chain:
+            seed = chain[(arm, seed)]
+            if seed in seen:               # a hand-edited ledger; leave it be
+                break
+            seen.add(seed)
+        if seed != start:
+            assignment[(arm, start)] = seed
+    return assignment, draws
+
+
+#: The seed a lineage identity is computed at. Any fixed value works; the point
+#: is only that it is the *same* one for every member of a lineage.
+_LINEAGE_SEED = 0
+
+
+def source_lineage(cfg: Config) -> str:
+    """Seed-independent identity of a source configuration.
+
+    A replacement source differs from the one it replaces in exactly one field,
+    the seed, so the seed is the one field the pool must not be keyed by.
+    Everything else -- cell, environment, budget, optimiser -- has to match, or
+    the "replacement" would be a different experiment. Computing the run digest
+    at a fixed seed gives that equivalence class for free and inherits the
+    digest's guarantee that no identity-bearing field is missed.
+    """
+    return dataclasses.replace(cfg, seed=_LINEAGE_SEED).run_digest()
+
+
+def source_arm_labels(exp: Experiment) -> frozenset[str]:
+    """Labels of the arms some other arm in `exp` draws its source from."""
+    return frozenset(a.source_from for a in exp.arms if a.source_from)
 
 
 def resolve_seeds(spec: str | Iterable[int] | None,
@@ -631,7 +772,8 @@ def resolve_seeds(spec: str | Iterable[int] | None,
 
 def jobs(experiment: str, seeds: str | Iterable[int] | None = None,
          out_root: str = 'runs', overrides: dict | None = None,
-         allow_factor_overrides: bool = False) -> list[Job]:
+         allow_factor_overrides: bool = False,
+         source_seeds: Mapping[tuple[str, int], int] | None = None) -> list[Job]:
     """Resolve one experiment into concrete jobs, sources before their consumers.
 
     Source checkpoints are resolved from the *same seed* and the *same arm
@@ -639,6 +781,15 @@ def jobs(experiment: str, seeds: str | Iterable[int] | None = None,
     source. That is enforced here rather than trusted, because in the published
     study the DDQN transfer arm's source is unidentifiable and the only
     surviving CartPole checkpoint is from the wrong architecture.
+
+    ``source_seeds`` re-points that resolution. It maps
+    ``(source arm label, the seed the source would default to)`` to the seed to
+    use instead, which is how `DESIGN.md` 4.3's reserve rule reaches the job
+    graph: `sweep.py` gates each source on its normalised final score and hands
+    back a map for the ones the gate rejected. The map is keyed on the
+    *default* seed, not the current one, so a lineage replaced twice still
+    resolves from one entry and re-running is a lookup rather than a fresh
+    draw. Passing nothing is the pre-reserve behaviour exactly.
     """
     exp = EXPERIMENTS[experiment]
     seed_list = resolve_seeds(seeds, exp.seed_block)
@@ -658,6 +809,16 @@ def jobs(experiment: str, seeds: str | Iterable[int] | None = None,
             f'fields: {sorted(SCALING_FIELDS)}')
 
     by_label = {a.label: a for a in exp.arms}
+    # ``None`` means "read the tree"; an explicit map -- including an empty one
+    # -- means the caller has already resolved the assignment and owns it. The
+    # runner always passes its own map, so it never races its own ledger.
+    if source_seeds is None:
+        replacements, draws = load_source_replacements(out_root)
+    else:
+        replacements = dict(source_seeds)
+        draws = {}
+        for (arm_label, _default), rep in replacements.items():
+            draws.setdefault(arm_label, set()).add(int(rep))
     built: dict[tuple[str, int], Job] = {}
     out: list[Job] = []
 
@@ -694,33 +855,63 @@ def jobs(experiment: str, seeds: str | Iterable[int] | None = None,
                                f' [factor overrides: {sorted(factor_overrides)}]'
                                ).strip()
 
+        src_arm = src_lineage = None
+        src_seed = default_src_seed = None
         if arm.source_from:
-            src_seed = seed
+            default_src_seed = seed
             if arm.source_seed_block:
                 block = SEED_BLOCKS[arm.source_seed_block]
-                src_seed = block[seed % len(block)]
+                default_src_seed = block[seed % len(block)]
+            src_seed = int(replacements.get((arm.source_from, default_src_seed),
+                                            default_src_seed))
             src_job = build(arm.source_from, src_seed)
             kwargs['source_checkpoint'] = os.path.join(src_job.cfg.run_dir(),
                                                        'model.keras')
             dep = src_job.key()
+            src_arm = arm.source_from
+            src_lineage = source_lineage(src_job.cfg)
 
         cfg = Config(**kwargs)
-        job = Job(experiment, arm.label, arm.role, cfg, dep)
+        job = Job(experiment, arm.label, arm.role, cfg, dep,
+                  source_arm=src_arm, source_default_seed=default_src_seed,
+                  source_seed=src_seed, source_lineage=src_lineage)
         built[(label, seed)] = job
         out.append(job)
         return job
 
+    donors = source_arm_labels(exp)
+    reserve = set(SEED_BLOCKS['RESERVE'])
     for seed in seed_list:
+        # `DESIGN.md` 3.4 gives RESERVE exactly one use -- "replacement sources
+        # when the validity gate rejects one" -- and "never used for anything
+        # else". Enumerating a whole experiment at a RESERVE seed would declare
+        # arms the design forbids to exist, and the completeness checks
+        # downstream infer an experiment's seed axis from the runs on disk: a
+        # replacement source at seed 400 would put 400 on that axis and every
+        # target-side arm would then be reported missing at a seed that must
+        # never be run. Only the donor arms are built there.
+        donors_only = seed in reserve
+        # Narrowed once more when the ledger says which lineage drew this seed.
+        # One rejected source does not mean every cell needs a run at 400, and
+        # declaring the others would report them missing for ever. With nothing
+        # to read, every donor arm is declared: a superset, which leaves a real
+        # replacement run attributable rather than orphaned.
+        drawn_here = {label for label, seeds in draws.items() if seed in seeds}
+        allowed = drawn_here or donors
         for arm in exp.arms:
             if arm.only_as_source:
                 continue          # built on demand, at its own block's seed
+            if donors_only and arm.label not in allowed:
+                continue
             build(arm.label, seed)
     return out
 
 
 def all_jobs(experiments: Iterable[str], seeds=None, out_root: str = 'runs',
              overrides: dict | None = None,
-             allow_factor_overrides: bool = False) -> list[Job]:
+             allow_factor_overrides: bool = False,
+             source_seeds: Mapping[tuple[str, int], int] | None = None
+             ) -> list[Job]:
     """Jobs for several experiments, de-duplicated by run directory.
 
     De-duplication is the payoff of keying a run by its configuration digest
@@ -733,7 +924,7 @@ def all_jobs(experiments: Iterable[str], seeds=None, out_root: str = 'runs',
     ordered: list[Job] = []
     for name in experiments:
         for job in jobs(name, seeds, out_root, overrides,
-                        allow_factor_overrides):
+                        allow_factor_overrides, source_seeds):
             if job.key() in seen:
                 continue
             seen[job.key()] = job
@@ -759,7 +950,9 @@ def summary() -> list[dict]:
 
 
 __all__ = ['Arm', 'Experiment', 'Job', 'EXPERIMENTS', 'SEED_BLOCKS', 'CELLS',
-           'SCALING_FIELDS', 'ENV_PAIRS',
+           'SCALING_FIELDS', 'ENV_PAIRS', 'SOURCE_VALIDITY_GATE',
+           'RESERVE_ORDER', 'source_lineage', 'source_arm_labels',
+           'load_source_replacements', 'REPLACEMENTS_RELPATH',
            'TIERS', 'PROTOCOL', 'COMMON', 'CORE_INVARIANTS', 'jobs',
            'all_jobs', 'resolve_seeds', 'summary', 'SMOKE_OVERRIDES',
            'SOURCE_ENV', 'TARGET_ENV', 'INTERFACE_ENV', 'FREEZE_LEVELS',

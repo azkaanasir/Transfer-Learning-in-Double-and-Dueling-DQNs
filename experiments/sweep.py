@@ -32,6 +32,51 @@ exits non-zero. `DESIGN.md` §8.4 and `ANALYSIS_PLAN.md` §8 both forbid a run
 disappearing without a stated rule, and a runner that skips silently is how that
 happens by accident.
 
+**Defect 4 -- the reserve-seed rule was documented and never implemented.**
+`DESIGN.md` 4.3 pre-registers it: "source seeds are drawn in order from a
+RESERVE block until the cell has its full complement of valid sources, and the
+number and identity of rejected source seeds appear in the results table". The
+block existed in `registry.py`, `plan.py`, `report.py` and `stats.py` all
+described the rule in prose, and the analysis layer reported `source_valid` --
+but nothing ever drew a replacement. At ten seeds a cell with three failed
+sources would have run at n=7, and `audit.py` would then have refused the whole
+report on seed completeness, 52 hours into the sweep. Worse, the failure is
+silent up to that point: a run whose source never learned the source task is
+exactly the published study's central defect, and it looks identical to a good
+run from the runner's side.
+
+So a selection containing source arms runs in **two phases**. Phase 1 trains the
+sources and gates each one on its own normalised final score; every failure
+allocates the next unused RESERVE seed, enqueues that source, and re-points the
+dependent transfer runs at the replacement checkpoint; the phase repeats while
+newly trained sources keep failing. Phase 2 runs the target side against the
+assignment that survived. Exhausting the reserve is an error and stops the
+sweep. Every rejection is appended to ``runs/_jobs/source_replacements.jsonl``
+with the seed, the cell, the score and the replacement, because the design
+requires the rejected seeds to appear in the results table and a number that
+lives only in a terminal scrollback is not reportable.
+
+The assignment is derived, not drawn: it is a function of the ledger plus the
+scores already on disk, walked in a fixed order over a fixed RESERVE ordering.
+Re-running the same command after an interruption therefore reproduces the same
+assignment instead of taking a fresh draw.
+
+One consequence is stated rather than papered over. `source_checkpoint` is
+deliberately *excluded* from the run digest (`src/dqn/config.py`,
+``BOOKKEEPING_FIELDS``: hashing a path would make moving the run tree change
+every run's identity), and until the reserve rule nothing could make two runs
+differ only in it -- the source seed was a pure function of the target seed. A
+re-pointed transfer run therefore keeps the run directory it would have had with
+the rejected source. That is safe within a sweep, because the source stage
+settles the assignment before any consumer is enqueued, but a directory left by
+an *earlier* sweep can hold a run built from the now-rejected source. Such a
+directory is detected by comparing the stored ``source.source_result.run_digest``
+against the assigned source and is **refused**, never skipped as complete and
+never resumed: serving invalid-source data under a valid-source label is the
+pooling error `DESIGN.md` 4.3 exists to prevent. Making the digest cover the
+source lineage instead would be the better fix and it belongs in
+`src/dqn/config.py`, which this file does not own.
+
 Three further properties are deliberate:
 
 * **Workers are separate interpreters, always -- even at ``--jobs 1``.**
@@ -61,10 +106,13 @@ Usage::
 Layout written under ``--out-root`` (default ``runs``)::
 
     _jobs/jobs.jsonl          one line per resolved job, with its full config
+    _jobs/jobs-<id>-<tag>.jsonl  what one phase of one sweep was given to run
     _jobs/status.jsonl        append-only state transitions, all sweeps
     _jobs/sweep-<id>.json     the invocation: argv, seeds, host, thread pinning
+    _jobs/source_replacements.jsonl  every validity-gate rejection and its
+                              replacement seed (DESIGN.md 4.3), append-only
     _index/<experiment>.jsonl experiment -> member run_dirs
-    _logs/w<NN>-<id>.log      per-worker output
+    _logs/w<NN>-<id>[-<tag>].log  per-worker output
 """
 from __future__ import annotations
 
@@ -77,7 +125,8 @@ import subprocess
 import sys
 import time
 import traceback
-from typing import Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Mapping, Optional, Sequence
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -93,6 +142,11 @@ INDEX_SUBDIR = '_index'
 LOGS_SUBDIR = '_logs'
 JOBS_FILE = 'jobs.jsonl'
 STATUS_FILE = 'status.jsonl'
+# Durable record of every source the validity gate rejected and what replaced
+# it. DESIGN.md 4.3 requires the number and identity of rejected source seeds in
+# the results table, so the rejections have to outlive the terminal that printed
+# them; append-only, one JSON object per rejection, for the analysis layer.
+REPLACEMENTS_FILE = 'source_replacements.jsonl'
 CLAIM_NAME = '.claim'
 
 DEFAULT_STALE_SECONDS = 7_200
@@ -252,13 +306,25 @@ def job_record(job: 'registry.Job', experiments: Sequence[str]) -> dict:
         'depends_on': job.depends_on,
         'source_checkpoint': cfg.source_checkpoint,
         'needs_source_weights': cfg.condition in _WEIGHT_READING,
+        # Which source this run draws on, and whether the validity gate moved it
+        # off the default. The run directory cannot say -- `source_checkpoint`
+        # is bookkeeping and outside the digest -- so the job record is where a
+        # replacement becomes legible, and where the lineage check reads it.
+        'source_arm': job.source_arm,
+        'source_default_seed': job.source_default_seed,
+        'source_seed': job.source_seed,
+        'source_lineage': job.source_lineage,
+        'source_replaced': job.source_replaced,
+        'source_run_digest': None,
+        'is_source': False,
         'config': cfg.to_dict(),
     }
 
 
 def build_plan(exp_ids: Sequence[str], seeds: Optional[tuple[int, ...]],
                out_root: str, overrides: dict | None = None,
-               allow_factor_overrides: bool = False
+               allow_factor_overrides: bool = False,
+               source_seeds: Mapping[tuple[str, int], int] | None = None
                ) -> tuple[list[dict], dict[str, list[str]]]:
     """Resolve experiments into de-duplicated job records plus experiment membership.
 
@@ -272,12 +338,14 @@ def build_plan(exp_ids: Sequence[str], seeds: Optional[tuple[int, ...]],
     here and written to ``_index/``.
     """
     jobs = registry.all_jobs(exp_ids, seeds, out_root, overrides,
-                             allow_factor_overrides=allow_factor_overrides)
+                             allow_factor_overrides=allow_factor_overrides,
+                             source_seeds=source_seeds)
     membership: dict[str, list[str]] = {}
     for eid in exp_ids:
         dirs = [j.cfg.run_dir() for j in registry.jobs(
             eid, seeds, out_root, overrides,
-            allow_factor_overrides=allow_factor_overrides)]
+            allow_factor_overrides=allow_factor_overrides,
+            source_seeds=source_seeds)]
         membership[eid] = list(dict.fromkeys(dirs))
 
     by_run: dict[str, list[str]] = {}
@@ -287,6 +355,24 @@ def build_plan(exp_ids: Sequence[str], seeds: Optional[tuple[int, ...]],
 
     records = [job_record(j, by_run.get(j.cfg.run_dir(), [j.experiment]))
                for j in jobs]
+
+    # Two derived fields that need the whole plan, not one job. `is_source` is
+    # membership of the phase-1 stage, and it is computed from the dependency
+    # edges rather than from `role`: E8's shift arms draw their source from a
+    # `scratch-*` arm whose declared role is 'target', and a role-based test
+    # would leave those sources ungated -- which is the one place the gate is
+    # most needed, since a scratch LunarLander run is exactly what the design
+    # calls a source there.
+    by_dir = {r['run_dir']: r for r in records}
+    for rec in records:
+        dep = rec.get('depends_on')
+        if not dep:
+            continue
+        src = by_dir.get(dep)
+        if src is None:
+            continue
+        src['is_source'] = True
+        rec['source_run_digest'] = src['run_digest']
     return records, membership
 
 
@@ -592,6 +678,428 @@ def dependency_state(rec: dict, pending: set[str], sweep_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Source validity and the RESERVE replacement rule (DESIGN.md 4.3)
+# ---------------------------------------------------------------------------
+def manifest_of(run_dir: str) -> Optional[dict]:
+    """The whole manifest, or None when the run has not written one."""
+    try:
+        with open(os.path.join(run_dir, 'manifest.json'), encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def source_score(run_dir: str) -> tuple[str, Optional[float]]:
+    """The quantity the gate is defined on, read from the source's own manifest.
+
+    `DESIGN.md` 4.3 defines validity on the **normalised** final score, which is
+    `result.final_score` of the source run itself -- not on raw return, and not
+    on a multiplicative fraction of the registered threshold, which at Acrobot's
+    -100 would demand -60 and so be harder than solving the task.
+
+    Three states, kept apart on purpose:
+
+    * ``unrun``    -- no manifest. Nothing is known; the run is still to do.
+    * ``unscored`` -- a manifest with no ``final_score``. The run finished
+      without producing the number the gate is defined on, so the gate cannot be
+      applied. That is reported, never read as a pass.
+    * ``scored``   -- the score.
+    """
+    result = manifest_result(run_dir)
+    if result is None:
+        return 'unrun', None
+    score = result.get('final_score')
+    if score is None:
+        return 'unscored', None
+    return 'scored', float(score)
+
+
+@dataclass
+class SourceSlot:
+    """One source requirement of the plan, and what it currently resolves to.
+
+    A slot is keyed by (source arm, the seed the source would default to), which
+    is the thing a replacement re-points. It is deliberately *not* keyed by the
+    consumer: several arms share one source -- E1's two transfer sets, E2's
+    permuted control -- and replacing the source once has to move all of them,
+    or a control would be measured against a different source than the arm it
+    controls for.
+    """
+
+    lineage: str
+    arm: str
+    cell: str
+    env: str
+    experiment: str
+    default_seed: int
+    seed: int
+    run_dir: str
+    run_digest: str
+    state: str = 'unrun'
+    score: Optional[float] = None
+    consumers: list[str] = field(default_factory=list)
+
+    @property
+    def replaced(self) -> bool:
+        return self.seed != self.default_seed
+
+    def verdict(self, gate: float) -> str:
+        """One of 'valid', 'rejected', 'unrun', 'unscored'."""
+        if self.state != 'scored':
+            return self.state
+        return 'valid' if self.score >= gate else 'rejected'
+
+    def describe(self) -> str:
+        return (f'{self.arm} s{self.seed:02d} ({self.cell} on {self.env})'
+                + (f' [replaces s{self.default_seed:02d}]' if self.replaced
+                   else ''))
+
+
+def source_slots(records: Sequence[dict]) -> list[SourceSlot]:
+    """Every source the plan depends on, in a fixed order.
+
+    The order is (arm, default seed) and it is fixed because the allocation
+    walks it: a draw that depended on dictionary or filesystem ordering would
+    give a different assignment on a re-run, and `DESIGN.md` 4.3's "drawn in
+    order" would then be untrue.
+    """
+    by_dir = {r['run_dir']: r for r in records}
+    slots: dict[tuple[str, int], SourceSlot] = {}
+    for rec in records:
+        dep = rec.get('depends_on')
+        src = by_dir.get(dep) if dep else None
+        if src is None:
+            continue
+        key = (str(rec.get('source_arm')), int(rec.get('source_default_seed')))
+        slot = slots.get(key)
+        if slot is None:
+            state, score = source_score(src['run_dir'])
+            slot = SourceSlot(
+                lineage=str(rec.get('source_lineage')),
+                arm=key[0], cell=src['cell'], env=src['env'],
+                experiment=src['experiment'], default_seed=key[1],
+                seed=int(rec.get('source_seed')), run_dir=src['run_dir'],
+                run_digest=src['run_digest'], state=state, score=score)
+            slots[key] = slot
+        slot.consumers.append(rec['run_dir'])
+    return [slots[k] for k in sorted(slots, key=lambda k: (k[0], k[1]))]
+
+
+def read_replacements(path: str) -> list[dict]:
+    """The rejection ledger, skipping any line a concurrent append tore."""
+    out: list[dict] = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def _replacement_key(row: dict) -> tuple:
+    return (str(row.get('lineage')), str(row.get('source_arm')),
+            row.get('rejected_seed'), row.get('replacement_seed'))
+
+
+def append_replacements(path: str, rows: Sequence[dict]) -> int:
+    """Append rejections not already recorded; return how many were new.
+
+    De-duplicated on (lineage, arm, rejected seed, replacement seed) so that
+    re-running a completed sweep adds nothing. Idempotence has to hold in the
+    *record* as well as in the assignment, or the results table would report one
+    rejection twice and the count `DESIGN.md` 4.3 asks for would be wrong.
+    """
+    known = {_replacement_key(r) for r in read_replacements(path)}
+    fresh = [r for r in rows if _replacement_key(r) not in known]
+    for row in fresh:
+        append_status(path, row)
+    return len(fresh)
+
+
+def resolve_source_assignment(
+        exp_ids: Sequence[str], seeds: Optional[tuple[int, ...]], out_root: str,
+        overrides: dict, allow_factor_overrides: bool, gate: float,
+        ledger: Sequence[dict], gate_overridden: bool = False,
+        sweep_id: str = '') -> dict:
+    """Work out which source seed each slot uses, and what was rejected.
+
+    The assignment is **derived, not drawn**. Two inputs only: the durable
+    ledger, replayed first so an assignment already made survives an
+    interruption even when the rejected run has since been moved off disk; and
+    the scores already on disk, walked in the fixed slot order against the fixed
+    RESERVE ordering. Same inputs, same assignment -- which is what makes a
+    resumed invocation a lookup rather than a fresh draw.
+
+    Returns the assignment map, the rebuilt plan, the slots, the rejections that
+    are new to the ledger, and the lineages whose reserve ran out. Exhaustion is
+    returned rather than raised so the caller can report every exhausted lineage
+    at once: finding out about them one sweep at a time is how a cell ends up at
+    n=7.
+    """
+    reserve = tuple(registry.RESERVE_ORDER)
+
+    # (arm, rejected seed) -> replacement seed, from the ledger. Chains, because
+    # a replacement can itself be rejected; `follow` walks to the end of one.
+    chain: dict[tuple[str, int], int] = {}
+    handed_out: dict[str, set[int]] = {}
+    for row in ledger:
+        rep = row.get('replacement_seed')
+        if rep is None:
+            # A rejection recorded with nothing left to replace it. It belongs
+            # in the results table but not in the chain, and re-reading it must
+            # not consume a reserve seed that was never handed out.
+            continue
+        chain[(str(row.get('source_arm')),
+               int(row.get('rejected_seed')))] = int(rep)
+        handed_out.setdefault(str(row.get('lineage')), set()).add(int(rep))
+
+    def follow(arm: str, seed: int) -> int:
+        seen = {seed}
+        cur = seed
+        while (arm, cur) in chain:
+            cur = chain[(arm, cur)]
+            if cur in seen:
+                raise RuntimeError(
+                    f'the replacement ledger contains a cycle for {arm} at seed '
+                    f'{seed}; '
+                    f'{os.path.join(out_root, JOBS_SUBDIR, REPLACEMENTS_FILE)} '
+                    f'has been edited or merged by hand')
+            seen.add(cur)
+        return cur
+
+    assignment: dict[tuple[str, int], int] = {}
+    new_rejections: list[dict] = []
+    records: list[dict] = []
+    membership: dict[str, list[str]] = {}
+    slots: list[SourceSlot] = []
+    exhausted: list[dict] = []
+
+    # Bounded: each pass either consumes one reserve seed for one lineage or
+    # settles. The bound is stated so that a bug becomes a refusal rather than a
+    # process that never returns.
+    for _ in range(len(reserve) * 8 + 4):
+        records, membership = build_plan(exp_ids, seeds, out_root, overrides,
+                                         allow_factor_overrides, assignment)
+        slots = source_slots(records)
+        exhausted = []
+        changed = False
+
+        # 1. Honour what the ledger already decided.
+        for slot in slots:
+            target = follow(slot.arm, slot.default_seed)
+            if target != slot.seed:
+                assignment[(slot.arm, slot.default_seed)] = target
+                changed = True
+        if changed:
+            continue
+
+        # 2. Gate what is on disk, and draw for the first rejection found. One
+        #    at a time, because an allocation moves run directories and every
+        #    later slot has to be re-read against the new plan.
+        for slot in slots:
+            if slot.verdict(gate) != 'rejected':
+                continue
+            used = set(handed_out.get(slot.lineage, ())) | {
+                other.seed for other in slots if other.lineage == slot.lineage}
+            nxt = next((r for r in reserve if r not in used), None)
+            row = {
+                'ts': round(time.time(), 3),
+                't': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'sweep': sweep_id,
+                'rule': 'DESIGN.md 4.3 -- normalised final score >= gate',
+                'gate': gate,
+                'gate_is_design_value': not gate_overridden,
+                'lineage': slot.lineage,
+                'cell': slot.cell,
+                'experiment': slot.experiment,
+                'source_arm': slot.arm,
+                'source_env': slot.env,
+                'rejected_seed': slot.seed,
+                'rejected_seed_block': seed_block(slot.seed),
+                'rejected_run_dir': slot.run_dir,
+                'rejected_run_digest': slot.run_digest,
+                'score': slot.score,
+                'default_seed': slot.default_seed,
+                'replacement_seed': nxt,
+                'consumers': sorted(set(slot.consumers)),
+            }
+            if nxt is None:
+                row['error'] = (
+                    f'RESERVE exhausted for {slot.arm} ({slot.cell} on '
+                    f'{slot.env}) at default seed {slot.default_seed}: all '
+                    f'{len(reserve)} seeds {reserve[0]}-{reserve[-1]} have '
+                    f'been drawn for this lineage, the last of them scoring '
+                    f'{slot.score:.3f} at s{slot.seed:02d}, and this slot '
+                    f'still has no valid source')
+                exhausted.append(row)
+                continue
+            chain[(slot.arm, slot.seed)] = nxt
+            assignment[(slot.arm, slot.default_seed)] = nxt
+            handed_out.setdefault(slot.lineage, set()).add(nxt)
+            new_rejections.append(row)
+            changed = True
+            break
+
+        if not changed:
+            break
+    else:                                            # pragma: no cover - guard
+        raise RuntimeError('source assignment did not settle; that is a bug in '
+                           'resolve_source_assignment, not a data condition')
+
+    return {'assignment': assignment, 'records': records,
+            'membership': membership, 'slots': slots,
+            'new_rejections': new_rejections, 'exhausted': exhausted}
+
+
+def lineage_conflicts(records: Sequence[dict]) -> list[dict]:
+    """Complete runs whose stored source is not the source now assigned.
+
+    This check exists because run identity does not cover the source. A
+    re-pointed transfer run keeps the run directory it would have had with the
+    rejected source (`source_checkpoint` is bookkeeping; see the module
+    docstring), so a directory left by an earlier sweep can hold a run trained
+    against a source the gate has since rejected. Treating it as complete would
+    serve invalid-source data under a valid-source label, which is precisely the
+    pooling error `DESIGN.md` 4.3 forbids; resuming it would be worse, because
+    `train.py` checks the trajectory digest and that does not cover the source
+    either, so the resume would be accepted.
+
+    Only conditions that actually read the source weights are checked: the
+    untrained control builds its own random source of matched shape and records
+    no ``source_result`` to compare against.
+    """
+    out: list[dict] = []
+    for rec in records:
+        if not rec.get('needs_source_weights') or not rec.get('depends_on'):
+            continue
+        if not is_complete(rec):
+            continue
+        manifest = manifest_of(rec['run_dir']) or {}
+        stored = (((manifest.get('source') or {}).get('source_result') or {})
+                  .get('run_digest'))
+        assigned = rec.get('source_run_digest')
+        if stored and assigned and str(stored) != str(assigned):
+            out.append({'run_dir': rec['run_dir'], 'job_id': rec['job_id'],
+                        'arm': rec['arm'], 'seed': rec['seed'],
+                        'experiment': rec['experiment'],
+                        'stored_source_digest': str(stored),
+                        'assigned_source_digest': str(assigned),
+                        'assigned_source_dir': rec['depends_on'],
+                        'assigned_source_seed': rec.get('source_seed'),
+                        'default_source_seed': rec.get('source_default_seed')})
+    return out
+
+
+def print_lineage_conflicts(conflicts: Sequence[dict]) -> None:
+    """Say exactly which directories hold data from a rejected source.
+
+    Printed rather than repaired, and the repair is not offered: this runner
+    does not delete data, and a directory whose contents were trained against a
+    source the gate has since rejected is evidence of something, not garbage.
+    Moving it aside is the operator's decision, and it is a decision that has to
+    be recorded in the paper -- `DESIGN.md` 4.3 requires the rejected sources to
+    appear in the results table, and a run that was built on one is part of that
+    story.
+    """
+    if not conflicts:
+        return
+    print('\n' + '=' * 72)
+    print(f'[ERROR] {len(conflicts)} complete run(s) were trained against a '
+          f'different source')
+    print('=' * 72)
+    print('  Run identity does not cover the source checkpoint '
+          '(src/dqn/config.py puts')
+    print('  source_checkpoint in BOOKKEEPING_FIELDS, so that moving the run '
+          'tree does not')
+    print('  change any run digest). A transfer run re-pointed at a '
+          'replacement source')
+    print('  therefore keeps the directory it had with the rejected one. These '
+          'directories')
+    print('  already hold a finished run built from the source the gate now '
+          'rejects:')
+    for row in conflicts:
+        print(f'\n  {row["job_id"]}  {row["experiment"]}/{row["arm"]} '
+              f'seed {row["seed"]}')
+        print(f'    directory:      {row["run_dir"]}')
+        print(f'    stored source:  {row["stored_source_digest"][:12]}')
+        print(f'    assigned source: {row["assigned_source_digest"][:12]} '
+              f'(seed {row["assigned_source_seed"]}, default '
+              f'{row["default_source_seed"]})')
+        print(f'                    {row["assigned_source_dir"]}')
+    print('\n  Neither skipped nor resumed. Skipping would serve '
+          'invalid-source data under a')
+    print('  valid-source label, which is the pooling error DESIGN.md 4.3 '
+          'exists to prevent;')
+    print('  resuming would be accepted by train.py, because the trajectory '
+          'digest does not')
+    print('  cover the source either. Move or delete the directories above and '
+          're-run --')
+    print('  this runner will not delete data. The proper fix is for the run '
+          'digest to cover')
+    print('  the source lineage, and that belongs in src/dqn/config.py.')
+
+
+def print_source_phase(slots: Sequence[SourceSlot], records: Sequence[dict],
+                       gate: float, ledger: Sequence[dict],
+                       new_rejections: Sequence[dict],
+                       exhausted: Sequence[dict]) -> None:
+    """The two-phase structure, before anything is written or launched."""
+    reserve = tuple(registry.RESERVE_ORDER)
+    sources = [r for r in records if r['is_source']]
+    consumers = [r for r in records if r.get('depends_on')]
+    repointed = [r for r in consumers if r.get('source_replaced')]
+    lineages = {sl.lineage for sl in slots}
+    tally: dict[str, int] = {}
+    for sl in slots:
+        v = sl.verdict(gate)
+        tally[v] = tally.get(v, 0) + 1
+    drawn = {int(r['replacement_seed']) for r in ledger
+             if r.get('replacement_seed') is not None}
+    drawn |= {int(r['replacement_seed']) for r in new_rejections
+              if r.get('replacement_seed') is not None}
+
+    print('\ntwo-phase structure (DESIGN.md 4.3, source validity):')
+    print(f'  gate:      normalised final score >= {gate:.3f} on the source '
+          f'environment')
+    print(f'  phase 1    {len(sources)} source run(s) over {len(lineages)} '
+          f'lineage(s); {sum(1 for r in sources if is_complete(r))} complete, '
+          f'{sum(1 for r in sources if not is_complete(r))} to run')
+    print(f'             {len(slots)} slot(s): '
+          + ('  '.join(f'{k}={v}' for k, v in sorted(tally.items())) or 'none'))
+    for sl in slots:
+        v = sl.verdict(gate)
+        if v == 'valid':
+            continue
+        detail = (f'score {sl.score:.3f} < {gate:.3f}' if v == 'rejected'
+                  else ('no manifest yet' if v == 'unrun'
+                        else 'manifest carries no final_score'))
+        print(f'               {v.upper():8s} {sl.describe()}  {detail}')
+    for row in new_rejections:
+        print(f'               -> RESERVE seed {row["replacement_seed"]} for '
+              f'{row["source_arm"]} (was s{row["rejected_seed"]:02d}, score '
+              f'{row["score"]:.3f}); {len(row["consumers"])} dependent run(s) '
+              f're-pointed')
+    print(f'             RESERVE: {len(reserve)} seed(s) {reserve[0]}-'
+          f'{reserve[-1]}; {len(drawn)} drawn, {len(reserve) - len(drawn)} '
+          f'unused')
+    print(f'  phase 2    {len(records) - len(sources)} run(s) outside phase 1; '
+          f'{len(consumers)} depend on a phase-1 source, {len(repointed)} of '
+          f'them on a replacement')
+    print('  phase 1 repeats while a newly trained source fails the gate. '
+          'Exhausting')
+    print('  RESERVE is an error and stops the sweep; it is never a quietly '
+          'short cell.')
+    for row in exhausted:
+        print(f'  [ERROR] {row["error"]}')
+
+
+# ---------------------------------------------------------------------------
 # The single-run entry point a worker invokes
 # ---------------------------------------------------------------------------
 def run_one(config_dict: dict, argv: list[str] | None = None) -> dict:
@@ -756,7 +1264,8 @@ def worker_main(args: argparse.Namespace) -> int:
 # Parent
 # ---------------------------------------------------------------------------
 def spawn_workers(args: argparse.Namespace, jobs_path: str,
-                  n_jobs: int) -> list[tuple[subprocess.Popen, str, str]]:
+                  n_jobs: int, tag: str = ''
+                  ) -> list[tuple[subprocess.Popen, str, str]]:
     """Launch worker interpreters with pinned threads and a fixed hash seed.
 
     Left unpinned, every TensorFlow process claims all cores and they thrash,
@@ -787,7 +1296,12 @@ def spawn_workers(args: argparse.Namespace, jobs_path: str,
                '--max-wait-seconds', str(args.max_wait_seconds)]
         if args.force:
             cmd.append('--force')
-        path = os.path.join(log_dir, f'w{i:02d}-{args.sweep_id}.log')
+        # The tag separates the phases' logs. Without it the source phase's
+        # workers and the target phase's would overwrite each other's log and
+        # the failure that stopped a source would be unreadable by the time
+        # anyone looked.
+        suffix = f'-{tag}' if tag else ''
+        path = os.path.join(log_dir, f'w{i:02d}-{args.sweep_id}{suffix}.log')
         fh = open(path, 'w', encoding='utf-8')
         proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
                                 env=env, cwd=_ROOT)
@@ -820,6 +1334,34 @@ def wait_for_workers(procs, status_path: str, sweep_id: str,
             print('  ... ' + '  '.join(f'{k}={v}' for k, v in
                                        sorted(tally.items())), flush=True)
     return codes
+
+
+def run_stage(args: argparse.Namespace, records: Sequence[dict], tag: str,
+              status_path: str) -> tuple[dict[str, int], dict[str, str]]:
+    """Write one phase's job file, launch workers on it, and wait.
+
+    Each phase gets its own job file rather than reusing ``jobs.jsonl``, because
+    a worker's whole contract is that it never invents a job: it runs what its
+    file lists and nothing else. Handing the source phase a file containing only
+    the source runs is therefore how the phase boundary is enforced, rather than
+    by asking workers to be selective.
+    """
+    jobs_dir = os.path.join(args.out_root, JOBS_SUBDIR)
+    os.makedirs(jobs_dir, exist_ok=True)
+    path = os.path.join(jobs_dir, f'jobs-{args.sweep_id}-{tag}.jsonl')
+    write_jobs(path, records)
+    n_jobs = max(1, min(args.jobs, len(records)))
+    print(f'\nlaunching {n_jobs} worker(s) for {len(records)} job(s) '
+          f'[{tag}] -> {path}')
+    procs = spawn_workers(args, path, n_jobs, tag)
+    log_paths = {name: log for _proc, log, name in procs}
+    started = time.time()
+    codes = wait_for_workers(procs, status_path, args.sweep_id,
+                             args.progress_seconds)
+    for _proc, log, name in procs:
+        print(f'  {name}: exit {codes.get(name)}  {log}')
+    print(f'  [{tag}] workers finished in {(time.time() - started) / 60:.1f} min')
+    return codes, log_paths
 
 
 def summarise(records: Sequence[dict], status_path: str, sweep_id: str,
@@ -1029,6 +1571,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help='proceed despite a seed-block violation. Stamped into '
                         'the invocation record; audit.py will still refuse the '
                         'affected estimates')
+    p.add_argument('--allow-invalid-sources', action='store_true',
+                   help='proceed into the target phase even though a cell has '
+                        'no valid source and RESERVE is exhausted. The cell is '
+                        'then transfer-from-a-source-that-never-learned, which '
+                        'is the published study\'s central defect; the '
+                        'override is stamped into the invocation record and '
+                        'into every rejection row so the affected cells are '
+                        'identifiable in the results table')
+    p.add_argument('--source-gate', type=float, default=None,
+                   metavar='SCORE',
+                   help='override the source-validity gate. A TESTING '
+                        'instrument: DESIGN.md 4.3 fixes the gate at '
+                        '0.6 normalised score and a confirmatory run must use '
+                        'that value. Any other value is printed as a warning, '
+                        'recorded in the invocation file, and stamped into '
+                        'every rejection row as gate_is_design_value=false')
     # Worker mode. Not for interactive use: a worker takes no seed
     # specification, only the resolved job manifest, which is what makes the
     # seed round-tripping defect impossible to reintroduce.
@@ -1093,24 +1651,65 @@ def main(argv=None) -> int:
               f'catalogue arms they are labelled as; their digests differ and '
               f'their manifests carry a note recording it.')
 
-    records, membership = build_plan(exp_ids, seeds, args.out_root, overrides,
-                                     args.allow_factor_overrides)
+    gate = (registry.SOURCE_VALIDITY_GATE if args.source_gate is None
+            else float(args.source_gate))
+    gate_overridden = abs(gate - registry.SOURCE_VALIDITY_GATE) > 1e-12
+    if gate_overridden:
+        print(f'[warning] --source-gate {gate:g} replaces the pre-registered '
+              f'{registry.SOURCE_VALIDITY_GATE:g} of DESIGN.md 4.3. This is a '
+              f'testing instrument. Every rejection recorded under it carries '
+              f'gate_is_design_value=false, and no run made under it is a '
+              f'confirmatory result.')
+
+    jobs_dir = os.path.join(args.out_root, JOBS_SUBDIR)
+    ledger_path = os.path.join(jobs_dir, REPLACEMENTS_FILE)
+    ledger = read_replacements(ledger_path)
+
+    # The source assignment is settled before anything is printed, because the
+    # plan a reader is shown has to be the plan that will run: a rejected source
+    # moves its dependants onto a different checkpoint, and a job list printed
+    # before that resolution would name a source the sweep is not going to use.
+    resolved = resolve_source_assignment(
+        exp_ids, seeds, args.out_root, overrides, args.allow_factor_overrides,
+        gate, ledger, gate_overridden, args.sweep_id)
+    records, membership = resolved['records'], resolved['membership']
+
     print(f'sweep {args.sweep_id}')
     print_plan(records, exp_ids, membership, seeds, args.jobs, args.verbose)
-
+    print_source_phase(resolved['slots'], records, gate, ledger,
+                       resolved['new_rejections'], resolved['exhausted'])
     if args.dry_run:
+        # Checked here only for the dry run. In a live sweep the phase-1 loop
+        # can still move the assignment, so the check that decides anything is
+        # the one after phase 1; printing both would show the same block twice.
+        print_lineage_conflicts(lineage_conflicts(records))
+        if resolved['new_rejections']:
+            print(f'\n--dry-run: {len(resolved["new_rejections"])} '
+                  f'rejection(s) would be appended to {ledger_path}.')
         print('\n--dry-run: nothing written, nothing launched.')
         return 0
 
-    jobs_dir = os.path.join(args.out_root, JOBS_SUBDIR)
     os.makedirs(jobs_dir, exist_ok=True)
     jobs_path = os.path.join(jobs_dir, JOBS_FILE)
     status_path = os.path.join(jobs_dir, STATUS_FILE)
-    write_jobs(jobs_path, records)
-    index_paths = write_index(args.out_root, membership, records)
+
+    def publish(recs: Sequence[dict], memb: dict[str, list[str]]) -> None:
+        """Keep jobs.jsonl and the index describing the *current* assignment.
+
+        Rewritten after every reassignment rather than once at launch: a sweep
+        killed mid-run is meant to be inspectable, and a job file naming sources
+        that have since been rejected would describe a sweep nobody ran.
+        """
+        write_jobs(jobs_path, recs)
+        write_index(args.out_root, memb, recs)
+
+    publish(records, membership)
     print(f'\nwrote {jobs_path} ({len(records)} jobs)')
-    for path in index_paths:
-        print(f'wrote {path}')
+    n_recorded = append_replacements(
+        ledger_path, list(resolved['new_rejections']) + list(resolved['exhausted']))
+    if n_recorded:
+        print(f'wrote {n_recorded} source-validity rejection(s) to '
+              f'{ledger_path}')
 
     if args.force:
         print('\n[--force] complete manifests will be re-entered. train.py '
@@ -1133,6 +1732,14 @@ def main(argv=None) -> int:
         'resume': bool(args.resume), 'force': bool(args.force),
         'stale_seconds': args.stale_seconds,
         'seed_block_override': bool(args.allow_seed_block_override and fatal),
+        # The reserve rule's provenance: the gate actually applied, whether it
+        # is the pre-registered one, and the assignment this sweep ran under.
+        'source_gate': gate,
+        'source_gate_is_design_value': not gate_overridden,
+        'source_replacements_recorded': n_recorded,
+        'source_assignment': {f'{arm}@s{seed}': int(rep) for (arm, seed), rep
+                              in sorted(resolved['assignment'].items())},
+        'invalid_sources_allowed': bool(args.allow_invalid_sources),
         'plan_hashes': _plan_hashes(),
     }
     with open(os.path.join(jobs_dir, f'sweep-{args.sweep_id}.json'), 'w',
@@ -1144,6 +1751,99 @@ def main(argv=None) -> int:
                                 'state': 'sweep_start',
                                 'ts': round(time.time(), 3),
                                 't': invocation['t']})
+
+    # ---- phase 1: sources, gated, replaced, repeated -------------------
+    # `--force` is not honoured here. It re-enters a complete directory, and
+    # train.py resumes rather than retrains, so forcing the source phase would
+    # leave the same complete manifests in place and the loop would never
+    # empty. Deleting a source's directory is still the way to retrain it.
+    stage = 0
+    stalled: list[dict] = []
+    while True:
+        due = [r for r in records if r['is_source'] and not is_complete(r)]
+        if not due:
+            break
+        stage += 1
+        print(f'\n{"=" * 72}\nphase 1, source stage {stage}: {len(due)} '
+              f'source run(s) to train, then gate at {gate:.3f}\n{"=" * 72}')
+        run_stage(args, due, f'src{stage}', status_path)
+
+        ledger = read_replacements(ledger_path)
+        resolved = resolve_source_assignment(
+            exp_ids, seeds, args.out_root, overrides,
+            args.allow_factor_overrides, gate, ledger, gate_overridden,
+            args.sweep_id)
+        records, membership = resolved['records'], resolved['membership']
+        publish(records, membership)
+        n_new = append_replacements(
+            ledger_path,
+            list(resolved['new_rejections']) + list(resolved['exhausted']))
+        n_recorded += n_new
+        print_source_phase(resolved['slots'], records, gate, ledger,
+                           resolved['new_rejections'], resolved['exhausted'])
+        if n_new:
+            print(f'  recorded {n_new} rejection(s) in {ledger_path}')
+
+        still = [r for r in records if r['is_source'] and not is_complete(r)]
+        if {r['run_dir'] for r in still} == {r['run_dir'] for r in due}:
+            # The stage trained nothing it was given. Looping would spin on the
+            # same failures; the worker log already names the cause.
+            stalled = still
+            print(f'\n[REFUSED] the source stage made no progress: '
+                  f'{len(still)} source run(s) still have no complete '
+                  f'manifest. Read the stage log above, fix the cause, and '
+                  f're-run; the target phase is not started against sources '
+                  f'whose validity is unknown.')
+            break
+
+    # ---- refusals between the phases -----------------------------------
+    if stalled:
+        return summarise(records, status_path, args.sweep_id, {}) or 1
+
+    if resolved['exhausted']:
+        print('\n' + '=' * 72)
+        print('[ERROR] RESERVE exhausted -- DESIGN.md 4.3 cannot be satisfied')
+        print('=' * 72)
+        for row in resolved['exhausted']:
+            print(f'  {row["error"]}')
+            print(f'    last rejected: s{row["rejected_seed"]:02d} score '
+                  f'{row["score"]:.3f} < {row["gate"]:.3f}  '
+                  f'{row["rejected_run_dir"]}')
+            print(f'    {len(row["consumers"])} dependent run(s) have no valid '
+                  f'source')
+        print('\n  Every rejection is in ' + ledger_path + '.')
+        print('  This is not a condition to run through: a cell whose sources '
+              'never learned the')
+        print('  source task measures transfer-from-nothing, which is the '
+              'defect DESIGN.md 4.3')
+        print('  exists to prevent. Widen RESERVE in registry.py, or fix what '
+              'is stopping the')
+        print('  sources from learning, or pass --allow-invalid-sources to '
+              'proceed deliberately.')
+        if not args.allow_invalid_sources:
+            append_status(status_path, {
+                'sweep': args.sweep_id, 'state': 'sweep_end',
+                'ts': round(time.time(), 3),
+                't': time.strftime('%Y-%m-%dT%H:%M:%S'), 'exit_code': 3,
+                'reason': 'RESERVE exhausted for '
+                          f'{len(resolved["exhausted"])} lineage(s)'})
+            return 3
+        print('\n[override] proceeding with invalid sources, as requested. '
+              'Recorded in the invocation file.')
+
+    conflicts = lineage_conflicts(records)
+    if conflicts:
+        print_lineage_conflicts(conflicts)
+        append_status(status_path, {
+            'sweep': args.sweep_id, 'state': 'sweep_end',
+            'ts': round(time.time(), 3),
+            't': time.strftime('%Y-%m-%dT%H:%M:%S'), 'exit_code': 4,
+            'reason': f'{len(conflicts)} run(s) hold data from a source the '
+                      f'validity gate has since rejected'})
+        return 4
+
+    # ---- phase 2: everything else --------------------------------------
+    pending = [r for r in records if args.force or not is_complete(r)]
     # One 'skipped' record per already-complete run, written by the parent so
     # that the count is stated once rather than once per worker.
     if not args.force:
@@ -1160,27 +1860,21 @@ def main(argv=None) -> int:
                     'reason': 'manifest reports episodes_completed >= '
                               f'{rec["num_episodes"]} before this sweep'})
 
+    log_paths: dict[str, str] = {}
     if not pending:
         print('\nNothing to run: every job already has a complete manifest.')
-        return summarise(records, status_path, args.sweep_id, {})
-
-    print(f'\nlaunching {n_jobs} worker(s) for {len(pending)} pending job(s)')
-    procs = spawn_workers(args, jobs_path, n_jobs)
-    log_paths = {name: path for _proc, path, name in procs}
-    print('\nWaiting. Tail any worker log to follow progress.', flush=True)
-    started = time.time()
-    codes = wait_for_workers(procs, status_path, args.sweep_id,
-                            args.progress_seconds)
-    for _proc, path, name in procs:
-        print(f'  {name}: exit {codes.get(name)}  {path}')
-    print(f'\nworkers finished in {(time.time() - started) / 60:.1f} min')
+    else:
+        print(f'\n{"=" * 72}\nphase 2, target stage: {len(pending)} run(s)'
+              f'\n{"=" * 72}')
+        print('Waiting. Tail any worker log to follow progress.', flush=True)
+        _codes, log_paths = run_stage(args, pending, 'targets', status_path)
 
     code = summarise(records, status_path, args.sweep_id, log_paths)
     append_status(status_path, {'sweep': args.sweep_id, 'state': 'sweep_end',
                                 'ts': round(time.time(), 3),
                                 't': time.strftime('%Y-%m-%dT%H:%M:%S'),
                                 'exit_code': code,
-                                'worker_exit_codes': codes})
+                                'source_replacements': n_recorded})
     return code
 
 

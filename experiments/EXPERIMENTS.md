@@ -26,7 +26,7 @@ python experiments/validate.py
 python experiments/measure_references.py --check
 ```
 
-**Do not skip step 2.** `preflight.py` catches a missing Box2D — which breaks
+**Do not skip step 2.** `preflight.py` catches a missing Box2D: which breaks
 LunarLander but not CartPole, so a naive CartPole smoke test passes and a sweep
 dies hours later. `validate.py` catches the subtler class: a diagnostic that
 perturbs training, a resume that silently restarts Adam, an epsilon schedule
@@ -52,7 +52,7 @@ Measured on the development machine (8 cores, 2 threads per worker):
 
 Both LunarLander configurations reached a final-100 training return of 205–216
 against a solved threshold of 200, so the 1000-episode budget does reach useful
-performance — the convergence question `DESIGN.md` §5.2 raises is answered
+performance: the convergence question `DESIGN.md` §5.2 raises is answered
 affirmatively for the target task, and the convergence gate is reported per run
 regardless.
 
@@ -76,17 +76,17 @@ python experiments/stats.py --per-seed runs/per_seed.csv
 python experiments/report.py --experiments E1 --outdir paper/results
 ```
 
-Everything produced at n=1 is stamped **PIPELINE VALIDATION — NOT A RESULT**.
+Everything produced at n=1 is stamped **PIPELINE VALIDATION: NOT A RESULT**.
 `stats.py` emits no test and no interval below n=3, deliberately: a single seed
 can show that a run *executes*, never that an arm *differs*.
 
 ## 3. The confirmatory runs, when compute is authorised
 
 ```bash
-# Tier 1 — nothing headline may be claimed before this completes
+# Tier 1: nothing headline may be claimed before this completes
 python experiments/sweep.py --tier 1 --jobs 6
 
-# Tier 2 — the mechanism ablations
+# Tier 2: the mechanism ablations
 python experiments/sweep.py --tier 2 --jobs 6
 
 # Then the full pipeline
@@ -105,7 +105,7 @@ touch those seeds.
 
 | ID | Name | Tier | Family | What it is for |
 |---|---|---|---|---|
-| `E0` | smoke | — | — | every code path, at a 12-episode budget |
+| `E0` | smoke | - | - | every code path, at a 12-episode budget |
 | `E1` | core2x2 | 1 | **confirmatory** | the four cells × {CartPole source, LunarLander scratch, transfer}, plus the trunk-only secondary |
 | `E2` | controls | 1 | estimation | untrained-source, untrained at K=0, permuted, spectrum-matched |
 | `E3` | hpsens | 1 | screen | lr × target-update per cell, on `TUNE` |
@@ -120,7 +120,7 @@ touch those seeds.
 | `E13` | plasticity | 3 | estimation | the plasticity-loss rival explanation |
 
 Only `E1` is confirmatory. Everything else is estimation or screening and carries
-**no p-values** — see `ANALYSIS_PLAN.md` §2 for why that is a design decision
+**no p-values**: see `ANALYSIS_PLAN.md` §2 for why that is a design decision
 rather than an omission.
 
 ## 5. How runs are identified, and why it matters
@@ -133,7 +133,7 @@ runs/<condition>/<run_digest12>/s<NN>/
 or the reported measurement**, and nothing else. Two consequences:
 
 * Two experiments requesting an *identical* configuration get the **same run**.
-  That is intentional — E4's freeze level that equals E1's protocol value, E8's
+  That is intentional: E4's freeze level that equals E1's protocol value, E8's
   level-0 scratch arms and E7's scratch arms are the same runs, and training them
   twice would waste compute and produce two independent estimates of one
   quantity. Across the whole catalogue this sharing removes about 29 % of the
@@ -141,8 +141,7 @@ or the reported measurement**, and nothing else. Two consequences:
 * Two *different* configurations can never share a directory. The previous
   scheme named directories `<env>/<arch>-<rule>-<mode>-s<NN>`, which omitted the
   freeze window, the transfer set, the learning rate, the target-update rule, the
-  width, the aggregation, the environment variant and the control condition —
-  so nine conditions drawn from six experiments collapsed onto one path, and a
+  width, the aggregation, the environment variant and the control condition: so nine conditions drawn from six experiments collapsed onto one path, and a
   completed directory was silently *resumed* rather than refused. Five
   experiments would have been fabricated from one experiment's data with every
   check passing.
@@ -166,7 +165,7 @@ stream position. The published checkpoint omitted the optimiser, so a resumed ru
 restarted Adam with zero moments while claiming to be the same run.
 
 So: **re-running the same command after any interruption is always correct.**
-`validate.py::test_resume_equivalence` is what makes that a tested claim.
+`validate.py:test_resume_equivalence` is what makes that a tested claim.
 
 ## 7. Outputs
 

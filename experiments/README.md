@@ -1,4 +1,4 @@
-# `experiments/` — the controlled transfer study
+# `experiments/`: the controlled transfer study
 
 Start here, then read in this order:
 
@@ -41,7 +41,7 @@ rather than unlikely**:
 
 | Path | Role |
 |---|---|
-| `registry.py` | the experiment catalogue — the declarative contract everything reads |
+| `registry.py` | the experiment catalogue: the declarative contract everything reads |
 | `plan.py` | cost and inventory, printed before anything launches |
 | `sweep.py` | the runner: job manifest, atomic per-run claiming, resumable |
 | `aggregate.py` | runs → `per_seed.csv` and `curves.csv` |

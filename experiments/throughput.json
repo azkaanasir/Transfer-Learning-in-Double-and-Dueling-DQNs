@@ -1,0 +1,71 @@
+{
+  "arch_factor": {
+    "dueling": 1.0,
+    "mlp": 0.68
+  },
+  "contention": {
+    "1": 0.75,
+    "2": 0.85,
+    "4": 1.0,
+    "6": 1.2,
+    "8": 1.45
+  },
+  "design_hash": "ec5d386149595cb8944ec92288ec5b6d",
+  "entries": {
+    "CartPole-v1|dueling": {
+      "note": "2 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.02), so the two coefficients are not separately identified: the per-episode overhead is held at its documented value and only the step rate is fitted; startup and the length ramp remain documented, because a finished short run shows neither",
+      "ramp_episodes": 400,
+      "s_per_env_step": 0.004416,
+      "s_per_episode": 0.02,
+      "source": "harvested",
+      "startup_s": 6.0,
+      "steps_end": 150.0,
+      "steps_start": 22.52
+    },
+    "CartPole-v1|mlp": {
+      "note": "2 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.24), so the two coefficients are not separately identified: the per-episode overhead is held at its documented value and only the step rate is fitted; startup and the length ramp remain documented, because a finished short run shows neither",
+      "ramp_episodes": 400,
+      "s_per_env_step": 0.004437,
+      "s_per_episode": 0.02,
+      "source": "harvested",
+      "startup_s": 6.0,
+      "steps_end": 150.0,
+      "steps_start": 22.52
+    },
+    "LunarLander-v3|dueling": {
+      "note": "20 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.06), so the two coefficients are not separately identified: the per-episode overhead is held at its documented value and only the step rate is fitted; startup and the length ramp remain documented, because a finished short run shows neither",
+      "ramp_episodes": 300,
+      "s_per_env_step": 0.011609,
+      "s_per_episode": 0.023,
+      "source": "harvested",
+      "startup_s": 6.0,
+      "steps_end": 560.0,
+      "steps_start": 94.01
+    },
+    "LunarLander-v3|mlp": {
+      "note": "20 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.19), so the two coefficients are not separately identified: the per-episode overhead is held at its documented value and only the step rate is fitted; startup and the length ramp remain documented, because a finished short run shows neither",
+      "ramp_episodes": 300,
+      "s_per_env_step": 0.019114,
+      "s_per_episode": 0.023,
+      "source": "harvested",
+      "startup_s": 6.0,
+      "steps_end": 560.0,
+      "steps_start": 94.01
+    }
+  },
+  "eval_episode_weight": 0.35,
+  "machine": {
+    "cpu_count": 8,
+    "hostname": "PC-Broda",
+    "machine": "AMD64",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 140 Stepping 1, GenuineIntel"
+  },
+  "method": "harvested from runs",
+  "rule_factor": {
+    "double": 1.03,
+    "vanilla": 1.0
+  },
+  "schema": "throughput-v1",
+  "written": "2026-08-25T10:58:17"
+}
