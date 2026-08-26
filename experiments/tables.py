@@ -84,9 +84,15 @@ on its own, because a second implementation of the plan is a second chance to
 diverge from it.
 
 Formatting is deliberately plain: booktabs rules, no siunitx, no S columns, no
-resizebox, no colour. The output compiles in a stock IEEE or LNCS template with
-the booktabs package and nothing else, and non-ASCII is mapped to LaTeX
-commands rather than relying on inputenc.
+resizebox, no colour, and non-ASCII is mapped to LaTeX commands rather than
+relying on inputenc. A table that fits the page is a float and needs the
+booktabs package and nothing else. A table that does not fit is NOT a float,
+because a float cannot break across pages: it is set as a supertabular, which
+can, and which repeats the header on every page and every column it continues
+onto. Such a table names the preamble lines it needs -- usepackage{booktabs}
+and usepackage{supertabular} -- in a comment at the top of its own .tex,
+raises a LaTeX error rather than misbehaving when supertabular is missing, and
+records the requirement in its provenance sidecar.
 
     python experiments/tables.py --per-seed runs/per_seed.csv --outdir paper/tables
     python experiments/tables.py --per-seed runs/per_seed.csv --stats stats.json
@@ -129,6 +135,11 @@ FAMILY_SIZE = statsmod.CONFIRMATORY_FAMILY_SIZE
 CONFIRMATORY_ENDPOINTS = statsmod.CONFIRMATORY_ENDPOINTS
 EQUIVALENCE_MARGIN = statsmod.EQUIVALENCE_MARGIN
 MIN_N_FOR_INFERENCE = statsmod.MIN_N_FOR_INFERENCE
+#: The n the confirmatory bar and the planning MDEs are stated at, imported
+#: rather than typed as 10: `confirmatory_bar` enumerates the attainable exact
+#: p-values at this n, and a literal here would let the note quote a bar for a
+#: sample size the plan no longer pre-registers.
+PLANNED_N = statsmod.PLANNED_N
 VALIDATION_STAMP = statsmod.VALIDATION_STAMP
 CELL_ORDER = statsmod.CELL_ORDER
 MDE_MULTIPLIERS = statsmod.MDE_MULTIPLIERS
@@ -275,6 +286,23 @@ _ENV_ABBREV: dict[str, str] = {
 #    the non-ASCII this study actually emits is mapped to commands, and
 #    anything unmapped is rendered visibly and recorded in the provenance
 #    sidecar rather than replaced quietly.
+#
+#    "Anything unmapped" used to mean "anything NON-ASCII", and that scoping
+#    was the blind spot. `<`, `>` and `|` are ASCII, so they fell through the
+#    `ord(ch) < 128` branch neither escaped nor recorded, and 161 of them
+#    reached the six generated .tex files. Under OT1, which is what a stock
+#    IEEEtran or llncs run uses because neither class loads T1 fontenc, those
+#    three slots hold an inverted exclamation mark, an inverted question mark
+#    and an en rule: "REJECTED 0.599 < 0.6" -- the source-validity verdict
+#    `DESIGN.md` 4.3 requires in the results table -- printed as "REJECTED
+#    0.599 (inverted !) 0.6", every "CP -> LL" in the transfer-lineage column
+#    printed as "CP -(inverted ?) LL", and the sidecar's
+#    `latex_unmapped_characters` recorded none of it. The pass-through is
+#    therefore a positive ALLOW-LIST, measured against a real pdflatex compile
+#    of every printable ASCII character in `article`, `llncs` and
+#    `IEEEtran` rather than assumed, and every character outside it is either
+#    mapped or recorded. Those three are the only printable ASCII characters
+#    that survey found do not reach the page as themselves.
 # ===========================================================================
 
 _BS = chr(92)
@@ -285,6 +313,53 @@ _LATEX_SPECIALS: dict[str, str] = {
     '_': _BS + '_', '{': _BS + '{', '}': _BS + '}',
     '~': _BS + 'textasciitilde{}', '^': _BS + 'textasciicircum{}',
 }
+
+#: The printable ASCII that a stock OT1 setup does NOT set as itself. Each is
+#: given the maths glyph of the same name, which exists in every class without
+#: a package. Kept as its own dict rather than folded into `_LATEX_UNICODE`
+#: because the allow-list below is derived from it: adding a character here
+#: removes it from the allow-list automatically, so a third list cannot go
+#: stale against these two.
+_LATEX_ASCII_MATH: dict[str, str] = {
+    '<': '$<$',
+    '>': '$>$',
+    '|': '$|$',
+}
+
+#: ASCII spellings of operators this study also writes in Unicode, mapped to
+#: the SAME commands as their Unicode twins below, so a reader cannot tell from
+#: the page whether the data carried `->` or U+2192. Matched as whole tokens
+#: before the single characters above, so `<=` never escapes as `$<$=`.
+_LATEX_ASCII_SEQUENCES: dict[str, str] = {
+    '->': '$' + _BS + 'rightarrow$',
+    '<-': '$' + _BS + 'leftarrow$',
+    '<=': '$' + _BS + 'leq$',
+    '>=': '$' + _BS + 'geq$',
+}
+
+#: A long option as it appears in the prose this module prints
+#: (`--allow-audit-failure`, `--source-policy`). LaTeX sets `--` as an en
+#: dash, so a flag typed verbatim reaches the page with one hyphen and cannot
+#: be copied back into a shell; the worst case was the caption naming the
+#: override that produced the table. Set in typewriter with the ligature broken
+#: by an empty group. `---` is not matched, so `NO_P_MARKER` keeps its em rule.
+_CLI_FLAG_RE = re.compile(r'--[A-Za-z][A-Za-z0-9-]*')
+
+#: Characters after which a long identifier may be broken across lines. A
+#: `p{}` column cannot wrap a token that contains no break point, so
+#: `LL[extra_actions=2,pad_mode=noise,pad_obs=4]` would set past the right edge
+#: of its own column however wide that column was made, which is the overflow
+#: this module now refuses. `\allowbreak` offers the break and inserts nothing,
+#: and it is emitted only inside a token (never before a space), so a cell that
+#: fits on one line is unchanged. TeX already breaks after an explicit hyphen,
+#: so `-` is not listed.
+_BREAK_AFTER = frozenset(',=[/;:_')
+
+#: A token no longer than this is never given an internal break point: `n=1`
+#: has nothing to gain from one and the noise would be in every cell of every
+#: table. The threshold is the shortest token that could plausibly need to wrap
+#: inside the narrowest column this module will emit (`MIN_WRAP_CHARS`).
+BREAK_TOKEN_CHARS = 12
 
 #: The non-ASCII that legitimately appears in this study's prose and numbers.
 _LATEX_UNICODE: dict[str, str] = {
@@ -310,29 +385,102 @@ _LATEX_UNICODE: dict[str, str] = {
     ' ': ' ',
 }
 
+#: The printable ASCII that passes through untouched. Derived from the two
+#: dicts above rather than typed out, so a character added to either is removed
+#: from here in the same edit and cannot be both "handled" and "waved through".
+#: Anything outside this set, ASCII or not, is mapped or recorded: that is what
+#: makes the sidecar's `latex_unmapped_characters` a complete record instead of
+#: a record of the non-ASCII only.
+_ASCII_SAFE: frozenset = frozenset(
+    ch for ch in map(chr, range(0x20, 0x7F))
+    if ch not in _LATEX_SPECIALS and ch not in _LATEX_ASCII_MATH)
+
 #: Characters seen but not mapped, accumulated across one invocation so the
 #: provenance sidecar can record them. Populated by `latex_escape`.
 _UNMAPPED: dict[str, int] = {}
+
+#: The tokens `latex_escape` must see whole rather than one character at a
+#: time. A capturing group, so `re.split` hands back the separators at the odd
+#: indices. The CLI-flag branch comes first: `--source-policy` must be a flag,
+#: not a `<-` operator hidden in a hyphen run.
+_TOKEN_RE = re.compile(
+    '(' + _CLI_FLAG_RE.pattern + '|'
+    + '|'.join(re.escape(s) for s in _LATEX_ASCII_SEQUENCES) + ')')
+
+
+def _escape_run(text: str) -> str:
+    """Escape one run of ordinary text, character by character.
+
+    Consumed character by character, so a replacement that itself contains a
+    backslash or a dollar cannot be re-escaped. A break opportunity is offered
+    after a `_BREAK_AFTER` character, but only inside a token long enough to
+    need one, so a long identifier can wrap inside a `p{}` column instead of
+    setting past its right edge while `n=1` is left alone. Nothing is inserted,
+    so a cell that already fits on one line is unchanged.
+    """
+    out: list[str] = []
+    for token in re.split(r'( )', text):
+        breakable = len(token) > BREAK_TOKEN_CHARS
+        last = len(token) - 1
+        for i, ch in enumerate(token):
+            if ch in _LATEX_SPECIALS:
+                out.append(_LATEX_SPECIALS[ch])
+            elif ch in _LATEX_UNICODE:
+                out.append(_LATEX_UNICODE[ch])
+            elif ch in _LATEX_ASCII_MATH:
+                out.append(_LATEX_ASCII_MATH[ch])
+            elif ch in _ASCII_SAFE:
+                out.append(ch)
+            else:
+                _UNMAPPED[ch] = _UNMAPPED.get(ch, 0) + 1
+                out.append(f'[U+{ord(ch):04X}]')
+            if breakable and ch in _BREAK_AFTER and i < last:
+                out.append(_BS + 'allowbreak{}')
+    return ''.join(out)
+
+
+def unbreakable_run(text: Any) -> int:
+    """The longest stretch of `text` that cannot be broken across lines.
+
+    The floor under a wrapped column's width: a `p{}` column narrower than this
+    sets one of its own cells past its right edge whatever the rest of the
+    layout does, and `layout_panels` refuses rather than emitting that. Break
+    points are a space, an explicit hyphen (TeX breaks after one already) and
+    the `_BREAK_AFTER` characters inside a long token, i.e. exactly the places
+    `_escape_run` offers a break.
+    """
+    worst = 0
+    for token in str(text).split():
+        breakable = len(token) > BREAK_TOKEN_CHARS
+        run = 0
+        for ch in token:
+            run += 1
+            if ch == '-' or (breakable and ch in _BREAK_AFTER):
+                worst = max(worst, run)
+                run = 0
+        worst = max(worst, run)
+    return worst
 
 
 def latex_escape(text: Any) -> str:
     """Escape one cell for LaTeX, mapping non-ASCII to commands.
 
-    Consumed character by character, so a replacement that itself contains a
-    backslash or a dollar cannot be re-escaped. Whitespace is collapsed because
-    a newline inside a tabular cell is a compile error, not a layout choice.
+    Whitespace is collapsed because a newline inside a tabular cell is a
+    compile error, not a layout choice. The text is then split on the tokens
+    that must not be escaped one character at a time -- a long option, whose
+    `--` LaTeX would set as an en dash, and the ASCII operators that have
+    commands of their own -- and everything between them goes through
+    `_escape_run`.
     """
+    flat = re.sub(r'\s+', ' ', str(text)).strip()
     out: list[str] = []
-    for ch in re.sub(r'\s+', ' ', str(text)).strip():
-        if ch in _LATEX_SPECIALS:
-            out.append(_LATEX_SPECIALS[ch])
-        elif ch in _LATEX_UNICODE:
-            out.append(_LATEX_UNICODE[ch])
-        elif ord(ch) < 128:
-            out.append(ch)
+    for i, piece in enumerate(_TOKEN_RE.split(flat)):
+        if i % 2 == 0:
+            out.append(_escape_run(piece))
+        elif piece in _LATEX_ASCII_SEQUENCES:
+            out.append(_LATEX_ASCII_SEQUENCES[piece])
         else:
-            _UNMAPPED[ch] = _UNMAPPED.get(ch, 0) + 1
-            out.append(f'[U+{ord(ch):04X}]')
+            out.append(_BS + 'texttt{-{}-' + _escape_run(piece[2:]) + '}')
     return ''.join(out)
 
 
@@ -355,6 +503,10 @@ class Col:
     header: str
     align: str = 'l'          # 'l' | 'r' | 'c' | 'p'
     width: float = 0.0        # fraction of linewidth, only for align='p'
+    #: True for a column that identifies the row rather than reporting a
+    #: number. A key column is repeated in every panel when the table has to be
+    #: split, because a panel of numbers with no row identity is not a table.
+    key_column: bool = False
 
     def latex_spec(self) -> str:
         if self.align == 'p':
@@ -386,52 +538,798 @@ class Table:
 
         Emitted as `table*`, which is legal in a one-column class as well, so
         the same file compiles in IEEE (two-column) and LNCS (one-column).
+
+        A FLOAT property, and only the float rendering reads it. A table too
+        tall for a float is not one, and non-float material has no way to
+        span both columns of a two-column class: it is set in the column,
+        which is why `available_chars` budgets against `body_linewidth_pt`.
         """
         return len(self.cols) >= 7
 
+    @property
+    def key_cols(self) -> tuple[Col, ...]:
+        """The columns that identify a row, for repeating across panels.
 
-def render_latex(t: Table) -> str:
-    """booktabs LaTeX for one table. No siunitx, no resizebox, no colour."""
-    env = 'table*' if t.star else 'table'
-    spec = ''.join(c.latex_spec() for c in t.cols)
-    row_end = ' ' + _BS * 2
-    lines: list[str] = [
-        f'% {t.key}: generated by experiments/tables.py -- do not edit.',
-        '% Needs only the booktabs package; compiles in a stock IEEE or LNCS '
-        'template.',
-        _BS + 'begin{' + env + '}[t]',
-        _BS + 'centering',
-        _BS + 'caption{' + latex_escape(t.caption) + '}',
-        _BS + 'label{' + t.label + '}',
-        _BS + t.fontsize,
-        _BS + 'begin{tabular}{' + spec + '}',
-        _BS + 'toprule',
-        ' & '.join(_BS + 'textbf{' + latex_escape(c.header) + '}'
-                   for c in t.cols) + row_end,
-        _BS + 'midrule',
-    ]
+        Falls back to the first column: a table that declares no key column
+        still has to be splittable, and its leftmost column is the identity by
+        convention everywhere in this file.
+        """
+        declared = tuple(c for c in self.cols if c.key_column)
+        return declared or self.cols[:1]
+
+
+# ===========================================================================
+# 3b. Page fit. A table too wide for the text width does not fail loudly:
+#     LaTeX prints an Overfull \hbox warning, sets the columns past the right
+#     edge, and the paper crops them. Every wide table here did exactly that in
+#     both of the templates `render_latex` names -- 662pt too wide for llncs,
+#     "Float too large for page by 234pt" for IEEEtran -- and the columns that
+#     fell off `main_results` were the last nine, including the source-validity
+#     verdict `DESIGN.md` 4.3 requires in the results table and the convergence
+#     gate 5.2 requires beside P1. A table that silently drops the column
+#     recording whether a source was valid is worse than one that does not fit.
+#
+#     So nothing is dropped. The natural width of every column is measured in
+#     characters, converted to points with per-character widths taken from a
+#     real pdflatex run in each named class, and a table that does not fit is
+#     SPLIT into panels that share one caption and one label: every column
+#     appears in exactly one panel, the key columns repeat in all of them, and
+#     the split is stated in the caption and in the notes so a reader can see
+#     that the last panel is the rest of the table and not a different table. A
+#     column set that cannot be made to fit at all raises `LayoutError` and
+#     nothing is written, because the alternative is the silent crop.
+#
+#     The same defect has a VERTICAL axis, and splitting the columns into
+#     panels made it worse rather than better: four 44-row panels stacked
+#     inside ONE float are roughly 2500pt of material against a 549pt llncs
+#     text height, pdflatex reported "Float too large for page by
+#     2294.84pt", and the compiled page carried panel 1 and nothing else.
+#     The source-validity column was on the floor again, for the same reason
+#     as before, one axis over. A float does not break across pages, so no
+#     caption, no font size and no panel split makes a 44-row table fit in
+#     one; the caption was measured and ruled out directly, deleting all
+#     2808 characters of it left the float 1953.34pt over. The MECHANISM is
+#     the cause, not the content, so the mechanism is what changes here:
+#     `page_breaks_needed` decides, and a table that cannot fit a float is
+#     emitted as `supertabular`, which breaks across pages and columns and
+#     repeats the header on each.
+#
+#     That has a width consequence, which is why it belongs here. A float
+#     can be `table*` and span `\textwidth`; material that breaks cannot be
+#     a float at all, so in a two-column class it is set in the COLUMN, at
+#     `\columnwidth`. The fit is therefore budgeted against the narrowest
+#     line the emitted material can land on in each class -- llncs 347.12pt,
+#     IEEEtran conference 252.00pt, both measured -- and never against
+#     `\textwidth`. Budgeting against 516pt and then setting into a 252pt
+#     column is the same silent crop with a different number on it.
+# ===========================================================================
+
+#: The two templates `render_latex`'s own comment promises compatibility with,
+#: measured rather than assumed: `\the\textwidth`, `\the\columnwidth`,
+#: `\the\textheight` and the width of a fifty-character string at each font
+#: size divided by fifty, read out of a real pdflatex run in each class.
+#:
+#: `textwidth_pt` is what a `table*` float spans (it is legal in a one-column
+#: class, where it is as wide as `table`). `body_linewidth_pt` is what
+#: ordinary body text gets, which is `\columnwidth`: 252.00pt in IEEEtran
+#: conference, because that class is two-column, and the same 347.12pt in
+#: llncs, which is not. THE FIT IS BUDGETED AGAINST `body_linewidth_pt`,
+#: because a table that has to break across pages cannot be a float and is
+#: therefore set in the column rather than across the page. Budgeting against
+#: `textwidth_pt` would put five of main_results' fourteen columns past the
+#: right edge of the IEEE column. llncs remains the binding template on
+#: height and on glyph size; IEEEtran is now the binding one on width. Both
+#: are checked anyway, so neither is an assumption.
+TEMPLATES: dict[str, dict[str, float]] = {
+    'llncs': {
+        'textwidth_pt': 347.12,
+        'body_linewidth_pt': 347.12,
+        'textheight_pt': 549.14,
+        'normalsize_pt_per_char': 5.278,
+        'small_pt_per_char': 4.882,
+        'footnotesize_pt_per_char': 4.882,
+        'scriptsize_pt_per_char': 4.201,
+        'footnotesize_baselineskip_pt': 11.00,
+        'scriptsize_baselineskip_pt': 8.00,
+    },
+    'ieeetran-conference': {
+        'textwidth_pt': 516.00,
+        'body_linewidth_pt': 252.00,
+        'textheight_pt': 672.00,
+        'normalsize_pt_per_char': 5.000,
+        'small_pt_per_char': 4.500,
+        'footnotesize_pt_per_char': 4.000,
+        'scriptsize_pt_per_char': 3.500,
+        'footnotesize_baselineskip_pt': 9.00,
+        'scriptsize_baselineskip_pt': 8.00,
+    },
+}
+
+#: `\tabcolsep` is set explicitly inside every emitted float. The two classes
+#: disagree about it by more than a factor of four (llncs 1.4pt, IEEEtran
+#: 6.0pt), and at fourteen columns that difference alone is 130pt of a 347pt
+#: line: a layout computed against one class overflows the other. Fixing it
+#: makes the width computed here the width both classes will set.
+TABCOLSEP_PT = 2.0
+
+#: Absorbs the difference between a per-character average and the exact glyph
+#: widths of a particular string, plus the two outer rules. Conservative by
+#: intent: an over-estimate splits a table that would just have fitted, an
+#: under-estimate crops a column.
+FIT_MARGIN_PT = 10.0
+
+#: A column no wider than this is set at its natural width and never wrapped.
+#: A wrapped `0.827 +/- 0.390` reads as two numbers, and a wrapped `REJECTED
+#: 0.599 < 0.6` reads as a verdict with the number on the next line.
+NOWRAP_MAX_CHARS = 22
+
+#: The narrowest a wrapped prose column may be squeezed to. Below this a cell
+#: breaks after almost every word and the column is illegible, which is another
+#: way of losing it, so the table is split instead of squeezed further.
+MIN_WRAP_CHARS = 14
+
+#: A header is set in `\textbf`, and bold cmr is about a tenth wider than
+#: roman; a short header is also well above the average per-character width
+#: this model uses, because it holds no spaces and no narrow punctuation. Both
+#: errors land on the same cells: after the split, the only boxes still
+#: protruding from their own column in either class were the headers `n`,
+#: `mean`, `Contrast` and `headroom`, by 0.6 to 5.6pt. The header is therefore
+#: budgeted at this multiple of its character count, plus one character.
+#: Verified by compiling all six generated tables in both classes: with it no
+#: header overfills its column, without it four do.
+HEADER_WIDTH_FACTOR = 1.25
+
+
+#: What each rendering mechanism needs in the preamble. A float needs
+#: booktabs and nothing else, which is the promise this module has always
+#: made. A table too tall for a float needs `supertabular` as well, and a
+#: generated file that quietly needs a package the document does not load
+#: fails somewhere further down and blames the wrong line, so the
+#: requirement is emitted as a comment in the .tex, asserted by the .tex at
+#: compile time, recorded in the provenance sidecar and printed on stdout.
+PREAMBLE_PACKAGES: dict[str, tuple[str, ...]] = {
+    'float': ('booktabs',),
+    'supertabular': ('booktabs', 'supertabular'),
+}
+
+
+class LayoutError(RuntimeError):
+    """A table whose columns cannot be fitted on the page without loss.
+
+    Raised instead of writing a .tex that LaTeX would crop. `main` turns it
+    into a message and a non-zero exit: the whole point of the width model is
+    that an overflow which would drop a column is an explicit failure, not a
+    warning in a log nobody reads.
+    """
+
+
+def _bold(chars: float) -> int:
+    """A bold header's character count, as this width model has to count it."""
+    return int(np.ceil(float(chars) * HEADER_WIDTH_FACTOR)) + 1
+
+
+def column_wraps(t: 'Table', col: 'Col') -> bool:
+    """Whether this column is a wrapping paragraph rather than a fixed cell.
+
+    ONE predicate for a decision two places need, because they must agree.
+    `allocate_chars` uses it to choose which columns absorb the shrink, and
+    `_cell_latex` uses it to decide whether a `\\makebox` is safe.
+
+    They used to disagree, and the disagreement was invisible.
+    `\\makebox[\\linewidth][r]{...}` declares a box of exactly `\\linewidth`
+    and neither clips nor shrinks content wider than that: the surplus
+    overhangs, right-aligned content protruding to the LEFT out of its own
+    column. LaTeX reports no Overfull `\\hbox`, because the BOX is the width
+    it was declared to be. A warning count therefore cannot detect it, and a
+    28-character convergence slope in a 22-character no-wrap budget printed
+    through the gutter and joined the source-validity verdict beside it into
+    one token, in the two-column template only.
+    """
+    return float(col_chars(t, col)) > NOWRAP_MAX_CHARS
+
+
+def col_chars(t: Table, col: Col) -> int:
+    """One column's natural width, in characters: its widest cell or header."""
+    widths = [_bold(len(str(col.header)))]
+    widths.extend(len(str(r.get(col.key, ''))) for r in t.rows)
+    return max(widths)
+
+
+def col_floor_chars(t: Table, col: Col) -> int:
+    """The narrowest that column may be set without cropping one of its cells.
+
+    The longest unbreakable stretch in the column, which is a hard floor: a
+    `p{}` column narrower than its own longest unbreakable token sets that
+    token past its right edge whatever else the layout does.
+    """
+    floors = [_bold(unbreakable_run(col.header))]
+    floors.extend(unbreakable_run(r.get(col.key, '')) for r in t.rows)
+    return max(floors)
+
+
+def _pt_per_char(template: str, fontsize: str) -> float:
+    row = TEMPLATES[template]
+    key = f'{fontsize}_pt_per_char'
+    if key in row:
+        return float(row[key])
+    # An unmeasured size cannot be budgeted for, and guessing is what produced
+    # the overflow. The largest measured width is used instead, so the estimate
+    # errs towards splitting rather than towards cropping.
+    return max(v for k, v in row.items() if k.endswith('_pt_per_char'))
+
+
+def available_chars(template: str, fontsize: str, ncols: int) -> float:
+    """How many characters of content one row of `ncols` columns has room for.
+
+    Against `body_linewidth_pt`, never `textwidth_pt`. A table tall enough to
+    need page breaks cannot be a float, and a non-float is set at
+    `\\columnwidth`: budgeting the IEEE layout against the 516pt a `table*`
+    would have spanned and then setting it into a 252pt column is this
+    model's own defect, one class over.
+    """
+    row = TEMPLATES[template]
+    usable = (float(row['body_linewidth_pt']) - FIT_MARGIN_PT
+              - 2.0 * TABCOLSEP_PT * ncols)
+    return usable / _pt_per_char(template, fontsize)
+
+
+def allocate_chars(t: Table, cols: Sequence[Col]) -> Optional[dict[str, float]]:
+    """Per-column character budgets that fit EVERY named template, or None.
+
+    Columns at or below `NOWRAP_MAX_CHARS` keep their natural width. The wider
+    ones are prose, and they are shrunk by one common factor towards their own
+    floor: the same factor for all of them, so the widest column stays the
+    widest and the table does not reorganise itself between renders. `None`
+    means this column set cannot be fitted, which is the caller's cue to split.
+    """
+    if not cols:
+        return None
+    natural = {c.key: float(col_chars(t, c)) for c in cols}
+    floors = {c.key: float(max(col_floor_chars(t, c), 1)) for c in cols}
+    # Membership by KEY, not by `Col`. `Col` is a frozen dataclass, so `in` on
+    # a list of them compares fields: two columns that happened to agree in
+    # every field would be treated as one, which is the kind of identity bug
+    # this whole file exists to avoid.
+    wrap = {c.key for c in cols if column_wraps(t, c)}
+    for key in wrap:
+        floors[key] = max(floors[key], float(MIN_WRAP_CHARS))
+    fixed_sum = sum(v for k, v in natural.items() if k not in wrap)
+    floor_sum = sum(floors[k] for k in wrap)
+    slack = sum(natural[k] - floors[k] for k in wrap)
+    factor = 1.0
+    for template in TEMPLATES:
+        room = available_chars(template, t.fontsize, len(cols))
+        if fixed_sum + floor_sum > room:
+            return None                      # not fittable at any shrink
+        if slack > 0.0:
+            factor = min(factor, (room - fixed_sum - floor_sum) / slack)
+    factor = max(0.0, min(1.0, factor))
+    return {k: (v if k not in wrap
+                else floors[k] + factor * (v - floors[k]))
+            for k, v in natural.items()}
+
+
+def layout_panels(t: Table) -> list[tuple[Col, ...]]:
+    """The table's columns grouped into panels that each fit the page.
+
+    Greedy left to right, with the key columns repeated at the front of every
+    panel. Every non-key column lands in exactly one panel, so the panels
+    reconstruct the table; `assert_no_column_lost` checks that rather than
+    trusting it.
+    """
+    keys = t.key_cols
+    key_set = {c.key for c in keys}
+    rest = [c for c in t.cols if c.key not in key_set]
+    if not rest:
+        if allocate_chars(t, keys) is None:
+            raise LayoutError(
+                f'{t.key}: the key column(s) '
+                f'{", ".join(c.key for c in keys)} do not fit the text width '
+                f'of every target template on their own, so there is no '
+                f'layout that keeps them. Shorten the column or lower the '
+                f'font size; do not let LaTeX crop it.')
+        return [keys]
+    panels: list[tuple[Col, ...]] = []
+    current: list[Col] = []
+    for col in rest:
+        if allocate_chars(t, tuple(keys) + tuple(current + [col])) is not None:
+            current.append(col)
+            continue
+        if not current:
+            raise LayoutError(
+                f'{t.key}: column {col.key!r} ({col_chars(t, col)} chars '
+                f'natural, {col_floor_chars(t, col)} unbreakable) does not fit '
+                f'beside the key column(s) '
+                f'{", ".join(c.key for c in keys)} in any target template at '
+                f'{t.fontsize}. Nothing is written rather than a table LaTeX '
+                f'would crop this column out of.')
+        panels.append(tuple(keys) + tuple(current))
+        current = [col]
+    if current:
+        panels.append(tuple(keys) + tuple(current))
+    return panels
+
+
+def assert_no_column_lost(t: Table, panels: Sequence[Sequence[Col]]) -> None:
+    """Every column of the table is in a panel, and no panel is empty.
+
+    The guard the previous layout had no equivalent of. An overflow that would
+    drop a column is now a raise: `main` reports it and exits non-zero, so a
+    silently truncated results table cannot be produced at all.
+    """
+    placed = [c.key for panel in panels for c in panel]
+    missing = [c.key for c in t.cols if c.key not in set(placed)]
+    if missing:
+        raise LayoutError(
+            f'{t.key}: the layout would drop column(s) {", ".join(missing)}. '
+            f'A table that loses a column silently is the defect this check '
+            f'exists to make impossible.')
+    keys = {c.key for c in t.key_cols}
+    for panel in panels:
+        if not [c for c in panel if c.key not in keys]:
+            raise LayoutError(
+                f'{t.key}: a panel would carry the key column(s) and nothing '
+                f'else, so the split does not converge.')
+
+
+def _baselineskip_pt(template: str, fontsize: str) -> float:
+    row = TEMPLATES[template]
+    key = f'{fontsize}_baselineskip_pt'
+    if key in row:
+        return float(row[key])
+    return max(v for k, v in row.items() if k.endswith('_baselineskip_pt'))
+
+
+def height_parts(t: Table, panels: Sequence[Sequence[Col]],
+                 template: str) -> dict[str, float]:
+    """How tall this table's material is in one template, piece by piece.
+
+    Estimated rather than measured, and USED rather than announced: it is
+    what `mechanism` decides on, because that is the decision the number is
+    actually evidence about.
+
+    In pieces because one total cannot tell an operator which of two
+    situations they are in, and the note that used to be printed under these
+    tables got exactly that wrong. It said the cause of the overflow was the
+    length of the generated caption and that the remedy was a placement
+    decision for the operator. Both halves were false on the table it was
+    printed under, and a compile settles it: replacing the whole
+    `\\caption{...}` argument of main_results with `\\caption{Short.}`,
+    which deleted 2808 characters, still left the float 1953.34pt too tall,
+    because the rows alone are several times the page. On another table the
+    caption really is most of the height. `rows_and_rules_pt`, `caption_pt`
+    and `notes_pt` are what let the note say which of those is the case
+    instead of assuming one of them.
+    """
+    chars_per_line = available_chars(template, t.fontsize, 1)
+    body = _baselineskip_pt(template, t.fontsize)
+    small = _baselineskip_pt(template, 'scriptsize')
+    tabular = 0.0
+    for panel in panels:
+        budget = allocate_chars(t, panel) or {}
+        tabular += 2.0 * body                     # header plus the two rules
+        for row in t.rows:
+            lines = 1
+            for col in panel:
+                width = max(budget.get(col.key, 1.0), 1.0)
+                lines = max(lines, int(np.ceil(
+                    len(str(row.get(col.key, ''))) / width)))
+            tabular += lines * body
+        tabular += 3.0 * body                     # rules, panel label, gap
+    caption = float(np.ceil(
+        len(t.caption) / max(chars_per_line, 1.0))) * body
+    notes = 0.0
+    for note in t.notes:
+        notes += float(np.ceil(len(note) / max(chars_per_line, 1.0))) * small
+    return {'tabular_pt': float(tabular), 'caption_pt': float(caption),
+            'notes_pt': float(notes),
+            'total_pt': float(tabular + caption + notes)}
+
+
+def height_report(t: Table, panels: Sequence[Sequence[Col]]) -> dict:
+    """The height estimate against every template's `\\textheight`."""
+    out: dict[str, Any] = {'fits_every_template': True, 'per_template': {}}
+    for template, row in TEMPLATES.items():
+        parts = height_parts(t, panels, template)
+        need = parts['total_pt']
+        have = float(row['textheight_pt'])
+        out['per_template'][template] = {
+            'estimated_float_height_pt': round(need, 1),
+            'rows_and_rules_pt': round(parts['tabular_pt'], 1),
+            'caption_pt': round(parts['caption_pt'], 1),
+            'notes_pt': round(parts['notes_pt'], 1),
+            'textheight_pt': have,
+            'over_by_pt': round(max(0.0, need - have), 1),
+            'rows_alone_exceed_textheight': bool(
+                parts['tabular_pt'] > have),
+            'fits': bool(need <= have)}
+        out['fits_every_template'] &= bool(need <= have)
+    return out
+
+
+def page_breaks_needed(t: Table, panels: Sequence[Sequence[Col]]) -> bool:
+    """True when this table cannot be set inside a float without being cropped.
+
+    A float is one unbreakable box, so for a float "does not fit" and "is
+    cropped" are the same sentence: LaTeX puts an oversized float on a float
+    page and sets whatever is past the bottom margin off the page. The whole
+    box has to fit, which is header, rules, every row of every panel, the
+    caption, and the notes when they are inside it.
+    """
+    return not height_report(t, panels)['fits_every_template']
+
+
+def mechanism(t: Table, panels: Sequence[Sequence[Col]]) -> str:
+    """`float` or `supertabular`: how this table is going to be set.
+
+    One decision, taken from the height model and never by hand, so the .tex,
+    the notes, the provenance sidecar and the console line cannot disagree
+    about what was emitted.
+    """
+    return 'supertabular' if page_breaks_needed(t, panels) else 'float'
+
+
+def pagebreak_note(t: Table, panels: Sequence[Sequence[Col]]) -> str:
+    """Why this table is not a float, in the numbers that decided it.
+
+    Replaces a note that named a cause the compiler disproves and a remedy
+    that cannot work. The cause is arithmetic on the row count; the remedy is
+    the one already applied in the file the reader is holding, which is why
+    there is nothing here for anybody to act on.
+    """
+    rep = height_report(t, panels)
+    name, worst = max(rep['per_template'].items(),
+                      key=lambda kv: kv[1]['estimated_float_height_pt'])
+    if worst['rows_alone_exceed_textheight']:
+        because = (f'The rows and rules alone are '
+                   f'{worst["rows_and_rules_pt"]:.0f}pt of that, already '
+                   f'over the {worst["textheight_pt"]:.0f}pt text height, '
+                   f'so NO caption length and no note length changes the '
+                   f'outcome: deleting every word of both still leaves the '
+                   f'table taller than the page. ')
+    else:
+        because = (f'The rows and rules are '
+                   f'{worst["rows_and_rules_pt"]:.0f}pt of that and the '
+                   f'generated caption and notes are '
+                   f'{worst["caption_pt"] + worst["notes_pt"]:.0f}pt. They '
+                   f'are not decoration and are not trimmed to make a float '
+                   f'fit: they carry the endpoint definitions, the seed '
+                   f'count, the audit state and the provenance hashes that '
+                   f'are what make the numbers beside them checkable. ')
+    rows = f'{len(t.rows)} row' + ('' if len(t.rows) == 1 else 's')
+    return (f'PAGE BREAKS: this table is {rows} in '
+            f'{len(panels)} panel(s), about '
+            f'{worst["estimated_float_height_pt"]:.0f}pt of material in '
+            f'{name}, against that template\'s {worst["textheight_pt"]:.0f}pt '
+            f'text height. ' + because
+            + 'A LaTeX float cannot break across pages, so material this '
+              'tall inside one is set on a float page and everything past '
+              'the bottom margin is CROPPED, which is how every panel after '
+              'the first used to vanish. So this table is NOT a float. It '
+              'is set as a supertabular, which breaks at the page or column '
+              'boundary and repeats the column headers on the other side, '
+              'and the caption and these notes are ordinary text that '
+              'breaks with it. Every row and every column reaches a page; '
+              'nothing is cropped and nothing is deferred. It needs '
+            + ' and '.join('\\usepackage{' + p + '}'
+                           for p in PREAMBLE_PACKAGES['supertabular'])
+            + ' in the preamble, and says so at the top of its own .tex.')
+
+
+def panel_note(t: Table, panels: Sequence[Sequence[Col]]) -> str:
+    """What the split did, for the notes of both renderings.
+
+    Printed in the markdown mirror as well, where there is no split, so the two
+    are reconcilable: a reader of the .md can see which columns the .tex put on
+    which panel and that the set is the same.
+    """
+    keys = ', '.join(c.header for c in t.key_cols)
+    parts = []
+    for i, panel in enumerate(panels, start=1):
+        own = [c.header for c in panel if c not in t.key_cols]
+        parts.append(f'panel {i}: ' + ', '.join(own))
+    widths = ', '.join(f'{k} {v["body_linewidth_pt"]:.0f}pt'
+                       for k, v in TEMPLATES.items())
+    return (f'LAYOUT: this table is {len(t.cols)} columns wide and does not '
+            f'fit the line width of the target templates ({widths}), so the '
+            f'LaTeX rendering SPLITS it into {len(panels)} panels, set one '
+            f'after another under one caption and one label, repeating the '
+            f'key column(s) ({keys}) in each. No column is omitted and no '
+            f'font is scaled: ' + '; '.join(parts) + '. The markdown mirror '
+            f'carries all {len(t.cols)} columns in one table, so the two can '
+            f'be checked against each other.')
+
+
+def layout_notes(t: Table, panels: Sequence[Sequence[Col]]) -> tuple[str, ...]:
+    """The notes the layout itself earns, in front of the table's own.
+
+    Emitted into BOTH renderings. The markdown mirror has no page width and no
+    page height, so it carries every column in one table: printing the same two
+    sentences there is what lets a reader hold the .md and the .tex side by side
+    and see that the panel split moved nothing and dropped nothing.
+    """
+    out: list[str] = []
+    if len(panels) > 1:
+        out.append(panel_note(t, panels))
+    if page_breaks_needed(t, panels):
+        out.append(pagebreak_note(t, panels))
+    return tuple(out)
+
+
+def _panel_spec(t: Table, panel: Sequence[Col]) -> str:
+    """The `p{}` column specification for one panel, as linewidth fractions.
+
+    A fraction per column, of the character budget that already fits the
+    narrowest line of every named template, scaled so the fractions leave room
+    for `\\tabcolsep` as well. The tabular is then bounded by `\\linewidth` by
+    construction and not only by the character estimate.
+    """
+    budget = allocate_chars(t, panel)
+    if budget is None:                        # unreachable: layout_panels
+        raise LayoutError(f'{t.key}: a panel does not fit after the split '
+                          f'converged, which is a bug in layout_panels, not a '
+                          f'data problem.')
+    total = sum(budget.values())
+    gap = 2.0 * TABCOLSEP_PT * len(panel)
+    room = 1.0 - (gap + FIT_MARGIN_PT) / min(
+        float(v['body_linewidth_pt']) for v in TEMPLATES.values())
+    fracs = {k: room * v / total for k, v in budget.items()}
+    return ''.join('p{%.4f%slinewidth}' % (fracs[c.key], _BS) for c in panel)
+
+
+def _header_row(panel: Sequence[Col]) -> str:
+    """The bold header row of one panel, terminated."""
+    return (' & '.join(_BS + 'textbf{' + latex_escape(c.header) + '}'
+                       for c in panel) + ' ' + _BS * 2)
+
+
+def _body_rows(t: Table, panel: Sequence[Col]) -> list[str]:
+    """Every data row of one panel, with the grouping rules in place."""
+    out: list[str] = []
     for i, row in enumerate(t.rows):
         if i and i in t.rules_before:
-            lines.append(_BS + 'midrule')
-        lines.append(' & '.join(latex_escape(row.get(c.key, ''))
-                                for c in t.cols) + row_end)
-    lines.append(_BS + 'bottomrule')
-    lines.append(_BS + 'end{tabular}')
-    if t.notes:
+            out.append(_BS + 'midrule')
+        out.append(' & '.join(
+            _cell_latex(c, row.get(c.key, ''), column_wraps(t, c))
+            for c in panel) + ' ' + _BS * 2)
+    return out
+
+
+def _panel_caption(t: Table, panels: Sequence[Sequence[Col]]) -> str:
+    """The caption, with the sentence a split earns appended to it."""
+    if len(panels) < 2:
+        return t.caption
+    return (t.caption + f' Set as {len(panels)} panels under one caption and '
+                        f'one label because the table is wider than the line; '
+                        f'no column is omitted, and the key column(s) repeat '
+                        f'in each panel.')
+
+
+def _preamble_comment(mech: str) -> str:
+    """The preamble this .tex needs, as a comment inside the .tex itself."""
+    # Named packages only. Spelling out what is NOT used would put the
+    # words this module's own self-test greps the output for into the
+    # output, and a check that its own comment defeats is not a check.
+    return ('% Preamble, and nothing beyond it: '
+            + ' '.join(_BS + 'usepackage{' + p + '}'
+                       for p in PREAMBLE_PACKAGES[mech]) + '.')
+
+
+def _width_comment(t: Table, panels: Sequence[Sequence[Col]]) -> str:
+    """Which line widths the layout was computed against, in the .tex."""
+    return (f'% layout: {len(t.cols)} columns in {len(panels)} panel(s), '
+            f'widths computed against '
+            + ', '.join(f'{k} {v["body_linewidth_pt"]:.2f}pt'
+                        for k, v in TEMPLATES.items()) + '.')
+
+
+def render_latex(t: Table) -> str:
+    """booktabs LaTeX for one table. No siunitx, no resizebox, no colour.
+
+    Every column is set as a `p{}` column of a computed fraction of
+    `\\linewidth`, and the fractions of one panel sum to less than one, so the
+    tabular cannot be wider than the line whatever class it lands in. Numeric
+    columns keep their right alignment inside that fixed width with a kernel
+    `\\makebox`, which needs no package and cannot widen the column. It is
+    applied only where `column_wraps` is false: the box cannot widen a column,
+    but content wider than the box overhangs it silently, so the makebox is
+    safe only where the content is known to fit.
+
+    TWO MECHANISMS, chosen by `page_breaks_needed`. A table that fits a float
+    is a float, which is the form an editor and a reader expect and the only
+    one that needs booktabs alone. A table that does not fit is not a float,
+    because a float is one unbreakable box and an oversized one is cropped:
+    it is set as a `supertabular` in the running text, which breaks at the page
+    or column boundary and repeats the header on the other side. The second
+    form is the only reason the source-validity column of a 44-row results
+    table reaches a page at all.
+    """
+    panels = layout_panels(t)
+    assert_no_column_lost(t, panels)
+    if mechanism(t, panels) == 'supertabular':
+        return _render_supertabular(t, panels)
+    return _render_float(t, panels)
+
+
+def _render_float(t: Table, panels: Sequence[Sequence[Col]]) -> str:
+    """The conventional rendering, for a table that fits inside one float."""
+    env = 'table*' if t.star else 'table'
+    row_end = ' ' + _BS * 2
+    notes = layout_notes(t, panels) + tuple(t.notes)
+    lines: list[str] = [
+        f'% {t.key}: generated by experiments/tables.py -- do not edit.',
+        '% Mechanism: float. It fits the text height of every target '
+        'template, so it is one.',
+        _preamble_comment('float'),
+        _width_comment(t, panels),
+        _BS + 'begin{' + env + '}[t]',
+        _BS + 'centering',
+        _BS + 'caption{' + latex_escape(_panel_caption(t, panels)) + '}',
+        _BS + 'label{' + t.label + '}',
+        _BS + t.fontsize,
+        _BS + 'setlength{' + _BS + 'tabcolsep}{%gpt}' % TABCOLSEP_PT,
+    ]
+    for p, panel in enumerate(panels):
+        lines.append(f'% panel {p + 1} of {len(panels)}')
+        if len(panels) > 1:
+            if p:
+                lines.append(_BS + 'par' + _BS + 'vspace{5pt}')
+            lines.append(_BS + 'par' + _BS + 'textit{Panel ' + str(p + 1)
+                         + ' of ' + str(len(panels)) + ', keyed by '
+                         + latex_escape(', '.join(c.header
+                                                  for c in t.key_cols))
+                         + '.}' + _BS + 'par' + _BS + 'vspace{2pt}')
+        lines.append(_BS + 'begin{tabular}{' + _panel_spec(t, panel) + '}')
+        lines.append(_BS + 'toprule')
+        lines.append(_header_row(panel))
+        lines.append(_BS + 'midrule')
+        lines.extend(_body_rows(t, panel))
+        lines.append(_BS + 'bottomrule')
+        lines.append(_BS + 'end{tabular}')
+    # The float fits by construction on this branch, so the notes go where
+    # notes conventionally go, which is inside it with the table they annotate.
+    if notes:
         lines.append(_BS + 'vspace{2pt}')
         lines.append(_BS + 'begin{minipage}{' + _BS + 'linewidth}')
         lines.append(_BS + 'raggedright' + _BS + 'scriptsize')
-        for j, note in enumerate(t.notes):
-            tail = '' if j == len(t.notes) - 1 else row_end
+        for j, note in enumerate(notes):
+            tail = '' if j == len(notes) - 1 else row_end
             lines.append(latex_escape(note) + tail)
         lines.append(_BS + 'end{minipage}')
     lines.append(_BS + 'end{' + env + '}')
     return '\n'.join(lines) + '\n'
 
 
+def _render_supertabular(t: Table, panels: Sequence[Sequence[Col]]) -> str:
+    """The breaking rendering, for a table too tall for any float.
+
+    Not a float, deliberately. `supertabular` rather than `longtable` because
+    ONE FILE has to compile in both target classes and longtable refuses in a
+    two-column one: under `\\documentclass[conference]{IEEEtran}` it stops with
+    "Package longtable Error: longtable not in 1-column mode", which is a
+    compile failure, not a layout compromise. `supertabular` builds each page's
+    worth as an ordinary tabular and breaks between them, so it works in one
+    column and in two, and it was compiled in both before this was written.
+
+    Each panel is its own breaking table. The caption and the label are carried
+    once, by the first, through `\\topcaption`, so the whole thing stays one
+    numbered table that `\\ref` resolves; the later panels name it and say
+    which panel they are. `\\tablehead` repeats the column headers on every
+    continuation, and `\\tabletail` says on the page it is leaving that there
+    is more, so a reader never meets a headerless block of numbers.
+    """
+    row_end = ' ' + _BS * 2
+    notes = layout_notes(t, panels) + tuple(t.notes)
+    rep = height_report(t, panels)
+    name, worst = max(rep['per_template'].items(),
+                      key=lambda kv: kv[1]['estimated_float_height_pt'])
+    keys = latex_escape(', '.join(c.header for c in t.key_cols))
+    lines: list[str] = [
+        f'% {t.key}: generated by experiments/tables.py -- do not edit.',
+        f'% Mechanism: supertabular. This is NOT a float, on purpose. '
+        f'{len(t.rows)} rows in',
+        f'% {len(panels)} panel(s) is about '
+        f'{worst["estimated_float_height_pt"]:.0f}pt of material in {name}, '
+        f'against a {worst["textheight_pt"]:.0f}pt text',
+        '% height. A float does not break across pages, so a float this tall '
+        'is set on a',
+        '% float page and every row past the bottom margin is cropped. '
+        'supertabular breaks',
+        '% across pages and columns and repeats the header on each, so every '
+        'row is set.',
+        _preamble_comment('supertabular'),
+        _width_comment(t, panels),
+        # A generated file that needs a package the document does not load
+        # would fail somewhere further down and blame the wrong line. It says
+        # so itself instead, at the point of use, by name.
+        _BS + 'makeatletter',
+        _BS + '@ifundefined{supertabular}{' + _BS + '@latex@error{tables.py: '
+        + t.key + ' needs ' + _BS + 'string' + _BS
+        + 'usepackage{supertabular} in the preamble}{This table is taller '
+        + 'than the page. A float cannot break, so it is set as a '
+        + 'supertabular.}}{}',
+        _BS + 'makeatother',
+        _BS + 'begingroup',
+        _BS + 'setlength{' + _BS + 'tabcolsep}{%gpt}' % TABCOLSEP_PT,
+        _BS + t.fontsize,
+        # The label lives inside the caption argument because \topcaption is
+        # typeset when the supertabular starts, not where it is written: a
+        # \label after it would be attached to the previous table's number.
+        _BS + 'topcaption{' + latex_escape(_panel_caption(t, panels))
+        + _BS + 'label{' + t.label + '}}',
+    ]
+    for p, panel in enumerate(panels):
+        head = _BS + 'toprule ' + _header_row(panel) + ' ' + _BS + 'midrule'
+        which = (f', panel {p + 1} of {len(panels)}' if len(panels) > 1 else '')
+        lines.append(f'% panel {p + 1} of {len(panels)}')
+        if p:
+            lines.append(_BS + 'par' + _BS + 'vspace{6pt}' + _BS + 'noindent'
+                         + _BS + 'textit{Panel ' + str(p + 1) + ' of '
+                         + str(len(panels)) + ' of Table~' + _BS + 'ref{'
+                         + t.label + '}, keyed by ' + keys + '.}' + _BS + 'par'
+                         + _BS + 'vspace{2pt}')
+        lines.append(_BS + 'tablefirsthead{' + head + '}')
+        lines.append(_BS + 'tablehead{' + head + '}')
+        lines.append(_BS + 'tabletail{' + _BS + 'midrule ' + _BS
+                     + 'multicolumn{' + str(len(panel)) + '}{r@{}}{' + _BS
+                     + 'textit{(Table~' + _BS + 'ref{' + t.label + '}' + which
+                     + ', continued)}}' + row_end + '}')
+        lines.append(_BS + 'tablelasttail{' + _BS + 'bottomrule}')
+        lines.append(_BS + 'begin{supertabular}{' + _panel_spec(t, panel) + '}')
+        lines.extend(_body_rows(t, panel))
+        lines.append(_BS + 'end{supertabular}')
+    lines.append(_BS + 'endgroup')
+    if notes:
+        lines.append('')
+        lines.append('% Nothing above is a float, so the notes are ordinary '
+                     'paragraph text that')
+        lines.append('% breaks across pages with the table rather than being '
+                     'cropped with it.')
+        # `\raggedright` so a long hash or path in a note cannot produce an
+        # overfull line: justified `\scriptsize` text with an unbreakable token
+        # in it is exactly the box LaTeX cannot set.
+        lines.append(_BS + 'begingroup' + _BS + 'scriptsize' + _BS
+                     + 'raggedright' + _BS + 'setlength{' + _BS
+                     + 'parskip}{2pt}')
+        lines.append(_BS + 'noindent' + _BS + 'textbf{Notes for Table~'
+                     + _BS + 'ref{' + t.label + '}.}' + _BS + 'par')
+        for note in notes:
+            lines.append(_BS + 'noindent ' + latex_escape(note) + _BS + 'par')
+        lines.append(_BS + 'endgroup')
+    return '\n'.join(lines) + '\n'
+
+
+def _cell_latex(col: Col, value: Any, wrapping: bool) -> str:
+    """One cell, escaped, and right-aligned inside its fixed width if numeric.
+
+    `\\makebox[\\linewidth][r]` inside a `p{}` column right-aligns without the
+    `array` package, which the module docstring promises not to need. It is
+    safe ONLY on a column narrow enough never to wrap, and `wrapping` now
+    carries that answer from `column_wraps` instead of the docstring merely
+    asserting it. A wrapping column keeps its content as an ordinary
+    paragraph, which is what a `p{}` column sets by default and which breaks
+    at the column edge instead of overhanging it.
+    """
+    text = latex_escape(value)
+    if (not wrapping and col.align in ('r', 'c')
+            and _BS + 'allowbreak' not in text):
+        where = 'r' if col.align == 'r' else 'c'
+        return (_BS + 'makebox[' + _BS + 'linewidth][' + where + ']{'
+                + text + '}')
+    return text
+
+
 def render_markdown(t: Table) -> str:
-    """The mirror: same rows, same caption, no LaTeX toolchain required."""
+    """The mirror: same rows, same caption, no LaTeX toolchain required.
+
+    Deliberately NOT split: a pipe table has no page width to overflow, so the
+    mirror carries every column in one table and states the LaTeX panel split
+    in its notes. That is what makes the two checkable against each other.
+    """
     align = {'l': ':---', 'r': '---:', 'c': ':---:', 'p': ':---'}
+    panels = layout_panels(t)
+    assert_no_column_lost(t, panels)
+    notes = layout_notes(t, panels) + tuple(t.notes)
     lines: list[str] = [
         f'# {t.title}',
         '',
@@ -447,9 +1345,9 @@ def render_markdown(t: Table) -> str:
             lines.append('| ' + ' | '.join([''] * len(t.cols)) + ' |')
         lines.append('| ' + ' | '.join(markdown_escape(row.get(c.key, ''))
                                        for c in t.cols) + ' |')
-    if t.notes:
+    if notes:
         lines += ['', '**Notes.**', '']
-        lines += [f'- {n}' for n in t.notes]
+        lines += [f'- {n}' for n in notes]
     return '\n'.join(lines) + '\n'
 
 
@@ -479,17 +1377,33 @@ def fint(v: Any, missing: str = NOT_RECORDED) -> str:
     return f'{int(round(float(v))):d}'
 
 
-def fmt_mean_sd(values: Sequence[float], nd: int = 3) -> str:
+def fmt_mean_sd(values: Sequence[float], nd: int = 3,
+                n_units: Optional[int] = None) -> str:
     """mean +/- SD over the runs of one arm.
 
     No SD is printed at n=1: one observation has no dispersion, and printing
     0.000 there would invent a precision claim the data cannot support.
+
+    `n_units` is the number of INDEPENDENT units behind those values, which for
+    every table here is the arm's distinct seed count. It is not the same as
+    `len(values)`, and the difference is the whole reason for the argument: two
+    runs of one arm at one seed are two configurations, so their spread is a
+    within-configuration spread and not the across-seed spread the notes define
+    this column as. Passing the row count instead printed "0.880 +/- 0.415" in
+    a column headed "mean +/- SD across the seeds of that arm" on a row whose
+    own n column read 1, which is the n=1 rule broken by the same argument it
+    was written to refuse. Where the units are too few, the mean is printed and
+    the absence of a dispersion estimate is stated in place of the SD.
     """
     v = np.asarray([x for x in values if _isnum(x)], dtype=float)
     if v.size == 0:
         return NOT_RECORDED
+    units = v.size if n_units is None else int(n_units)
     if v.size == 1:
         return f'{v[0]:.{nd}f}'
+    if units < 2:
+        return (f'{v.mean():.{nd}f} (mean over {v.size} runs at {units} '
+                f'seed(s); NO across-seed SD exists)')
     return f'{v.mean():.{nd}f} ± {v.std(ddof=1):.{nd}f}'
 
 
@@ -535,6 +1449,42 @@ def verdict_word(lo: Any, hi: Any) -> str:
     if float(hi) < 0:
         return 'excludes 0 (negative)'
     return 'not distinguishable'
+
+
+def verdict_vs(lo: Any, hi: Any, null: float, quantity: str,
+               n: Any = None) -> str:
+    """The same verdict against a null other than zero, refusing to affirm one.
+
+    Two rows of the inferential table compare an interval against a value that
+    is not 0: RQ1's Brunner-Munzel `theta` against 0.5 and the dispersion
+    row's SD ratio against 1. Both were written as inline two-branch
+    expressions with no missing-interval case, so an ABSENT interval fell into
+    the else branch and printed "covers 0.5: not distinguishable" -- a null
+    result -- on ten rows of the live tree where no interval had been emitted
+    at all. One of them was the dueling-vanilla dispersion row at n=0, whose
+    arm has no runs in the analysis set because the `DESIGN.md` 4.3 source gate
+    removed them: an analysis-set EXCLUSION laundered into a statistical null,
+    which is the first fallacy `DESIGN.md` 9 lists. `verdict_word` had the
+    missing-interval branch all along and these two callers bypassed it, so the
+    branch lives here instead of in the caller.
+
+    `n` is used only to tell an exclusion from a small sample: at n=0 there is
+    nothing to estimate and saying so is the whole content of the row.
+    """
+    if _isnum(n) and int(n) == 0:
+        return ('NO ESTIMATE: this arm has no runs in the analysis set, so '
+                'nothing was computed. That is an analysis-set exclusion, not '
+                'a null result, and it may not be read as one (DESIGN.md 9)')
+    if not (_isnum(lo) and _isnum(hi)):
+        floor = (f'; n={int(n)} < {MIN_N_FOR_INFERENCE}'
+                 if _isnum(n) and int(n) < MIN_N_FOR_INFERENCE else '')
+        return (f'NO INTERVAL WAS EMITTED for {quantity}{floor}, so there is '
+                f'no verdict here. An absent interval is not a null result '
+                f'(DESIGN.md 9)')
+    lo_f, hi_f = float(lo), float(hi)
+    if lo_f > null or hi_f < null:
+        return f'{quantity} excludes {null:g}'
+    return f'covers {null:g}: not distinguishable'
 
 
 def exclusion_bound_text(lo: Any, nd: int = 3) -> str:
@@ -1005,8 +1955,10 @@ def fmt_metric(g: pd.DataFrame, col: str, nd: int = 3) -> str:
     vals = vals[np.isfinite(vals)]
     if not len(vals):
         return NOT_RECORDED
-    text = fmt_mean_sd(vals, nd=nd)
     seeds = int(finite['seed'].nunique())
+    # The SD is scaled by the SEED count, not the row count. `fmt_mean_sd`
+    # refuses a dispersion estimate at one unit, and the unit here is a seed.
+    text = fmt_mean_sd(vals, nd=nd, n_units=seeds)
     total = n_seeds(g)
     tags: list[str] = []
     if seeds < total:
@@ -1093,6 +2045,34 @@ def arms_with_moved_invariants(df: pd.DataFrame) -> list[str]:
     return out
 
 
+def rejected_source_text(score: Any, gate: float = None) -> str:
+    """The whole "REJECTED x < gate" clause, printed so it cannot contradict.
+
+    `exclusion_bound_text` documents the discipline this applies: the sentence
+    and the number beside it must not disagree, so the branch is taken on the
+    value AS PRINTED. At three decimals a source scoring 0.5996 printed
+    "REJECTED 0.600 < 0.6", which as printed says 0.600 is less than 0.6 and is
+    also indistinguishable from the "valid 0.600" of an accepted source. This
+    is not hypothetical: the gate is 0.600 and P0's own source scores 0.599201,
+    0.0008 below it, so any tree landing in the top 0.0005 of the rejection
+    region printed the contradiction. Precision is increased until the printed
+    number really is below the printed gate; a score that is not below the gate
+    at any precision is a contradiction in the INPUT and is labelled as one
+    rather than smoothed over.
+    """
+    gate = float(SOURCE_VALIDITY_GATE if gate is None else gate)
+    if not _isnum(score):
+        return f'REJECTED, source score {NOT_RECORDED}, gate {gate}'
+    value = float(score)
+    for nd in (3, 4, 5, 6, 8):
+        text = f'{value:.{nd}f}'
+        if float(text) < gate:
+            return f'REJECTED {text} < {gate}'
+    return (f'REJECTED, but the recorded score {value:.8f} is NOT below the '
+            f'{gate} gate: source_valid and source_final_score disagree in '
+            f'the input')
+
+
 def source_state(g: pd.DataFrame) -> dict[str, Any]:
     """One arm's source-validity verdict, as `DESIGN.md` 4.3 requires it shown.
 
@@ -1126,7 +2106,7 @@ def source_state(g: pd.DataFrame) -> dict[str, Any]:
     mean = float(scores.mean()) if len(scores) else None
     score_text = fnum(mean, 3, missing=NOT_RECORDED)
     if n_bad and not n_ok:
-        out['text'] = f'REJECTED {score_text} < {SOURCE_VALIDITY_GATE}'
+        out['text'] = rejected_source_text(mean)
     elif n_bad:
         out['text'] = (f'{n_ok} valid, {n_bad} REJECTED; '
                        f'mean {score_text}')
@@ -1226,7 +2206,7 @@ def table_main_results(df: pd.DataFrame, ctx: Context,
                        stats: Optional[dict] = None) -> Table:
     conv = convergence_state(df, stats)
     cols = (
-        Col('arm', 'Arm (label)'),
+        Col('arm', 'Arm (label)', key_column=True),
         Col('cell', 'Cell'),
         Col('condition', 'Condition'),
         Col('env', 'Env'),
@@ -1646,10 +2626,8 @@ def _estimation_rows(stats: dict, headroom: dict[str, float]) -> list[dict]:
             'Brunner-Munzel relative effect', 'theta = P(X>Y)', NO_P_MARKER,
             NO_P_MARKER,
             'theta ' + fmt_ci(r.get('theta'), r.get('ci_lo'), r.get('ci_hi')),
-            ('theta excludes 0.5'
-             if (_isnum(r.get('ci_lo')) and _isnum(r.get('ci_hi'))
-                 and (float(r['ci_lo']) > 0.5 or float(r['ci_hi']) < 0.5))
-             else 'covers 0.5: not distinguishable')
+            verdict_vs(r.get('ci_lo'), r.get('ci_hi'), 0.5, 'theta',
+                       min(r.get('n_a') or 0, r.get('n_b') or 0))
             + _headroom_phrase(headroom, r.get('a'), r.get('b'))
             + '; associational: cells are different algorithms, not treatments '
               'assigned to units (DESIGN.md 2.4), and RQ1 is a sanity check, '
@@ -1725,10 +2703,8 @@ def _estimation_rows(stats: dict, headroom: dict[str, float]) -> list[dict]:
             NO_P_MARKER, NO_P_MARKER,
             'ratio ' + fmt_ci(r.get('sd_ratio'), r.get('ci_lo'),
                               r.get('ci_hi')),
-            ('excludes 1' if (_isnum(r.get('ci_lo')) and _isnum(r.get('ci_hi'))
-                              and (float(r['ci_lo']) > 1
-                                   or float(r['ci_hi']) < 1))
-             else 'covers 1: not distinguishable')))
+            verdict_vs(r.get('ci_lo'), r.get('ci_hi'), 1.0,
+                       'the SD ratio', r.get('n'))))
 
     # Secondary and mechanism metrics, estimation-only by declared role. The
     # role travels with the row: a mechanism signal supports or refuses
@@ -1832,9 +2808,9 @@ def _c4_rows(stats: dict) -> list[dict]:
 def table_inferential(df: pd.DataFrame, ctx: Context,
                       stats: Optional[dict]) -> Table:
     cols = (
-        Col('rq', 'RQ'),
+        Col('rq', 'RQ', key_column=True),
         Col('family', 'Family'),
-        Col('quantity', 'Quantity / contrast'),
+        Col('quantity', 'Quantity / contrast', key_column=True),
         Col('endpoint', 'Endpoint'),
         Col('n', 'n', 'r'),
         Col('test', 'Test / estimator'),
@@ -1986,9 +2962,9 @@ def table_inferential(df: pd.DataFrame, ctx: Context,
 def table_control_contrasts(df: pd.DataFrame, ctx: Context,
                             stats: Optional[dict]) -> Table:
     cols = (
-        Col('cell', 'Cell'),
+        Col('cell', 'Cell', key_column=True),
         Col('endpoint', 'Endpoint'),
-        Col('contrast', 'Contrast'),
+        Col('contrast', 'Contrast', key_column=True),
         Col('name', 'What was manipulated'),
         Col('n', 'n', 'r'),
         Col('mean', 'mean', 'r'),
@@ -2255,7 +3231,7 @@ def table_protocol_summary(df: pd.DataFrame, ctx: Context) -> Table:
                 for c, _h in OPTIONAL_PROTOCOL_COLUMNS
                 if c in df.columns and df[c].dropna().nunique() == 1]
     cols = (
-        Col('arm', 'Arm (label)'),
+        Col('arm', 'Arm (label)', key_column=True),
         Col('cell', 'Cell'),
         Col('condition', 'Condition'),
         Col('pair', 'Source -> target'),
@@ -2537,7 +3513,7 @@ def table_environments(df: pd.DataFrame, ctx: Context) -> Table:
     catalogue |= used
 
     cols = (
-        Col('env', 'Environment'),
+        Col('env', 'Environment', key_column=True),
         Col('role', 'Role'),
         Col('used', 'In data', 'c'),
         Col('obs', 'obs', 'r'),
@@ -2740,6 +3716,229 @@ def _powered_phrase(mde_holm: Any) -> str:
             f'Holm-corrected alpha')
 
 
+def confirmatory_bar() -> dict[str, Any]:
+    """The confirmatory bar, READ rather than restated.
+
+    The note this replaces said: "A cell is therefore confirmed if and only if
+    all ten of its seeds move in the same direction. That bar is stated before
+    the numbers, not after (ANALYSIS_PLAN.md 2.2)." `ANALYSIS_PLAN.md` 2.2 now
+    says the opposite in as many words, and the change log at 2026-08-26 records
+    why: "The 'only if' half is false ... a cell split 9 to 1 with a small
+    opposing delta returns p = 0.00391 and clears the bar without unanimity."
+    The correction reached `stats.py` and did not reach here, so the artefact
+    bound for the paper printed a rule the pre-registration it cited had
+    withdrawn, and stated it as STRICTER than the real one. Nothing could
+    notice, because the sentence was a literal.
+
+    So the sentence is no longer typed. The numbers come from
+    `statlib.signflip_attainable_p_below`, which enumerates the attainable
+    exact two-sided p-values at or below the Holm-strictest alpha, and the
+    wording is built from them. The plan file is then read and checked: if 2.2
+    still contains the retracted "if and only if" phrasing, or does not contain
+    the count this function computed, that DISAGREEMENT is what gets printed
+    rather than either version being asserted over the other.
+    """
+    n = int(PLANNED_N)
+    total = 2 ** n
+    # `enumerated` is the key that separates the two ways this dict can
+    # come back with an empty list of attainable p-values: the enumeration
+    # RAN and found none, or it never ran. Without it the caller had one
+    # empty list for both and printed the first sentence for the second
+    # case, asserting as a finding about the design what was only a failed
+    # import. An empty result and an absent result are not the same result.
+    out: dict[str, Any] = {
+        'planned_n': n, 'assignments': total,
+        'alpha_strictest': ALPHA_STRICTEST,
+        'floor_p': 2.0 / total,
+        'enumerated': False,
+        'attainable_p_at_or_below_alpha': [],
+        'max_extreme_assignments': None,
+        'source': None, 'plan_check': None,
+    }
+    try:
+        from experiments import statlib      # type: ignore  # noqa: PLC0415
+        attainable = list(statlib.signflip_attainable_p_below(
+            n, ALPHA_STRICTEST))
+        out['source'] = ('statlib.signflip_attainable_p_below at n='
+                         f'{n}, alpha={ALPHA_STRICTEST}')
+    except Exception as exc:                 # noqa: BLE001
+        out['source'] = (f'statlib.signflip_attainable_p_below could not be '
+                         f'called ({type(exc).__name__}: {exc}), so the '
+                         f'attainable p-values were NOT enumerated and no '
+                         f'bar is stated here')
+        return out
+    out['enumerated'] = True
+    out['attainable_p_at_or_below_alpha'] = attainable
+    if attainable:
+        out['max_extreme_assignments'] = int(round(max(attainable) * total))
+    out['plan_check'] = _plan_states_bar(out)
+    return out
+
+
+def _plan_states_bar(bar: dict[str, Any]) -> dict[str, Any]:
+    """Does `ANALYSIS_PLAN.md` 2.2 still say what this table is about to say?
+
+    A one-way check, deliberately: the plan is pre-registered and frozen, so a
+    disagreement is reported and never resolved by editing either side. What it
+    catches is exactly the drift that produced this defect: a plan sentence
+    corrected on one side of the repository and not the other.
+    """
+    path = os.path.join(_HERE, 'ANALYSIS_PLAN.md')
+    out: dict[str, Any] = {'plan_file': path.replace(os.sep, '/'),
+                           'read': False, 'agrees': None, 'note': ''}
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            text = fh.read()
+    except OSError as exc:
+        out['note'] = (f'ANALYSIS_PLAN.md could not be read ({exc}), so the '
+                       f'bar printed here is unchecked against the plan')
+        return out
+    out['read'] = True
+    out.update(plan_bar_agreement(text, bar))
+    return out
+
+
+def plan_bar_agreement(plan_text: str, bar: dict[str, Any]) -> dict[str, Any]:
+    """Does section 2.2 of this plan text state the bar `statlib` computes?
+
+    Split out from the file read so `self_test` can put both a corrected and a
+    retracted section 2.2 in front of it: a check that can only be run against
+    the one file on disk is a check nobody can show works.
+
+    Scoped to the section that states the bar, and normalised first. All three
+    steps matter. The plan's own change log QUOTES the retracted "if and only
+    if" while recording that it was withdrawn, so an unscoped search reports a
+    disagreement that is really the correction. The bar is stated inside a bold
+    blockquote, so the raw text reads "at most 6 of the 1024 > sign
+    assignments". And the markdown wraps, so the sentence spans newlines. Any
+    one of the three makes a literal search fail on formatting rather than on
+    content, which would turn this check into a permanent false alarm and
+    therefore into no check at all.
+    """
+    section = re.search(r'^###\s*2\.2\b.*?(?=^##\s|\Z)', plan_text,
+                        re.MULTILINE | re.DOTALL)
+    if section is None:
+        return {'agrees': None, 'section': None,
+                'note': 'ANALYSIS_PLAN.md has no section 2.2 heading, so the '
+                        'bar printed here is unchecked against the plan'}
+    body = re.sub(r'^[>#\s]+', ' ', section.group(0), flags=re.MULTILINE)
+    body = re.sub(r'[*`_]', '', body)
+    body = re.sub(r'\s+', ' ', body).lower()
+    k = bar.get('max_extreme_assignments')
+    has_count = k is not None and (
+        f'at most {k} of the {bar["assignments"]} sign assignments' in body)
+    retracted = 'confirmed if and only if' in body
+    if has_count and not retracted:
+        return {'agrees': True, 'section': '2.2',
+                'note': 'ANALYSIS_PLAN.md 2.2 states the same bar as the '
+                        'numbers above'}
+    bits = []
+    if not has_count:
+        bits.append(f'ANALYSIS_PLAN.md 2.2 does not state the bar as "at most '
+                    f'{k} of the {bar["assignments"]} sign assignments", '
+                    f'which is what statlib computes at '
+                    f'n={bar["planned_n"]}')
+    if retracted:
+        bits.append('ANALYSIS_PLAN.md 2.2 still contains a "confirmed if and '
+                    'only if" formulation, which its own change log retracted '
+                    'on 2026-08-26')
+    return {'agrees': False, 'section': '2.2',
+            'note': ('DISAGREEMENT between this table and the plan: '
+                     + '; '.join(bits) + '. The numbers above come from '
+                     'statlib and no rule is asserted here until the two '
+                     'agree')}
+
+
+def confirmatory_bar_note() -> str:
+    """The power table's sentence about the bar, assembled from the numbers."""
+    return confirmatory_bar_sentence(confirmatory_bar())
+
+
+def confirmatory_bar_sentence(bar: dict[str, Any]) -> str:
+    """The sentence a given bar earns. Split out from the computation so
+    `self_test` can put all three shapes of `bar` in front of it: the
+    enumeration that ran and found values, the one that ran and found none,
+    and the one that never ran. The third used to print the second's
+    sentence, which said NO cell at this n could be confirmed whatever the
+    data do. That is false at the planned n, where three attainable values
+    clear the strictest Holm step, and it turned a tooling failure into a
+    statement about the design. A check that can only be run against a
+    working import cannot notice that.
+    """
+    n, total = bar['planned_n'], bar['assignments']
+    attainable = bar['attainable_p_at_or_below_alpha']
+    head = (f'At the planned n={n} the exact sign-flip test cannot return a '
+            f'two-sided p below {bar["floor_p"]:.5f}, attained exactly when '
+            f'every seed moves the same way, and the strictest Holm step is '
+            f'{bar["alpha_strictest"]:.5f}. ')
+    if not bar.get('enumerated'):
+        return (head + 'THE BAR IS NOT STATED HERE, because the attainable '
+                       'p-values could not be enumerated on this run. That '
+                       'is a failure to compute and NOT a finding: it says '
+                       'nothing about whether a cell at this n can be '
+                       'confirmed, and it must not be read as an '
+                       'enumeration that ran and returned nothing. Restore '
+                       'experiments/statlib.py and re-run to get the bar; '
+                       'until then no rule about confirmation is asserted '
+                       'by this table. '
+                       f'({bar["source"]}.)')
+    if not attainable:
+        return (head + 'The enumeration RAN and returned no attainable '
+                       'p-value at or below that step, so no cell at this n '
+                       'can be confirmed whatever the data do, and the '
+                       'tests are reported for completeness only. '
+                       f'({bar["source"]}.)')
+    k = bar['max_extreme_assignments']
+    vals = ', '.join(f'{p:.5f}' for p in attainable)
+    tail = ''
+    check = bar.get('plan_check') or {}
+    if check.get('agrees') is False or check.get('read') is False:
+        tail = ' ' + str(check.get('note', ''))
+    return (head
+            + f'The floor is not the bar: the exact p moves in steps of '
+              f'2/{total}, because a sign assignment and its negation are '
+              f'always equally extreme, so {len(attainable)} attainable '
+              f'values sit at or below that step ({vals}). THE BAR IS '
+              f'THEREFORE: at most {k} of the {total} sign assignments may be '
+              f'at least as extreme as the observed mean. All {n} seeds moving '
+              f'the same way attains the floor and is SUFFICIENT; it is NOT '
+              f'NECESSARY, because one seed moving against the rest by a small '
+              f'enough margin leaves {4} assignments at least as extreme, '
+              f'p = {4.0 / total:.5f}, which still clears '
+              f'{bar["alpha_strictest"]:.5f}. That bar applies to the smallest '
+              f'p in the family of {FAMILY_SIZE}; Holm compares the jth '
+              f'smallest against alpha/(m-j+1), so every later step is looser. '
+              f'Stated before the numbers, not after (ANALYSIS_PLAN.md 2.2). '
+              f'Computed here from {bar["source"]}, never transcribed.'
+            + tail)
+
+
+def _powered_thresholds_note() -> str:
+    """Both NOT-POWERED thresholds, from the constants `_powered_phrase` uses.
+
+    The note used to describe `UNPOWERED_MDE` only, so on the live tree the
+    dueling-vanilla scratch planning row printed "NOT POWERED FOR A MODEST
+    EFFECT: MDE 0.568 is at or above 0.568" directly under a sentence saying
+    the flag fires at 1.0, and a reader reconciling the two could only conclude
+    the table was inconsistent. Both thresholds are read from the module
+    constants here, so a flag cannot fire against an undocumented boundary.
+    """
+    return (
+        f'Two NOT-POWERED thresholds, both pre-registered and both read from '
+        f'the constants the Powered? column is computed with. (1) NOT POWERED '
+        f'when the MDE at the Holm-corrected alpha reaches {UNPOWERED_MDE} '
+        f'score unit(s), which by construction of the normalisation is the '
+        f'entire distance from a random policy to the registered threshold '
+        f'(DESIGN.md 5.1). (2) NOT POWERED FOR A MODEST EFFECT when it reaches '
+        f'{MODEST_EFFECT_MDE:.3f}, which is the MDE ANALYSIS_PLAN.md 6.3 '
+        f'tabulates for the noisy dueling-vanilla scratch cell and says in the '
+        f'same paragraph is "not powered for a modest effect": the largest '
+        f'pre-registered planning SD ({PLANNING_SDS_MAX:.3f}) at the '
+        f'Holm-corrected paired multiplier '
+        f'({MDE_MULTIPLIERS[("paired", "holm8")]}). Which cells are powered is '
+        f'known in advance from the dispersion, not discovered after the test.')
+
+
 def _alpha_label(kind: str) -> str:
     return (f'{ALPHA}' if kind == 'nominal'
             else f'{ALPHA_STRICTEST:.5f} (Holm over {FAMILY_SIZE})')
@@ -2857,8 +4056,8 @@ def table_power(df: pd.DataFrame, ctx: Context,
                 stats: Optional[dict]) -> Table:
     cols = (
         Col('scope', 'Scope'),
-        Col('endpoint', 'Endpoint'),
-        Col('cell', 'Cell / arm'),
+        Col('endpoint', 'Endpoint', key_column=True),
+        Col('cell', 'Cell / arm', key_column=True),
         Col('n', 'n', 'r'),
         Col('sigma_delta', 'sigma(delta)', 'r'),
         Col('sigma_pooled', 'sigma(pooled)', 'r'),
@@ -2946,21 +4145,11 @@ def table_power(df: pd.DataFrame, ctx: Context,
     notes = [
         _mde_multiplier_note(stats),
         _PAIRING_NOTE,
-        f'A cell is flagged NOT POWERED when its MDE at the Holm-corrected '
-        f'alpha reaches {UNPOWERED_MDE} score unit(s) -- which by construction '
-        f'of the normalisation is the entire distance from a random policy to '
-        f'the registered threshold (DESIGN.md 5.1). Which cells are powered is '
-        f'therefore known in advance from the dispersion, not discovered after '
-        f'the test.',
+        _powered_thresholds_note(),
         'A null result in an unpowered cell is a power result as much as an '
         'absence. The honest statement there is the exclusion bound of Table 2, '
         'not a null p-value (DESIGN.md 10.8, ANALYSIS_PLAN.md 4).',
-        'At n=10 the exact sign-flip test cannot return a two-sided p below '
-        f'{2 / 2 ** 10:.5f}, attained only when every seed moves the same way, '
-        f'and the strictest Holm step is {ALPHA_STRICTEST:.5f}. A cell is '
-        'therefore confirmed if and only if all ten of its seeds move in the '
-        'same direction. That bar is stated before the numbers, not after '
-        '(ANALYSIS_PLAN.md 2.2).',
+        confirmatory_bar_note(),
         'The REPLICATE seed block exists so n can be doubled to 20 under a '
         'pre-registered pooling rule; the decision to run it is made on '
         'compute availability only, never on the n=10 outcome '
@@ -3041,6 +4230,46 @@ def scan_latex_mapping(t: Table) -> None:
         latex_escape(note)
 
 
+def _layout_record(t: Table) -> dict:
+    """What the page-fit model decided, for the provenance sidecar.
+
+    `mechanism` and `requires_packages` are part of it because they are
+    what a reader has to know to compile the file and what an author has to
+    know to check that every row reached a page. A sidecar that recorded
+    only the column split described a table whose rows were being cropped.
+    """
+    panels = layout_panels(t)
+    assert_no_column_lost(t, panels)
+    placed = [c.key for panel in panels for c in panel]
+    mech = mechanism(t, panels)
+    return {
+        'fontsize': t.fontsize,
+        'mechanism': mech,
+        'breaks_across_pages': mech == 'supertabular',
+        'requires_packages': list(PREAMBLE_PACKAGES[mech]),
+        'float_environment': (('table*' if t.star else 'table')
+                              if mech == 'float' else None),
+        'templates_fitted_against': {
+            k: {'textwidth_pt': v['textwidth_pt'],
+                'body_linewidth_pt': v['body_linewidth_pt'],
+                'textheight_pt': v['textheight_pt'],
+                'pt_per_char': _pt_per_char(k, t.fontsize)}
+            for k, v in TEMPLATES.items()},
+        'tabcolsep_pt': TABCOLSEP_PT,
+        'panels': [[c.key for c in panel] for panel in panels],
+        'key_columns': [c.key for c in t.key_cols],
+        'column_chars_natural': {c.key: col_chars(t, c) for c in t.cols},
+        'column_chars_unbreakable': {c.key: col_floor_chars(t, c)
+                                     for c in t.cols},
+        'column_chars_allocated': [
+            {k: round(v, 1)
+             for k, v in (allocate_chars(t, panel) or {}).items()}
+            for panel in panels],
+        'columns_omitted': [c.key for c in t.cols if c.key not in set(placed)],
+        'height': height_report(t, panels),
+    }
+
+
 def write_table(t: Table, outdir: str, formats: Sequence[str],
                 ctx: Context) -> dict:
     """Write one table in every requested format, plus its sidecar."""
@@ -3062,6 +4291,12 @@ def write_table(t: Table, outdir: str, formats: Sequence[str],
         'rows': len(t.rows),
         'notes': list(t.notes),
         'caption': t.caption,
+        # The layout is provenance, not decoration: a reader holding the
+        # rendered table has to be able to check that the columns they can see
+        # are all the columns there were. `columns_omitted` is the assertion
+        # that the split lost nothing, made by `assert_no_column_lost` before
+        # anything was written rather than claimed here.
+        'layout': _layout_record(t),
         'outputs': {fmt: {'path': p, 'sha': provenance.file_hash(p)}
                     for fmt, p in written.items()},
         'inputs': {
@@ -3100,9 +4335,22 @@ def write_table(t: Table, outdir: str, formats: Sequence[str],
             'mde_multipliers': {f'{k[0]}/{k[1]}': v
                                 for k, v in MDE_MULTIPLIERS.items()},
             'unpowered_mde_score_units': UNPOWERED_MDE,
+            # The second NOT-POWERED threshold was the one inference constant
+            # in use that the sidecar did not record, and it is the one that
+            # actually fires on this tree: a machine-readable record that
+            # omits the boundary a printed flag was decided by cannot be used
+            # to check the flag.
+            'modest_effect_mde_score_units': MODEST_EFFECT_MDE,
+            'planning_sd_max': PLANNING_SDS_MAX,
+            'planned_n': PLANNED_N,
             'source_validity_gate': SOURCE_VALIDITY_GATE,
             'noop_drift_tolerance': NOOP_DRIFT_TOLERANCE,
         },
+        # Read from statlib and checked against the plan file, never restated:
+        # the note under the power table quoted a decision rule ANALYSIS_PLAN.md
+        # 2.2 had retracted, and no test could notice because the sentence was
+        # a literal. The record travels so the check is auditable too.
+        'confirmatory_bar': confirmatory_bar(),
         'latex_unmapped_characters': dict(_UNMAPPED),
         'argv': list(ctx.argv),
         'cwd': os.getcwd(),
@@ -3177,6 +4425,17 @@ def multiplicity_ledger(stats: Optional[dict], tables: Sequence[Table]) -> str:
 #     direction with `stats.phrase_interval_verdict`, so the two cannot drift.
 # ===========================================================================
 
+def _bare_ascii_math_free(escaped: str) -> bool:
+    """True when no `<`, `>` or `|` is left outside the maths it belongs in.
+
+    Every occurrence in escaped output must be inside a `$...$` produced by
+    `_LATEX_ASCII_MATH` or `_LATEX_ASCII_SEQUENCES`; a bare one is the defect.
+    Checked by removing the maths groups and looking for survivors.
+    """
+    stripped = re.sub(r'\$[^$]*\$', '', escaped)
+    return not (set('<>|') & set(stripped))
+
+
 def self_test(verbose: bool = True) -> int:
     checks: list[tuple[str, bool, str]] = []
 
@@ -3210,6 +4469,58 @@ def self_test(verbose: bool = True) -> int:
           unknown == '[U+2603]' and '☃' in _UNMAPPED
           and '☃' not in before, unknown)
     _UNMAPPED.pop('☃', None)
+
+    # --- the three ASCII characters OT1 does not set as themselves ---------
+    # Tested on the strings that actually occur: the source-validity verdict,
+    # the suppression reason, an env id, the transfer lineage, and the two
+    # comparison operators. Each of these reached the .tex unescaped and set as
+    # inverted punctuation or an en rule in both target templates.
+    for raw, want in (
+            ('REJECTED 0.599 < 0.6', '$<$'),
+            ('theta = P(X>Y)', '$>$'),
+            ('obs 6 -> 8 | act 3 -> 4', '$|$'),
+    ):
+        got = latex_escape(raw)
+        check(f'the OT1-broken character in {raw!r} is escaped',
+              want in got and _bare_ascii_math_free(got), got)
+    check('no <, > or | survives escaping in any form',
+          _bare_ascii_math_free(latex_escape(
+              'a<b>c|d n<=20 gate >= 0.6 CP -> LL')),
+          latex_escape('a<b>c|d n<=20 gate >= 0.6 CP -> LL'))
+    check('the ASCII arrow becomes the same command as the Unicode one',
+          latex_escape('CP -> LL') == latex_escape('CP → LL'),
+          latex_escape('CP -> LL'))
+    check('the ASCII inequalities become the same commands as the Unicode ones',
+          latex_escape('n <= 20') == latex_escape('n ≤ 20')
+          and latex_escape('gate >= 0.6') == latex_escape('gate ≥ 0.6'),
+          latex_escape('n <= 20') + ' / ' + latex_escape('gate >= 0.6'))
+    check('a long option keeps both its hyphens and is set in typewriter',
+          latex_escape('--allow-audit-failure')
+          == _BS + 'texttt{-{}-allow-audit-failure}',
+          latex_escape('--allow-audit-failure'))
+    check('the no-p marker is NOT mistaken for a long option',
+          latex_escape(NO_P_MARKER) == '---'
+          and latex_escape('a -- b') == 'a -- b',
+          latex_escape(NO_P_MARKER) + ' / ' + latex_escape('a -- b'))
+    check('the ASCII allow-list is derived from the two mapping tables, so a '
+          'mapped character can never also be waved through',
+          not (_ASCII_SAFE & set(_LATEX_SPECIALS))
+          and not (_ASCII_SAFE & set(_LATEX_ASCII_MATH))
+          and len(_ASCII_SAFE) == (0x7F - 0x20 - len(_LATEX_SPECIALS)
+                                   - len(_LATEX_ASCII_MATH)),
+          f'{len(_ASCII_SAFE)} safe characters')
+    check('a long identifier is given break points so it can wrap in a p{} '
+          'column',
+          _BS + 'allowbreak' in latex_escape(
+              'LL[extra_actions=2,pad_mode=noise,pad_obs=4]'),
+          latex_escape('LL[extra_actions=2,pad_mode=noise,pad_obs=4]')[:60])
+    check('a short token is left alone',
+          latex_escape('n=1 < 3') == 'n=1 $<$ 3', latex_escape('n=1 < 3'))
+    check('unbreakable_run measures what a p{} column cannot wrap',
+          unbreakable_run('LL[extra_actions=2,pad_mode=noise,pad_obs=4]') == 8
+          and unbreakable_run('transfer-trunk-dueling-vanilla') == 9,
+          f"{unbreakable_run('LL[extra_actions=2,pad_mode=noise,pad_obs=4]')}, "
+          f"{unbreakable_run('transfer-trunk-dueling-vanilla')}")
     check('newlines inside a cell are collapsed, not emitted',
           '\n' not in latex_escape('a\nb') and latex_escape('a\nb') == 'a b')
     check('a markdown cell escapes the delimiter',
@@ -3278,6 +4589,113 @@ def self_test(verbose: bool = True) -> int:
                                tuple(Col(str(i), str(i)) for i in range(7))
                                ).star)
 
+    # --- page fit: nothing is dropped, and an overflow is a refusal --------
+    check('a table that fits is one panel and is not split',
+          layout_panels(t) == [t.cols], str(layout_panels(t)))
+    wide = Table(
+        'wide', 'Wide', 'c',
+        (Col('arm', 'Arm (label)', key_column=True),)
+        + tuple(Col(f'm{i}', f'metric {i}', 'r') for i in range(13)),
+        [{'arm': 'transfer-trunk-dueling-vanilla',
+          **{f'm{i}': '0.123 ± 0.045' for i in range(13)}}
+         for _ in range(4)])
+    panels = layout_panels(wide)
+    placed = [c.key for panel in panels for c in panel]
+    check('a table too wide for the page is split, not truncated',
+          len(panels) > 1 and set(placed) == {c.key for c in wide.cols},
+          f'{len(panels)} panels, {len(set(placed))} of {len(wide.cols)} '
+          f'columns placed')
+    check('every panel of a split table repeats the key column',
+          all(panel[0].key == 'arm' for panel in panels),
+          str([[c.key for c in p] for p in panels]))
+    check('every panel of a split table fits every target template',
+          all(allocate_chars(wide, panel) is not None for panel in panels))
+    check('the split is stated in the notes of BOTH renderings',
+          'LAYOUT:' in render_latex(wide) and 'LAYOUT:' in
+          render_markdown(wide))
+    check('the markdown mirror is not split and carries every column',
+          all(f'metric {i}' in render_markdown(wide) for i in range(13))
+          and render_markdown(wide).count('| Arm (label) |') == 1,
+          str(render_markdown(wide).count('| Arm (label) |')))
+    _frac_re = re.compile(r'p\{([0-9.]+)' + re.escape(_BS) + r'linewidth\}')
+    # Both mechanisms, because a tall table's columns are set by
+    # `supertabular` and a check that only looked at `tabular` would have
+    # silently stopped checking anything the moment the mechanism changed.
+    _spec_re = re.compile(r'begin\{(?:super)?tabular\}\{(.*?)\}\n')
+    _specs = _spec_re.findall(render_latex(wide))
+    check('the emitted column fractions cannot exceed the line width',
+          bool(_specs) and all(sum(float(x) for x in _frac_re.findall(s)) < 1.0
+                               for s in _specs),
+          '; '.join('%.4f' % sum(float(x) for x in _frac_re.findall(s))
+                    for s in _specs))
+    unfittable = Table(
+        'unfittable', 'Unfittable', 'c',
+        (Col('key', 'Key', key_column=True), Col('blob', 'Blob')),
+        [{'key': 'k', 'blob': 'A' * 400}])
+    raised = False
+    try:
+        layout_panels(unfittable)
+    except LayoutError:
+        raised = True
+    check('a column that cannot be fitted RAISES rather than being cropped',
+          raised, 'a 400-character unbreakable cell')
+    dropper = Table('d', 'D', 'c', (Col('a', 'A'), Col('b', 'B')),
+                    [{'a': '1', 'b': '2'}])
+    lost = False
+    try:
+        assert_no_column_lost(dropper, [(dropper.cols[0],)])
+    except LayoutError:
+        lost = True
+    check('a layout that omits a column is refused by the guard', lost)
+    # --- a table taller than the page BREAKS; it is not a float --------
+    tall = Table('tall', 'Tall', 'c' * 400,
+                 (Col('a', 'A'), Col('b', 'B')),
+                 [{'a': 'x' * 20, 'b': 'y' * 20} for _ in range(400)])
+    tall_panels = layout_panels(tall)
+    tall_tex = render_latex(tall)
+    tall_note = '\n'.join(layout_notes(tall, tall_panels))
+    check('a table taller than the page is NOT set in a float',
+          mechanism(tall, tall_panels) == 'supertabular'
+          and _BS + 'begin{table}' not in tall_tex
+          and _BS + 'begin{table*}' not in tall_tex,
+          mechanism(tall, tall_panels))
+    for token in ('begin{supertabular}', 'tablefirsthead{', 'tablehead{',
+                  'tabletail{', 'tablelasttail{', 'topcaption{',
+                  'label{tab:tall}'):
+        check(f'the breaking rendering emits {token}', token in tall_tex,
+              tall_tex[:200])
+    _rules = tall_tex.count(_BS + 'toprule')
+    check('the header is repeated on every continuation, not only the first',
+          _rules == 2 * len(tall_panels),
+          f'{_rules} toprule(s) for {len(tall_panels)} panel(s)')
+    check('the .tex names the package it needs and errors by name without it',
+          _BS + 'usepackage{supertabular}' in tall_tex
+          and '@ifundefined{supertabular}' in tall_tex,
+          tall_tex[:400])
+    check('a table that fits the page is still an ordinary float',
+          mechanism(t, layout_panels(t)) == 'float'
+          and _BS + 'begin{table}' in render_latex(t),
+          mechanism(t, layout_panels(t)))
+    check('the page-break note states the ROW COUNT and the text height',
+          ('PAGE BREAKS:' in tall_note and f'{len(tall.rows)} rows' in
+           tall_note and 'text height' in tall_note),
+          tall_note[:200])
+    # The note this replaces blamed the caption and told the operator to
+    # shorten it. The compiler disproved that: deleting all 2808 characters
+    # of main_results' caption left the float 1953.34pt over. So the claim
+    # is asserted here rather than trusted, on a table with NO caption at
+    # all, and the note is required not to name the caption as the cause.
+    uncaptioned = Table('tall', 'Tall', '', tall.cols, tall.rows)
+    check('an empty caption does not make a 400-row table fit a float',
+          mechanism(uncaptioned, layout_panels(uncaptioned))
+          == 'supertabular',
+          f'height {height_report(uncaptioned, layout_panels(uncaptioned))}')
+    check('the note does not blame the caption or recommend shortening it',
+          ('shorter caption' not in tall_note
+           and 'length of the generated caption' not in tall_note
+           and 'placement decision' not in tall_note),
+          tall_note[:400])
+
     # --- a p-value is a probability ---------------------------------------
     check('a value outside [0, 1] is refused as a p-value',
           fmt_p(1.17).startswith('INVALID') and fmt_p(-0.1).startswith(
@@ -3297,6 +4715,29 @@ def self_test(verbose: bool = True) -> int:
     check('a strictly positive lower bound does exclude every degradation',
           'every degradation is excluded' in exclusion_bound_text(0.2),
           exclusion_bound_text(0.2))
+
+    # --- an absent interval is never a null result -------------------------
+    check('an absent interval against a non-zero null is NOT reported as a '
+          'null result',
+          'NO INTERVAL' in verdict_vs(None, None, 0.5, 'theta', 1)
+          and 'not distinguishable' not in verdict_vs(None, None, 0.5,
+                                                      'theta', 1),
+          verdict_vs(None, None, 0.5, 'theta', 1))
+    check('an absent interval below the inference floor says which floor',
+          f'< {MIN_N_FOR_INFERENCE}' in verdict_vs(None, None, 1.0,
+                                                   'the SD ratio', 1),
+          verdict_vs(None, None, 1.0, 'the SD ratio', 1))
+    check('an arm with no runs is an EXCLUSION, not a null',
+          'NO ESTIMATE' in verdict_vs(None, None, 1.0, 'the SD ratio', 0)
+          and 'exclusion' in verdict_vs(None, None, 1.0, 'the SD ratio', 0),
+          verdict_vs(None, None, 1.0, 'the SD ratio', 0))
+    check('a real interval still gets its verdict against 0.5 and against 1',
+          verdict_vs(0.6, 0.9, 0.5, 'theta', 4) == 'theta excludes 0.5'
+          and verdict_vs(0.4, 0.9, 0.5, 'theta', 4)
+          == 'covers 0.5: not distinguishable'
+          and verdict_vs(1.2, 3.0, 1.0, 'the SD ratio', 4)
+          == 'the SD ratio excludes 1',
+          verdict_vs(0.6, 0.9, 0.5, 'theta', 4))
 
     # --- n is a count of seeds --------------------------------------------
     probe = pd.DataFrame({
@@ -3359,6 +4800,41 @@ def self_test(verbose: bool = True) -> int:
     check('an arm with no source reads n/a, not "not recorded"',
           source_state(pd.DataFrame({'source_valid': [float('nan')],
                                      'seed': [0]}))['text'] == 'n/a')
+    # The printed number must be below the printed gate. At three decimals a
+    # source scoring 0.5996 printed "REJECTED 0.600 < 0.6", which contradicts
+    # itself and is also indistinguishable from an accepted "valid 0.600".
+    for score in (0.5996, 0.59999, 0.5999999):
+        text = rejected_source_text(score)
+        number = text.split()[1]
+        check(f'a source at {score} prints a number really below the gate',
+              float(number) < float(SOURCE_VALIDITY_GATE), text)
+    check('a rejected source cannot print the same number as an accepted one',
+          rejected_source_text(0.5996) != source_state(pd.DataFrame({
+              'label': ['t'], 'seed': [0], 'source_valid': [True],
+              'source_final_score': [0.6004]}))['text'],
+          rejected_source_text(0.5996))
+    check('a flag and a score that disagree are labelled, not smoothed over',
+          'disagree' in rejected_source_text(0.7),
+          rejected_source_text(0.7))
+
+    # --- no SD at one seed, however many rows the arm holds ----------------
+    check('two runs at one seed get a mean and NO across-seed SD',
+          '±' not in fmt_mean_sd([0.5, 1.2], n_units=1)
+          and 'NO across-seed SD' in fmt_mean_sd([0.5, 1.2], n_units=1),
+          fmt_mean_sd([0.5, 1.2], n_units=1))
+    check('two seeds still get an SD',
+          '±' in fmt_mean_sd([0.5, 1.2], n_units=2),
+          fmt_mean_sd([0.5, 1.2], n_units=2))
+    dup_probe = pd.DataFrame({
+        'run_dir': ['a', 'a'], 'label': ['x', 'x'], 'arm': ['x', 'x'],
+        'cell': ['c', 'c'], 'condition': ['scratch'] * 2,
+        'env': ['LunarLander-v3'] * 2, 'seed': [0, 0],
+        'seed_block': ['CONFIRM'] * 2, 'final_score': [0.5, 1.2],
+        'auc_score': [0.5, 1.2]})
+    check('the results cell of a duplicated arm carries no SD either',
+          '±' not in fmt_metric(dup_probe, 'final_score')
+          and 'rows at 1 seed' in fmt_metric(dup_probe, 'final_score'),
+          fmt_metric(dup_probe, 'final_score'))
 
     # --- a moved invariant is any declared invariant, not freeze_updates ---
     moved_probe = pd.DataFrame({'lr': [0.0005, 0.001],
@@ -3409,6 +4885,105 @@ def self_test(verbose: bool = True) -> int:
           (f'by {_PAIRING_REDUCTION_PCT:.0f}%' in _PAIRING_NOTE
            and f'{_PAIRING_INFLATION_PCT:.0f}% LARGER' in _PAIRING_NOTE),
           _PAIRING_NOTE[:200])
+
+    # --- the confirmatory bar is read, not restated ------------------------
+    bar = confirmatory_bar()
+    note = confirmatory_bar_note()
+    check('the bar is computed from statlib, not transcribed',
+          'statlib' in str(bar.get('source')), str(bar.get('source')))
+    check('the retracted "if and only if" rule is not printed anywhere in the '
+          'note this table carries',
+          'if and only if' not in note.lower(), note[:140])
+    check('the note states unanimity as SUFFICIENT and NOT NECESSARY',
+          'SUFFICIENT' in note and 'NOT' in note and 'NECESSARY' in note,
+          note[-260:])
+    check('the note quotes the attainable count statlib returns',
+          bar['max_extreme_assignments'] == 6
+          and f"at most {bar['max_extreme_assignments']} of "
+              f"{bar['assignments']}" in note.replace('the 1024', '1024'),
+          f"k={bar['max_extreme_assignments']} of {bar['assignments']}")
+    check('the plan agrees with the bar this table prints',
+          (bar.get('plan_check') or {}).get('agrees') is True,
+          str((bar.get('plan_check') or {}).get('note')))
+    # The check has to be able to FAIL, or it is decoration. Both directions
+    # are put in front of it here rather than only the file on disk.
+    good = ('### 2.2 The bar\n> **Therefore: a cell is confirmed when at most '
+            '6 of the 1024\n> sign assignments are at least as extreme.** '
+            'Unanimity is sufficient.\n')
+    bad = ('### 2.2 The bar\nA cell is confirmed if and only if all ten seeds '
+           'move the same way.\n')
+    check('the plan check passes a corrected 2.2 and fails a retracted one',
+          plan_bar_agreement(good, bar)['agrees'] is True
+          and plan_bar_agreement(bad, bar)['agrees'] is False,
+          f"{plan_bar_agreement(good, bar)['agrees']} / "
+          f"{plan_bar_agreement(bad, bar)['agrees']}")
+    check('a plan with no section 2.2 is reported as unchecked, not as agreeing',
+          plan_bar_agreement('# nothing here', bar)['agrees'] is None)
+    # The enumeration can come back empty two ways, and they are not the
+    # same sentence. Both shapes are put in front of the sentence builder,
+    # and then the real degenerate path is driven by breaking the call the
+    # guarded import makes, because a branch reachable only when a module
+    # is missing is a branch nothing was checking.
+    ran_empty = dict(bar, enumerated=True,
+                     attainable_p_at_or_below_alpha=[],
+                     max_extreme_assignments=None,
+                     source='a stub that enumerated and found none')
+    never_ran = dict(bar, enumerated=False,
+                     attainable_p_at_or_below_alpha=[],
+                     max_extreme_assignments=None,
+                     source='a stub that could not be called')
+    empty_note = confirmatory_bar_sentence(ran_empty)
+    absent_note = confirmatory_bar_sentence(never_ran)
+    check('an enumeration that ran and found nothing says no cell can be '
+          'confirmed',
+          'RAN' in empty_note and 'no cell at this n can be confirmed'
+          in empty_note, empty_note[-220:])
+    check('an enumeration that never ran does NOT claim no cell can be '
+          'confirmed',
+          ('can be confirmed whatever the data do' not in absent_note
+           and 'NO cell' not in absent_note
+           and 'NOT a finding' in absent_note
+           and 'could not be enumerated' in absent_note),
+          absent_note[-260:])
+    check('the two degenerate bars do not print the same sentence',
+          empty_note != absent_note)
+    from experiments import statlib as _statlib   # noqa: PLC0415
+    _kept = _statlib.signflip_attainable_p_below
+
+    def _raise(*_a, **_k):
+        raise ImportError('self-test stub: statlib is unavailable')
+
+    try:
+        _statlib.signflip_attainable_p_below = _raise
+        stubbed_bar = confirmatory_bar()
+        stubbed_note = confirmatory_bar_note()
+    finally:
+        _statlib.signflip_attainable_p_below = _kept
+    check('a failed statlib call is recorded as NOT enumerated, not as empty',
+          stubbed_bar['enumerated'] is False
+          and stubbed_bar['attainable_p_at_or_below_alpha'] == [],
+          str(stubbed_bar['source']))
+    check('the failed-import branch prints the tooling sentence, not the '
+          'finding',
+          ('NOT a finding' in stubbed_note
+           and 'whatever the data do' not in stubbed_note),
+          stubbed_note[-260:])
+    check('the working import still enumerates the three attainable values',
+          confirmatory_bar()['enumerated'] is True
+          and len(confirmatory_bar()['attainable_p_at_or_below_alpha']) == 3,
+          str(confirmatory_bar()['attainable_p_at_or_below_alpha']))
+
+    # --- the power table documents BOTH of its thresholds ------------------
+    thresholds = _powered_thresholds_note()
+    check('both NOT-POWERED thresholds are documented, not just the first',
+          f'{UNPOWERED_MDE}' in thresholds
+          and f'{MODEST_EFFECT_MDE:.3f}' in thresholds,
+          thresholds[:160])
+    check('the threshold that actually fires on this tree is the documented '
+          'one',
+          f'{MODEST_EFFECT_MDE:.3f}' in _powered_phrase(MODEST_EFFECT_MDE)
+          and f'{MODEST_EFFECT_MDE:.3f}' in thresholds,
+          _powered_phrase(MODEST_EFFECT_MDE)[:90])
 
     # --- the guards that used to fail open ---------------------------------
     check('seed_block is required, so the TUNE and donor guards cannot skip',
@@ -3599,6 +5174,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     built: list[Table] = [build_table(key, df, ctx, stats) for key in keys]
     for t in built:
         scan_latex_mapping(t)
+
+    # The page fit is decided before the first byte is written. A column set
+    # that cannot be laid out without dropping a column is a refusal, not a
+    # warning: the whole point of the width model is that the silent crop which
+    # took the source-validity column off main_results in both target templates
+    # is now an error the operator sees.
+    try:
+        layouts = {t.key: (t, layout_panels(t)) for t in built}
+        for t, panels in layouts.values():
+            assert_no_column_lost(t, panels)
+    except LayoutError as exc:
+        print(f'tables.py: LAYOUT REFUSED -- {exc}')
+        print('  Nothing was written. A table whose columns do not fit the '
+              'page is emitted as')
+        print('  panels that share one caption; a table that cannot be split '
+              'so that every column')
+        print('  survives is not emitted at all, because the alternative is a '
+              'results table that')
+        print('  silently loses the column recording whether its source was '
+              'valid (DESIGN.md 4.3).')
+        return 1
+    print()
+    needs: set[str] = set()
+    for t, panels in layouts.values():
+        rep = height_report(t, panels)
+        mech = mechanism(t, panels)
+        needs.update(PREAMBLE_PACKAGES[mech])
+        if mech == 'float':
+            how = 'set as a float, which fits both target templates'
+        else:
+            how = ('too tall for any float (' + ', '.join(
+                f'{k} {v["estimated_float_height_pt"]:.0f}pt of '
+                f'{v["textheight_pt"]:.0f}pt'
+                for k, v in rep['per_template'].items())
+                + '), so it is set as a supertabular that BREAKS across pages')
+        print(f'  layout {t.key:<18} {len(t.cols):>2} columns -> '
+              f'{len(panels)} panel(s), 0 dropped; {len(t.rows)} '
+              f'row{"" if len(t.rows) == 1 else "s"} {how}')
+    print()
+    print('  preamble the emitted .tex files need: '
+          + ' '.join('\\usepackage{' + p + '}' for p in sorted(needs)))
+    print('  a table set as a supertabular raises a LaTeX error by name '
+          'if it is missing, rather than')
+    print('  failing further down the file. Every row and every column '
+          'reaches a page in both')
+    print('  target templates; a float that cannot break is what used to '
+          'crop them.')
     print()
     for t in built:
         result = write_table(t, args.outdir, formats, ctx)
