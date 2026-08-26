@@ -47,14 +47,56 @@ What this file is defending against, defect by defect:
   contrast whose transferred-parameter fractions differ by more than
   `INTENSITY_TOLERANCE` is refused unless `--allow-intensity-confound` is
   passed, and the override is stamped into the output (`DESIGN.md` §3.1).
-* **A single-seed number quoted as a result.** With n<3 no test and no
-  interval is emitted and the output is stamped
-  `PIPELINE VALIDATION - NOT A RESULT` (`ANALYSIS_PLAN.md` §9,
-  `STANDING_INSTRUCTIONS.md` S8).
+* **A single-seed number quoted as a result.** With n<3 no test, no interval,
+  no proportion and no generated between-arm sentence is emitted, and the
+  output is stamped `PIPELINE VALIDATION - NOT A RESULT` (`ANALYSIS_PLAN.md`
+  §9, `STANDING_INSTRUCTIONS.md` S8). §9 forbids *quoting* such a number, not
+  merely testing it, so a suppressed member carries no point estimate either.
+* **A silent collapse.** Two rows for one (arm, seed) used to be resolved by
+  keeping whichever row pandas visited last; a metric absent in *both* arms
+  used to shrink n with nothing said; an unrecognised boolean token used to
+  become `None` and then read as PASS everywhere downstream. Each is now a
+  refusal that names the rows it refuses.
+* **A verdict from a degenerate interval.** A zero-width bootstrap interval (a
+  constant arm, or transfer identical to scratch at every seed) used to read as
+  EQUIVALENT and as "every degradation is excluded at 95%". Degeneracy is now
+  detected and reported as degeneracy.
+* **Two definitions of one number.** `statlib.py` holds the pre-registered
+  estimators. This module keeps vectorised copies, because a 10,000-resample
+  bootstrap cannot call a scalar estimator once per resample per contrast, so
+  every copy is checked against `statlib` on every invocation
+  (`verify_primitives_against_statlib`) and a disagreement is printed in §1 and
+  entered in the deviations of §12.
 
 Input is `runs/per_seed.csv` as produced by `aggregate.py`; the column names
-that module pins are the interface. Output is the twelve sections of
-`ANALYSIS_PLAN.md` §10, in that order, and optionally the same content as JSON.
+that module pins are the interface. The output maps onto `ANALYSIS_PLAN.md`
+§10 as follows, and the mapping is stated rather than asserted, because the
+version this replaces claimed to emit "the twelve sections of §10, in that
+order" while emitting neither the audit result (§10.1) nor the reference
+returns (§10.3):
+
+===============  =====================================================
+§10 item         where it is emitted here
+===============  =====================================================
+1  audit         section 1a, via `audit.audit_ok` on the run tree beside
+                 the per-seed table. A failed audit refuses everything
+                 below unless `--allow-audit-failure` is passed, and
+                 the override is stamped into the output and the JSON
+2  inventory      section 2
+3  references     section 1b: reference returns and the normalisation
+4  descriptives   section 3
+5  convergence    section 4
+6  confirmatory   section 5
+7  equivalence    section 6
+8  controls       section 7
+9  C4             section 8, for **each** co-primary endpoint
+10 estimation     section 9, for **each** co-primary endpoint
+11 ledger         section 11
+12 deviations     section 12
+===============  =====================================================
+
+Section 10, power, is this module's own addition: `ANALYSIS_PLAN.md` §6 asks
+for a stated minimum detectable effect and §10's list has no slot for it.
 
     python experiments/stats.py --per-seed runs/per_seed.csv
     python experiments/stats.py --per-seed runs/per_seed.csv --json out.json
@@ -68,6 +110,7 @@ import math
 import os
 import re
 import sys
+import warnings
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any, Callable, Iterable, Optional, Sequence
@@ -147,58 +190,130 @@ SOURCE_VALIDITY_GATE = 0.6
 
 #: `ANALYSIS_PLAN.md` §6.2, computed before launch and, per §6.4, **not
 #: re-tuned after seeing results**. Multipliers on the relevant sigma.
+#:
+#: The unpaired row reads 1.41/1.88 rather than 1.39/1.87 because §6.2's table
+#: contradicted its own section: the prose directly beneath it says "1.41
+#: against 1.01 sigma" and §6.5's table pins 1.406 for the identical estimator
+#: at the identical n, so the table was the odd one out and this module was
+#: transcribing the odd one out. The plan's table was corrected on 2026-08-26
+#: and the correction is logged in `ANALYSIS_PLAN.md` §11. That is not a
+#: re-tuning under §6.4: no confirmatory run exists (§6.6), the correction
+#: moves the number *away* from the study's favour by claiming less power, and
+#: it reconciles the plan with itself rather than with any observed result.
 MDE_MULTIPLIERS: dict[tuple[str, str], float] = {
     ('paired', 'nominal'): 1.00,
     ('paired', 'holm8'): 1.54,
-    ('unpaired', 'nominal'): 1.39,
-    ('unpaired', 'holm8'): 1.87,
+    ('unpaired', 'nominal'): 1.41,
+    ('unpaired', 'holm8'): 1.88,
 }
 
-#: Where the multipliers came from, printed with the power table.
+#: Where the multipliers came from, printed with the power table. Rewritten by
+#: `verify_mde_against_statlib` once that verification has actually run.
 MDE_SOURCE = 'ANALYSIS_PLAN.md §6.2 (pre-registered, transcribed here)'
 
+#: The planned confirmatory n, read from the registry's CONFIRM block. §6.2's
+#: multipliers are stated at that n, so a verification has to be run there.
+PLANNED_N: int = len(registry.SEED_BLOCKS['CONFIRM'])
 
-def _adopt_statlib_mde() -> None:
-    """Prefer `statlib`'s MDE table when that module exists, but verify it.
+#: Tolerance for the statlib comparison, and where the number comes from.
+#: Two terms, both measured rather than picked:
+#:
+#: * §6.2 quotes its multipliers to two decimals, so the transcription above
+#:   can sit up to 0.005 from the value `statlib` computes through rounding
+#:   alone;
+#: * `statlib`'s MDE is a 20,000-replicate power simulation. Re-running
+#:   `mde_signflip` and `mde_mann_whitney` at n=10 under eight different RNG
+#:   seeds gives across-seed SDs of 0.0029, 0.0032, 0.0065 and 0.0063, so the
+#:   estimator's own Monte Carlo error is about 0.006 on its worst row.
+#:
+#: 0.005 + 0.006 is 0.011 and the tolerance is set just below that, at 0.01, so
+#: it absorbs rounding and roughly one Monte Carlo SD and nothing more. The
+#: predecessor value was 0.02, which was the smallest round number that let the
+#: unpaired nominal row through at abs_diff 0.0164 -- a tolerance chosen to
+#: pass, sized around the one disagreement it had to hide. That disagreement
+#: was real and is fixed at its source in the plan (see `MDE_MULTIPLIERS`);
+#: with the plan corrected the largest remaining gap is 0.0036, well inside
+#: this bound, so the bound is not carrying any disagreement.
+MDE_AGREEMENT_TOLERANCE = 0.01
 
-    `statlib.py` derives the multipliers from the exact null distribution, so it
-    is the better source than a transcription. It is imported softly because
-    this module must run without it, and the values are checked against the
-    pre-registered ones rather than trusted: `ANALYSIS_PLAN.md` §6.4 forbids
-    re-tuning the power table after seeing results, so a statlib table that
-    disagreed with §6.2 would be a plan violation arriving through an import.
-    A disagreement therefore keeps the pre-registered numbers and says so.
+#: Filled in by `verify_mde_against_statlib`, which, unlike its predecessor,
+#: runs.
+MDE_VERIFICATION: dict[str, Any] = {
+    'ran': False, 'rows': [], 'agree': None,
+    'note': 'not run in this invocation'}
+
+
+def verify_mde_against_statlib(n: int = PLANNED_N) -> dict:
+    """Recompute §6.2's multipliers with `statlib` and check them, for real.
+
+    The function this replaces looked for a `statlib.MDE_MULTIPLIERS` dict.
+    `statlib` has never exported one, so that function returned at its
+    `isinstance` check on every invocation and the safeguard its own docstring
+    described ("the values are checked against the pre-registered ones rather
+    than trusted") never executed once. The check now calls the functions
+    `statlib` does expose, `mde_signflip` and `mde_mann_whitney`, at the
+    planned n and at both alphas.
+
+    The pre-registered numbers stand whatever comes back: `ANALYSIS_PLAN.md`
+    §6.4 forbids re-tuning the power table after seeing results, so a
+    disagreement is reported and never adopted. That is the point of checking
+    rather than importing.
     """
-    global MDE_SOURCE
+    global MDE_SOURCE, MDE_VERIFICATION
     try:
         from experiments import statlib          # type: ignore  # noqa: PLC0415
-    except Exception:                            # noqa: BLE001
-        return
-    table_ = getattr(statlib, 'MDE_MULTIPLIERS', None)
-    if not isinstance(table_, dict):
-        return
-    disagree = []
-    for key, planned in MDE_MULTIPLIERS.items():
-        got = table_.get(key)
-        if got is None:
-            disagree.append(f'{key}: absent from statlib')
-        elif abs(float(got) - planned) > 0.01:
-            disagree.append(f'{key}: statlib {float(got):.3f} vs '
-                            f'pre-registered {planned:.3f}')
-    if disagree:
-        MDE_SOURCE = ('ANALYSIS_PLAN.md §6.2 (pre-registered). statlib.py '
-                      'disagrees and was NOT adopted: ' + '; '.join(disagree)
-                      + '. ANALYSIS_PLAN.md §6.4 forbids re-tuning the power '
-                        'table, so the pre-registered values stand and the '
-                        'disagreement is reported')
-        return
-    MDE_MULTIPLIERS.update({k: float(v) for k, v in table_.items()
-                            if k in MDE_MULTIPLIERS})
-    MDE_SOURCE = ('statlib.MDE_MULTIPLIERS, verified equal to '
-                  'ANALYSIS_PLAN.md §6.2')
-
-
-_adopt_statlib_mde()
+    except Exception as exc:                     # noqa: BLE001
+        MDE_VERIFICATION = {
+            'ran': False, 'rows': [], 'agree': None,
+            'note': f'statlib.py could not be imported ({exc}); the '
+                    'pre-registered multipliers stand unverified'}
+        return MDE_VERIFICATION
+    fns = {'paired': getattr(statlib, 'mde_signflip', None),
+           'unpaired': getattr(statlib, 'mde_mann_whitney', None)}
+    absent = sorted(k for k, v in fns.items() if not callable(v))
+    if absent:
+        MDE_VERIFICATION = {
+            'ran': False, 'rows': [], 'agree': None,
+            'note': f'statlib.py exposes no MDE function for {absent}; the '
+                    'pre-registered multipliers stand unverified'}
+        return MDE_VERIFICATION
+    alphas = {'nominal': ALPHA, 'holm8': ALPHA_STRICTEST}
+    rows: list[dict[str, Any]] = []
+    for (test, level), planned in MDE_MULTIPLIERS.items():
+        try:
+            got = float(fns[test](n, alpha=alphas[level]))
+        except Exception as exc:                 # noqa: BLE001
+            rows.append({'test': test, 'alpha_level': level, 'n': n,
+                         'pre_registered': planned, 'statlib': None,
+                         'abs_diff': None, 'agree': False,
+                         'note': f'statlib raised {exc.__class__.__name__}'})
+            continue
+        diff = abs(got - planned)
+        rows.append({'test': test, 'alpha_level': level, 'n': n,
+                     'pre_registered': planned, 'statlib': got,
+                     'abs_diff': diff,
+                     'agree': bool(diff <= MDE_AGREEMENT_TOLERANCE),
+                     'note': ''})
+    agree = all(r['agree'] for r in rows)
+    if agree:
+        MDE_SOURCE = (f'ANALYSIS_PLAN.md §6.2 (pre-registered), re-derived at '
+                      f'n={n} by statlib and agreeing to within '
+                      f'{MDE_AGREEMENT_TOLERANCE}')
+    else:
+        bad = '; '.join(
+            '{}/{}: statlib {} vs pre-registered {:.3f}'.format(
+                r['test'], r['alpha_level'],
+                'n/a' if r['statlib'] is None else f'{r["statlib"]:.3f}',
+                r['pre_registered'])
+            for r in rows if not r['agree'])
+        MDE_SOURCE = (
+            'ANALYSIS_PLAN.md §6.2 (pre-registered). statlib DISAGREES and was '
+            f'NOT adopted: {bad}. §6.4 forbids re-tuning the power table after '
+            'seeing results, so the pre-registered values stand and the '
+            'disagreement is reported')
+    MDE_VERIFICATION = {'ran': True, 'rows': rows, 'agree': agree,
+                        'note': MDE_SOURCE, 'n': n}
+    return MDE_VERIFICATION
 
 #: `ANALYSIS_PLAN.md` §6.3, the planning inputs. Reported next to the observed
 #: SDs, per the §6.4 update rule, so the reader can see whether the pilot's
@@ -265,10 +380,22 @@ METRIC_ROLES: dict[str, str] = {
     'grad_norm_head': MECHANISM,
     'grad_norm_global': MECHANISM,
     'q_mean': MECHANISM,
+    'q_max': MECHANISM,
     'td_error_abs': MECHANISM,
     'cka_transfer_vs_scratch': MECHANISM,
     'cka_drift': MECHANISM,
     'dead_unit_frac': MECHANISM,
+    # The plasticity signals of `DESIGN.md` §5.5. They are instrumented, they
+    # reach per_seed.csv, and this table used to omit them, so `metric_role`
+    # returned 'unclassified', `MECHANISM_COLUMNS` never held them and §9g
+    # never printed them. Feature-rank collapse and parameter-norm growth are
+    # the rival explanation `DESIGN.md` §10.9 leans on, so omitting them
+    # silently disarmed the section that exists to license or refuse a
+    # mechanism claim.
+    'effective_rank': MECHANISM,
+    'stable_rank': MECHANISM,
+    'param_norm_total': MECHANISM,
+    'param_norm_trunk': MECHANISM,
     # Bookkeeping -- identity and intensity columns, not outcomes.
     'transferred_param_fraction': BOOKKEEPING,
     'reinitialised_layer_count': BOOKKEEPING,
@@ -325,6 +452,32 @@ def require_confirmatory(name: str) -> None:
 def _clean(x: Iterable[float]) -> np.ndarray:
     a = np.asarray(list(x), dtype=float)
     return a[np.isfinite(a)]
+
+
+def correlation(kind: str, x: Sequence[float], y: Sequence[float]) -> float:
+    """Pearson or Spearman rho, with a constant input reported as absent.
+
+    SciPy emits a `ConstantInputWarning` on stderr and returns NaN when either
+    arm has no variation. That warning went to a stream nothing in this
+    pipeline captures, and the NaN then rendered as
+    `rho = +nan: reported whatever its value`, which reads as a measurement
+    rather than as the absence of one. The warning is silenced here because it
+    is not news, and every caller handles the NaN as "not estimable".
+    """
+    a, b = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    if len(a) != len(b) or len(a) < 3:
+        return float('nan')
+    if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
+        return float('nan')
+    if np.std(a) <= 0 or np.std(b) <= 0:
+        return float('nan')          # a constant arm: no correlation exists
+    fn = sps.pearsonr if kind == 'pearson' else sps.spearmanr
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        try:
+            return float(fn(a, b)[0])
+        except (ValueError, TypeError):
+            return float('nan')
 
 
 def all_signed_means(d: np.ndarray) -> np.ndarray:
@@ -420,7 +573,20 @@ def bca_interval(theta_hat: float, reps: np.ndarray, jack: np.ndarray,
     reps = reps[np.isfinite(reps)]
     if len(reps) < 100 or not np.isfinite(theta_hat):
         return {'lo': float('nan'), 'hi': float('nan'), 'method': 'none',
+                'degenerate': False,
                 'note': 'too few finite bootstrap replicates'}
+    # A bootstrap distribution with no spread carries no information about
+    # uncertainty, and the zero-width interval that comes out of it is not a
+    # precise estimate: it is the absence of one. Reported as such, because an
+    # interval of [+0.0000, +0.0000] used to satisfy the containment check and
+    # read as EQUIVALENT, and then as "every degradation is excluded at 95%",
+    # from an arm whose every run held the same constant.
+    if float(np.max(reps) - np.min(reps)) <= 0.0:
+        v = float(reps[0])
+        return {'lo': v, 'hi': v, 'method': 'degenerate', 'degenerate': True,
+                'note': 'every bootstrap replicate is identical, so the '
+                        'interval has zero width: the resampling unit has no '
+                        'variation and no interval is estimable'}
     lo_q, hi_q = 100 * alpha / 2, 100 * (1 - alpha / 2)
     pct = (float(np.percentile(reps, lo_q)), float(np.percentile(reps, hi_q)))
     frac = float(np.mean(reps < theta_hat))
@@ -429,6 +595,7 @@ def bca_interval(theta_hat: float, reps: np.ndarray, jack: np.ndarray,
     note = ''
     if frac <= 0.0 or frac >= 1.0 or len(jack) < 3:
         return {'lo': pct[0], 'hi': pct[1], 'method': 'percentile',
+                'degenerate': bool(pct[1] - pct[0] <= 0.0),
                 'note': 'BCa undefined (bias fraction at a boundary or too '
                         'few jackknife values); percentile interval reported'}
     z0 = float(sps.norm.ppf(frac))
@@ -443,6 +610,7 @@ def bca_interval(theta_hat: float, reps: np.ndarray, jack: np.ndarray,
         denom = 1.0 - a * (z0 + z)
         if abs(denom) < 1e-12:
             return {'lo': pct[0], 'hi': pct[1], 'method': 'percentile',
+                    'degenerate': bool(pct[1] - pct[0] <= 0.0),
                     'note': 'BCa denominator degenerate; percentile reported'}
         out.append(float(sps.norm.cdf(z0 + (z0 + z) / denom)))
     lo = float(np.percentile(reps, 100 * min(max(out[0], 1e-6), 1 - 1e-6)))
@@ -450,7 +618,7 @@ def bca_interval(theta_hat: float, reps: np.ndarray, jack: np.ndarray,
     if lo > hi:
         lo, hi = hi, lo
     return {'lo': lo, 'hi': hi, 'method': 'BCa', 'z0': z0, 'a': a,
-            'note': note}
+            'degenerate': bool(hi - lo <= 0.0), 'note': note}
 
 
 def hl_vec(samples: np.ndarray) -> np.ndarray:
@@ -492,7 +660,7 @@ def bootstrap_statistic(units: np.ndarray, stat: Callable[[np.ndarray], float],
     theta = float(stat(units))
     if n < MIN_N_FOR_INFERENCE:
         return {'estimate': theta, 'lo': float('nan'), 'hi': float('nan'),
-                'n': n, 'method': 'suppressed',
+                'n': n, 'method': 'suppressed', 'degenerate': False,
                 'note': f'n={n} < {MIN_N_FOR_INFERENCE}: no interval emitted '
                         f'(ANALYSIS_PLAN.md §9)'}
     if idx is None:
@@ -506,7 +674,7 @@ def bootstrap_statistic(units: np.ndarray, stat: Callable[[np.ndarray], float],
     ci = bca_interval(theta, reps, jack, alpha)
     return {'estimate': theta, 'lo': ci['lo'], 'hi': ci['hi'], 'n': n,
             'method': ci['method'], 'note': ci.get('note', ''),
-            'reps': reps}
+            'degenerate': bool(ci.get('degenerate')), 'reps': reps}
 
 
 def holm_adjust(pvals: dict[Any, float], m: int) -> dict[Any, float]:
@@ -559,25 +727,40 @@ def brunner_munzel(x: Sequence[float], y: Sequence[float],
         return th, math.sqrt(max(va / na + vb / nb, 0.0))
 
     theta, se = theta_se(x, y)
+    # The resampling scheme below is statlib.brunner_munzel's, draw for draw:
+    # one generator, the x index matrix taken whole and then the y one, the
+    # same studentisation and the same usability floor. This function used to
+    # draw xb and yb alternately inside a loop from a single stream, which is a
+    # different sequence of draws, so the two modules reported different
+    # intervals for identical input: two definitions of one number, which
+    # `load_per_seed`'s own docstring refuses.
+    # `verify_primitives_against_statlib` asserts the agreement on every
+    # invocation rather than trusting this comment.
     rng = np.random.default_rng(seed)
-    ts = []
-    for _ in range(n_boot):
-        xb = x[rng.integers(0, nx, nx)]
-        yb = y[rng.integers(0, ny, ny)]
-        tb, sb = theta_se(xb, yb)
-        if sb > 1e-12:
-            ts.append((tb - theta) / sb)
-    if se <= 1e-12 or len(ts) < 100:
-        return {'theta': theta, 'lo': float('nan'), 'hi': float('nan'),
-                'nx': nx, 'ny': ny, 'se': se,
-                'note': 'degenerate standard error (no overlap variation); '
-                        'no interval emitted'}
-    tq = np.percentile(np.asarray(ts), [100 * (1 - alpha / 2),
-                                        100 * alpha / 2])
-    lo = max(0.0, theta - tq[0] * se)
-    hi = min(1.0, theta - tq[1] * se)
-    return {'theta': theta, 'lo': float(lo), 'hi': float(hi), 'nx': nx,
-            'ny': ny, 'se': se, 'note': 'bootstrap-t'}
+    ix = rng.integers(0, nx, size=(int(n_boot), nx))
+    iy = rng.integers(0, ny, size=(int(n_boot), ny))
+    thetas = np.empty(int(n_boot), dtype=float)
+    ts = np.full(int(n_boot), np.nan, dtype=float)
+    for k in range(int(n_boot)):
+        tb, sb = theta_se(x[ix[k]], y[iy[k]])
+        thetas[k] = tb
+        if sb and np.isfinite(sb) and sb > 0:
+            ts[k] = (tb - theta) / sb
+    usable = np.isfinite(ts)
+    lo_q, hi_q = 100 * alpha / 2, 100 * (1 - alpha / 2)
+    if se > 0 and int(usable.sum()) >= max(50, int(n_boot) // 20):
+        lo = theta - float(np.percentile(ts[usable], hi_q)) * se
+        hi = theta - float(np.percentile(ts[usable], lo_q)) * se
+        method, note = 'bootstrap-t', 'bootstrap-t'
+    else:
+        lo = float(np.percentile(thetas, lo_q))
+        hi = float(np.percentile(thetas, hi_q))
+        method = 'percentile'
+        note = ('studentisation degenerate (se=0 or too few usable '
+                'resamples); percentile interval reported')
+    return {'theta': theta, 'lo': float(min(max(lo, 0.0), 1.0)),
+            'hi': float(min(max(hi, 0.0), 1.0)), 'nx': nx, 'ny': ny, 'se': se,
+            'method': method, 'note': note}
 
 
 def jonckheere_effect(groups: Sequence[Sequence[float]]) -> dict:
@@ -617,29 +800,49 @@ def clopper_pearson(k: int, n: int, alpha: float = ALPHA) -> tuple[float, float]
     return (lo, hi)
 
 
-def kaplan_meier(times: Sequence[float], events: Sequence[bool]) -> dict:
-    """Kaplan-Meier survivor function for right-censored event times.
+def kaplan_meier(times: Sequence[float], events: Sequence[bool],
+                 entry: Optional[Sequence[float]] = None) -> dict:
+    """Kaplan-Meier survivor function, with optional delayed entry.
 
     Censored observations contribute their time at risk and are never treated
     as events, which is the whole point: imputing the budget both biases the
     estimate and creates a tie mass that degrades every rank statistic
     downstream (`ANALYSIS_PLAN.md` §5).
+
+    `entry` implements the left truncation `ANALYSIS_PLAN.md` §5 asks for:
+    "Kaplan-Meier curves per arm, with delayed entry at the end of the freeze
+    window where a freeze is in force". A run whose trunk is frozen for its
+    first K updates is not at risk of reaching a threshold on a fine-tuned
+    trunk before then, and holding it in the risk set from time zero inflates
+    the denominator of every earlier increment. With `entry` supplied a unit
+    joins the risk set only at its entry time; with `entry` omitted the
+    everyone-from-zero behaviour is unchanged. This function had no
+    left-truncation support at all, and the omission was neither reported nor
+    recorded as a deviation.
+
+    A non-finite time cannot enter a curve, so such rows are counted into
+    `dropped_nonfinite` and reported by the caller rather than deleted in
+    silence.
     """
     t = np.asarray(list(times), dtype=float)
     e = np.asarray(list(events), dtype=bool)
-    keep = np.isfinite(t)
-    t, e = t[keep], e[keep]
+    v = (np.asarray(list(entry), dtype=float) if entry is not None
+         else np.zeros(len(t), dtype=float))
+    keep = np.isfinite(t) & np.isfinite(v)
+    dropped = int(len(t) - int(keep.sum()))
+    t, e, v = t[keep], e[keep], v[keep]
     n = len(t)
+    truncated = bool(entry is not None and np.any(v > 0))
     if n == 0:
-        return {'n': 0, 'events': 0, 'curve': [], 'median': None}
+        return {'n': 0, 'events': 0, 'curve': [], 'median': None,
+                'delayed_entry': truncated, 'dropped_nonfinite': dropped}
     order = np.argsort(t, kind='stable')
-    t, e = t[order], e[order]
+    t, e, v = t[order], e[order], v[order]
     curve = []
     surv = 1.0
-    at_risk = n
     i = 0
     while i < n:
-        ti = t[i]
+        ti = float(t[i])
         d = 0
         c = 0
         while i < n and t[i] == ti:
@@ -648,13 +851,16 @@ def kaplan_meier(times: Sequence[float], events: Sequence[bool]) -> dict:
             else:
                 c += 1
             i += 1
+        # At risk at ti: entered at or before ti and not yet out. With no entry
+        # times this is exactly the running count the previous version kept.
+        at_risk = int(np.sum((v <= ti) & (t >= ti)))
         if d > 0 and at_risk > 0:
             surv *= (1.0 - d / at_risk)
-        curve.append({'t': float(ti), 'at_risk': int(at_risk), 'events': d,
+        curve.append({'t': ti, 'at_risk': at_risk, 'events': d,
                       'censored': c, 'survival': float(surv)})
-        at_risk -= (d + c)
     median = next((row['t'] for row in curve if row['survival'] <= 0.5), None)
-    return {'n': n, 'events': int(e.sum()), 'curve': curve, 'median': median}
+    return {'n': n, 'events': int(e.sum()), 'curve': curve, 'median': median,
+            'delayed_entry': truncated, 'dropped_nonfinite': dropped}
 
 
 def logrank_statistic(t1, e1, t2, e2) -> dict:
@@ -692,6 +898,119 @@ def logrank_statistic(t1, e1, t2, e2) -> dict:
             'events': (int(e1.sum()), int(e2.sum())),
             'note': 'statistic only; no p-value emitted outside the '
                     'confirmatory family (ANALYSIS_PLAN.md §7)'}
+
+
+#: Filled in by `verify_primitives_against_statlib`, printed in §1 and, on a
+#: disagreement, entered in the deviations of §12.
+PRIMITIVE_AGREEMENT: dict[str, Any] = {
+    'ran': False, 'rows': [], 'agree': None,
+    'note': 'not run in this invocation'}
+
+#: Absolute tolerance for the statlib comparison. These are the same estimators
+#: on the same input, so anything above floating-point noise is a disagreement.
+PRIMITIVE_TOLERANCE = 1e-9
+
+
+def verify_primitives_against_statlib(n_boot: int = 2000) -> dict:
+    """Check every estimator here against `statlib`'s, on fixed input.
+
+    `statlib.py` holds the pre-registered estimators and has no ability to read
+    a run, which is what makes it the reference. This module keeps its own
+    copies for one reason: `bootstrap_statistic` evaluates its statistic 10,000
+    times per contrast over several dozen contrasts, and that is only tractable
+    on a vectorised path over a whole stack of resamples. Two implementations
+    of one estimator is exactly the situation `load_per_seed`'s docstring
+    refuses ("so that no number in the paper has two definitions"), so the
+    copies are not trusted: they are compared here, on inputs fixed in this
+    function, on every invocation. A disagreement is printed in §1 and entered
+    in the deviations of §12; it is never resolved silently in favour of the
+    local copy.
+
+    The comparison is deliberately on small, fixed vectors rather than on the
+    data: a check that varied with the input could pass on the data that
+    happened to be loaded and fail on the next tree.
+    """
+    global PRIMITIVE_AGREEMENT
+    try:
+        from experiments import statlib          # type: ignore  # noqa: PLC0415
+    except Exception as exc:                     # noqa: BLE001
+        PRIMITIVE_AGREEMENT = {
+            'ran': False, 'rows': [], 'agree': None,
+            'note': f'statlib.py could not be imported ({exc}); the '
+                    'estimators here stand unverified'}
+        return PRIMITIVE_AGREEMENT
+
+    d = np.array([0.30, -0.10, 0.50, 0.20, 0.40, -0.20, 0.60, 0.10, 0.05,
+                  0.25])
+    x = np.array([0.9, 0.4, 1.2, 0.7, 0.1, 0.8, 0.3])
+    y = np.array([0.2, -0.4, 0.6, 0.0, 0.5, -0.1, 0.4, 0.25, -0.3])
+    km_t = [1.0, 2.0, 3.0, 4.0, 5.0]
+    km_e = [True, False, True, False, True]
+    rows: list[dict[str, Any]] = []
+
+    def compare(name: str, ours: float, theirs: float,
+                tol: float = PRIMITIVE_TOLERANCE) -> None:
+        diff = (abs(float(ours) - float(theirs))
+                if np.isfinite(ours) and np.isfinite(theirs) else float('nan'))
+        rows.append({'primitive': name, 'here': float(ours),
+                     'statlib': float(theirs), 'abs_diff': diff,
+                     'agree': bool(np.isfinite(diff) and diff <= tol)})
+
+    try:
+        compare('sign_flip_test p', sign_flip_test(d)['p'],
+                statlib.sign_flip_test(d)['p_two_sided'])
+        compare('hodges_lehmann (paired)', hodges_lehmann_paired(d),
+                float(statlib.hodges_lehmann(d)))
+        compare('hodges_lehmann (two-sample)',
+                hodges_lehmann_two_sample(x, y),
+                float(statlib.hodges_lehmann(x, y)))
+        cp_here = clopper_pearson(3, 10)
+        cp_there = tuple(statlib.clopper_pearson(3, 10))
+        compare('clopper_pearson lo', cp_here[0], cp_there[0])
+        compare('clopper_pearson hi', cp_here[1], cp_there[1])
+        holm_here = holm_adjust({0: 0.001, 1: 0.02, 2: 0.04}, 3)
+        holm_there = statlib.holm([0.001, 0.02, 0.04])
+        for i in range(3):
+            compare(f'holm[{i}]', holm_here[i], float(holm_there[i]))
+        bm_here = brunner_munzel(x, y, n_boot=n_boot, seed=BOOT_SEED)
+        bm_there = statlib.brunner_munzel(x, y, n_boot=n_boot, seed=BOOT_SEED)
+        compare('brunner_munzel theta', bm_here['theta'], bm_there['theta'])
+        compare('brunner_munzel se', bm_here['se'], bm_there['se'])
+        compare('brunner_munzel ci_lo', bm_here['lo'], bm_there['ci_lo'])
+        compare('brunner_munzel ci_hi', bm_here['hi'], bm_there['ci_hi'])
+        km_here = kaplan_meier(km_t, km_e)
+        km_there = statlib.kaplan_meier(km_t, [int(v) for v in km_e])
+        surv_there = dict(zip([float(v) for v in km_there['time']],
+                              [float(v) for v in km_there['survival']]))
+        for row in km_here['curve']:
+            if row['t'] in surv_there:
+                compare(f'kaplan_meier S({row["t"]:.0f})', row['survival'],
+                        surv_there[row['t']])
+        compare('kaplan_meier median', float(km_here['median']),
+                float(km_there['median']))
+        jt_here = jonckheere_effect([[1.0, 2.0, 3.0], [3.0, 4.0, 5.0],
+                                     [5.0, 6.0, 7.0]])
+        jt_there = statlib.jonckheere_terpstra(
+            [[1.0, 2.0, 3.0], [3.0, 4.0, 5.0], [5.0, 6.0, 7.0]],
+            n_perm=200, n_boot=200)
+        compare('jonckheere J', jt_here['J'], float(jt_there['J']))
+    except Exception as exc:                     # noqa: BLE001
+        PRIMITIVE_AGREEMENT = {
+            'ran': False, 'rows': rows, 'agree': False,
+            'note': f'the comparison itself raised {exc.__class__.__name__}: '
+                    f'{exc}. Treat the estimators here as unverified'}
+        return PRIMITIVE_AGREEMENT
+
+    bad = [r for r in rows if not r['agree']]
+    PRIMITIVE_AGREEMENT = {
+        'ran': True, 'rows': rows, 'agree': not bad,
+        'note': ('every estimator here reproduces statlib.py to within '
+                 f'{PRIMITIVE_TOLERANCE:g}'
+                 if not bad else
+                 'DISAGREEMENT with statlib.py: '
+                 + '; '.join(f'{r["primitive"]} {r["here"]:.6f} vs '
+                             f'{r["statlib"]:.6f}' for r in bad))}
+    return PRIMITIVE_AGREEMENT
 
 
 # ===========================================================================
@@ -826,6 +1145,46 @@ REQUIRED_COLUMNS: tuple[str, ...] = (
     'transfer_set', 'input_policy', 'head_policy', 'freeze_group',
     'freeze_updates', 'permute_kind', 'final_score', 'auc_score', 'plan_hash')
 
+#: The columns that carry a machine-checked invariant of `DESIGN.md` §8.4. An
+#: unparseable value in any of them is a refusal, not a `None`.
+BOOLEAN_COLUMNS: tuple[str, ...] = (
+    'source_valid', 'metrics_contiguous', 'freeze_verified', 'git_dirty')
+
+#: The tokens `aggregate.py` can legitimately write for a boolean. Anything
+#: else is schema drift and is refused by `parse_boolean`.
+_TRUE_TOKENS = frozenset({'true', '1', '1.0'})
+_FALSE_TOKENS = frozenset({'false', '0', '0.0'})
+
+
+def parse_boolean(value: Any) -> tuple[bool, Optional[bool]]:
+    """Parse one invariant flag. Returns (parseable, value-or-None).
+
+    An empty cell is a genuine absence (a scratch run has no source verdict) and
+    parses to `None`. Any other unrecognised token is *not* absence: it is a
+    schema change, and mapping it to `None` is what let a file whose flags all
+    read "no" be reported as a file where every invariant passed.
+    """
+    if value is None:
+        return True, None
+    if isinstance(value, (bool, np.bool_)):
+        return True, bool(value)
+    if isinstance(value, (int, np.integer)) and value in (0, 1):
+        return True, bool(value)
+    if isinstance(value, (float, np.floating)):
+        if not np.isfinite(value):
+            return True, None
+        if float(value) in (0.0, 1.0):
+            return True, bool(value)
+        return False, None
+    text = str(value).strip()
+    if text == '' or text.lower() in ('nan', 'none'):
+        return True, None
+    if text.lower() in _TRUE_TOKENS:
+        return True, True
+    if text.lower() in _FALSE_TOKENS:
+        return True, False
+    return False, None
+
 #: Cell order from the registry, so report rows follow the design's factorial
 #: order rather than alphabetical accident.
 CELL_ORDER: tuple[str, ...] = tuple(f'{a}-{r}' for a, r in registry.CELLS)
@@ -880,6 +1239,26 @@ class Options:
     n_boot: int
     boot_seed: int
     json_out: Optional[str]
+    #: Where the run tree sits, for the `ANALYSIS_PLAN.md` §10.1 audit gate.
+    audit_root: str = ''
+    #: §10.1's "explicit override that is stamped into the output".
+    override_audit: bool = False
+    #: Passed through to `audit.py`, exactly as `report.py` passes them: the
+    #: seed set the runs were launched at, and the launch-level overrides in
+    #: force. Without them a one-seed validation tree fails SEED COMPLETENESS,
+    #: which is a true statement about the design and not about this analysis.
+    audit_seeds: Optional[str] = None
+    audit_overrides: tuple[str, ...] = ()
+    #: Whether to re-derive the §6.2 MDE multipliers with statlib and check
+    #: them. On by default: the check that never ran is the defect this
+    #: replaces.
+    verify_mde: bool = True
+    #: The TUNE-block exclusion, carried so §2c can report it. The rows are
+    #: removed in `main` before any section runs, so a section testing for
+    #: them can only report zero (ANALYSIS_PLAN.md §10.2 requires exclusions
+    #: reported, and this one was visible only in the JSON).
+    tune_runs_excluded: int = 0
+    tune_seeds_excluded: tuple[int, ...] = ()
 
 
 def load_per_seed(path: str, ledger: Ledger) -> pd.DataFrame:
@@ -896,12 +1275,32 @@ def load_per_seed(path: str, ledger: Ledger) -> pd.DataFrame:
             f'{path} is missing pinned columns {missing}. The per-seed schema '
             'is a contract between aggregate.py and this module; refusing to '
             'guess a substitute.')
-    truth = {True: True, False: False, 'True': True, 'False': False,
-             'true': True, 'false': False, 1: True, 0: False}
-    for col in ('source_valid', 'metrics_contiguous', 'freeze_verified',
-                'git_dirty') + tuple(f'censored_{t}' for t, _ in THRESHOLD_LEVELS):
-        if col in df.columns:
-            df[col] = df[col].map(lambda v: truth.get(v, None))
+    bad: list[str] = []
+    for col in BOOLEAN_COLUMNS + tuple(f'censored_{tag}'
+                                       for tag, _ in THRESHOLD_LEVELS):
+        if col not in df.columns:
+            continue
+        parsed = []
+        for v in df[col]:
+            ok, val = parse_boolean(v)
+            if not ok:
+                bad.append(f'{col}={v!r}')
+            parsed.append(val)
+        df[col] = pd.Series(parsed, index=df.index, dtype=object)
+    if bad:
+        seen = sorted(set(bad))
+        raise ValueError(
+            f'{path} carries {len(bad)} unparseable boolean value(s) in its '
+            f'machine-checked invariant columns: {seen[:10]}'
+            + (' ...' if len(seen) > 10 else '')
+            + '. The previous version mapped an unrecognised token to None, '
+              'and every consumer then failed OPEN: a file whose '
+              'source_valid, metrics_contiguous and freeze_verified all read '
+              '"no" reported "0 rejected", "440 ok, 0 failing" and a clean '
+              'confirmatory family, with every DESIGN.md §8.4 invariant '
+              'reading PASS when in fact every run had failed. Column '
+              'presence was checked and value parseability was not. Refusing '
+              'to guess what these mean.')
     absent = [c for c in ('transferred_param_fraction', 'jumpstart_score',
                           'probe_jumpstart_score', 'within_run_sd',
                           'convergence_slope', 'source_final_score')
@@ -990,28 +1389,208 @@ def scratch_arm(df: pd.DataFrame, opts: Options) -> pd.DataFrame:
                                   env=opts.target_env))
 
 
+def arm_by_seed(d: pd.DataFrame, metric: str) -> dict:
+    """One arm as seed -> value, with duplicates and gaps kept separate.
+
+    Three outcomes are distinguished, because collapsing them is how a seed
+    disappears:
+
+    * a seed with exactly one row and a finite value is usable;
+    * a seed with more than one row is **ambiguous**, not resolvable by taking
+      one of them. The previous version built this map with
+      `out[int(r['seed'])] = float(v)` inside `iterrows`, so a duplicated
+      (arm, seed) silently kept whichever row pandas visited last: one injected
+      row with `final_score = 99` moved a cell's mean delta by +9.77 and
+      shifted every other member's Holm-adjusted p, while the completeness
+      table still read n=10 and reported no unpaired seed at all;
+    * a seed whose row exists but whose metric is absent is a **gap**. It is
+      reported rather than skipped: when the metric was absent in *both* arms
+      the seed used to vanish from `common`, `only_a` and `only_b` alike, so n
+      shrank with nothing said and the incomplete-arm refusal never fired.
+    """
+    values: dict[int, float] = {}
+    seen: dict[int, list[float]] = {}
+    rows: dict[int, int] = {}
+    finite: dict[int, int] = {}
+    for _, r in d.iterrows():
+        s = int(r['seed'])
+        rows[s] = rows.get(s, 0) + 1
+        v = r.get(metric)
+        if pd.notna(v):
+            finite[s] = finite.get(s, 0) + 1
+            seen.setdefault(s, []).append(float(v))
+            values.setdefault(s, float(v))
+    duplicates = sorted(s for s, k in rows.items() if k > 1)
+    # Whether the duplicated rows agree on the metric matters to the reader:
+    # equal values are one run recorded twice (a bookkeeping fault the audit's
+    # CONFIG/DIGEST CONSISTENCY check owns), unequal values are two different
+    # runs claiming one identity. Neither is resolvable here, and the arm is
+    # ambiguous either way, but the two want different fixes.
+    conflicting = sorted(
+        s for s in duplicates
+        if len(set(round(v, 12) for v in seen.get(s, []))) > 1)
+    gaps = sorted(s for s in rows if finite.get(s, 0) == 0)
+    usable = {s: v for s, v in values.items() if s not in duplicates}
+    return {'values': usable, 'seeds_present': sorted(rows),
+            'duplicates': duplicates, 'conflicting': conflicting,
+            'metric_missing': gaps, 'n_rows': int(len(d))}
+
+
+def arm_problems(info: dict, metric: str, who: str = 'arm') -> list[str]:
+    """Every reason ONE arm is not a clean one-value-per-seed sample, as prose.
+
+    Split out of `pairing_problems` so that a section with a single arm --
+    §3's descriptives, §3b's headroom denominator, §4's slope gate, §7's
+    per-condition vectors -- states the ambiguity in the same words as §5
+    rather than inventing its own or, as four of them did, saying nothing at
+    all and reporting a number computed over rows.
+    """
+    out: list[str] = []
+    dup, clash = info['duplicates'], info['conflicting']
+    if dup:
+        if clash:
+            kind = (f'seed(s) {clash} carry DIFFERENT {metric} values across '
+                    'those rows, so two different runs claim one identity')
+        else:
+            kind = (f'the rows agree on {metric}, so this is one run recorded '
+                    'more than once (audit.py owns that as a CONFIG/DIGEST '
+                    'CONSISTENCY fault)')
+        out.append(
+            f'the {who} has more than one row for seed(s) {dup}: {kind}. '
+            f'The arm is ambiguous and those seeds are excluded from the '
+            f'sample rather than resolved by taking one row '
+            f'(DESIGN.md §8.4)')
+    return out
+
+
+def seed_vector(d: pd.DataFrame, metric: str, who: str = 'arm') -> dict:
+    """THE per-seed reduction of one arm: one value per seed, or a refusal.
+
+    Every per-seed aggregation in this module goes through here or through
+    `paired_by_seed`, which is the two-arm form of the same thing. Both are
+    built on `arm_by_seed`, so there is exactly one place where rows become
+    seeds and exactly one rule for what happens when they cannot.
+
+    What this is defending against: `section_descriptives`, §3b, §4 and
+    `section_controls` each used to do their own reduction. Three of them took
+    `len(_clean(g[metric]))` as n, which is a ROW count, so an arm holding two
+    rows for one seed reported n=6 from 3 seeds, an SD that shrank towards
+    zero as rows were duplicated, and a "seed-level bootstrap" CI that
+    resampled rows. The fourth, `section_controls`, wrote
+    `vals[int(r['seed'])] = float(v)` inside `iterrows` and kept whichever row
+    pandas visited last, so its contrasts depended on the order of the CSV:
+    reading `runs_demo/per_seed.csv` forwards and then row-reversed -- the
+    same rows, the same multiset -- moved 32 contrast rows and flipped the
+    sign and the printed verdict of C1-C0, the confirmatory estimand, in two
+    cells.
+
+    A duplicated (arm, seed) is therefore a **refusal**, not a resolution:
+    `refused` is True, `reason` says which seeds and whether the rows agree,
+    and the caller emits no estimate, exactly as §5 does. Seeds whose metric
+    is absent are reported in `metric_missing` and are simply not observations
+    of this metric; they do not make the arm ambiguous.
+    """
+    info = arm_by_seed(d, metric)
+    problems = arm_problems(info, metric, who)
+    seeds = sorted(info['values'])
+    return {'seeds': seeds,
+            'values': np.array([info['values'][s] for s in seeds],
+                               dtype=float),
+            'n': len(seeds), 'n_rows': info['n_rows'],
+            'seeds_present': info['seeds_present'],
+            'duplicates': info['duplicates'],
+            'conflicting': info['conflicting'],
+            'metric_missing': info['metric_missing'],
+            'problems': problems,
+            'refused': bool(info['duplicates']),
+            'reason': '; '.join(problems) or None}
+
+
 def paired_by_seed(a: pd.DataFrame, b: pd.DataFrame, metric: str) -> dict:
     """Match two arms on seed. Reports incompleteness, never drops silently.
 
     `DESIGN.md` §1: "One seed was dropped from one arm with no stated rule."
-    Seeds present in one arm only are returned and surface in the report.
+    Seeds present in one arm only are returned and surface in the report, and
+    so now are duplicated (arm, seed) rows and seeds whose metric is missing on
+    both sides. `n_a` and `n_b` count distinct usable seeds; `rows_a` and
+    `rows_b` count rows, so the two can be compared and a collapse is visible
+    instead of being absorbed by a field named for one and holding the other.
     """
-    def by_seed(d: pd.DataFrame) -> dict[int, float]:
-        out: dict[int, float] = {}
-        for _, r in d.iterrows():
-            v = r.get(metric)
-            if pd.notna(v):
-                out[int(r['seed'])] = float(v)
-        return out
-
-    xa, xb = by_seed(a), by_seed(b)
+    ia, ib = arm_by_seed(a, metric), arm_by_seed(b, metric)
+    xa, xb = ia['values'], ib['values']
     common = sorted(set(xa) & set(xb))
+    present_a, present_b = set(ia['seeds_present']), set(ib['seeds_present'])
+    gaps = sorted((set(ia['metric_missing']) | set(ib['metric_missing']))
+                  & (present_a & present_b))
     return {'seeds': common,
             'a': np.array([xa[s] for s in common], dtype=float),
             'b': np.array([xb[s] for s in common], dtype=float),
-            'only_a': sorted(set(xa) - set(xb)),
-            'only_b': sorted(set(xb) - set(xa)),
-            'n_a': len(xa), 'n_b': len(xb)}
+            'only_a': sorted(present_a - present_b),
+            'only_b': sorted(present_b - present_a),
+            'n_a': len(xa), 'n_b': len(xb),
+            'rows_a': ia['n_rows'], 'rows_b': ib['n_rows'],
+            'dup_a': ia['duplicates'], 'dup_b': ib['duplicates'],
+            'conflicting_a': ia['conflicting'],
+            'conflicting_b': ib['conflicting'],
+            'metric_missing': gaps}
+
+
+def pairing_problems(pair: dict, metric: str, name_a: str = 'transfer',
+                     name_b: str = 'scratch') -> list[str]:
+    """Every reason this pairing is not a clean matched sample, as prose.
+
+    Returned as a list so a caller can print them, put them in the ledger, or
+    suppress on them; an empty list means the two arms match seed for seed with
+    a value on both sides.
+    """
+    out: list[str] = []
+    for who, dup, clash in ((name_a, pair['dup_a'], pair['conflicting_a']),
+                            (name_b, pair['dup_b'], pair['conflicting_b'])):
+        # The single-arm wording lives in `arm_problems` so that §3, §3b, §4
+        # and §7 say the same thing about the same fault as §5 does.
+        out.extend(arm_problems({'duplicates': dup, 'conflicting': clash},
+                                metric, f'{who} arm'))
+    if pair['metric_missing']:
+        out.append(
+            f'seed(s) {pair["metric_missing"]} have a run in both arms but no '
+            f'{metric} value, so they cannot enter the paired sample. They are '
+            f'named here because a seed absent from both arms used to vanish '
+            f'from the count entirely')
+    return out
+
+
+def incomplete_arm_reason(pair: dict, name_a: str = 'transfer',
+                          name_b: str = 'scratch') -> Optional[str]:
+    """§5's partial-arm refusal, in §5's words, for every section that needs it.
+
+    `ANALYSIS_PLAN.md` §8 forbids "dropping a seed, for any reason, after it
+    has run", and `DESIGN.md` §8.4 refuses a partial arm. §5 obeyed both. §7,
+    §9b, §9e and §9j took the intersection instead and analysed whatever
+    survived, so the same estimand §5 had just refused as an incomplete arm
+    came back one section later with an interval and a directional sentence
+    attached. Returns None when the two arms match seed for seed.
+    """
+    if not pair['only_a'] and not pair['only_b']:
+        return None
+    return (f'incomplete arm: seeds {pair["only_a"]} appear only in '
+            f'{name_a}, {pair["only_b"]} only in {name_b}. A partial arm is '
+            f'refused (DESIGN.md §8.4); no seed is dropped to rescue the '
+            f'estimate (ANALYSIS_PLAN.md §8)')
+
+
+def paired_refusal(pair: dict, metric: str, name_a: str = 'transfer',
+                   name_b: str = 'scratch') -> Optional[str]:
+    """The one reason a paired estimate cannot be computed, or None.
+
+    Duplicates first, then incompleteness, in the order §5 tests them, so a
+    section that refuses on this string refuses on the same ground and with
+    the same words as the confirmatory family does.
+    """
+    problems = pairing_problems(pair, metric, name_a, name_b)
+    dup = [p for p in problems if 'more than one row' in p]
+    if dup:
+        return '; '.join(dup)
+    return incomplete_arm_reason(pair, name_a, name_b)
 
 
 def transferred_fraction(df: pd.DataFrame) -> float:
@@ -1077,6 +1656,93 @@ def h2(title: str) -> None:
 #    cannot drift apart.
 # ===========================================================================
 
+def section_audit(opts: Options, ledger: Ledger) -> dict:
+    """§10.1 -- the audit result, and the gate that hangs off it.
+
+    `ANALYSIS_PLAN.md` §10 item 1: "Audit result. If the audit fails, nothing
+    below is emitted without an explicit override that is stamped into the
+    output." This module used to have no audit gate at all: it never imported
+    `audit.py`, substituted a provenance section for the audit result, and then
+    described itself as emitting the twelve sections of §10 in order. A reader
+    of the output could not tell an audited tree from an unaudited one.
+
+    The audit reads the run tree, not the per-seed table, so it can only run
+    when a tree sits beside the table. When it cannot run, that is said and
+    recorded as a deviation; a missing audit is never reported as a passing
+    one, which is the failure mode the gate exists to prevent.
+    """
+    h1('1a. AUDIT GATE (ANALYSIS_PLAN.md §10.1)')
+    root = opts.audit_root or os.path.dirname(
+        os.path.abspath(opts.per_seed)) or '.'
+    out: dict[str, Any] = {'root': root, 'ran': False, 'ok': None,
+                           'override': bool(opts.override_audit),
+                           'checks': []}
+    print(f'  run tree            : {root}')
+    if not os.path.isdir(root):
+        out['note'] = f'{root} is not a directory: the audit cannot run'
+        print(f'  NOT RUN: {out["note"]}.')
+        ledger.deviations.append(
+            'ANALYSIS_PLAN.md §10.1 audit gate not evaluated: '
+            + out['note'])
+        return out
+    try:
+        from experiments import audit as audit_mod   # noqa: PLC0415
+        ok, rep = audit_mod.audit_ok(
+            root, experiments=opts.experiments, seeds=opts.audit_seeds,
+            overrides=audit_mod.parse_overrides(opts.audit_overrides or None))
+    except Exception as exc:                          # noqa: BLE001
+        out['note'] = f'{exc.__class__.__name__}: {exc}'
+        print(f'  NOT RUN: audit.py raised {out["note"]}.')
+        ledger.deviations.append(
+            f'ANALYSIS_PLAN.md §10.1 audit gate not evaluated: audit.py '
+            f'raised {out["note"]}')
+        return out
+    if not rep.get('runs_discovered'):
+        out['note'] = (f'no run directories under {root}, so there is nothing '
+                       'to audit. The per-seed table was analysed without an '
+                       'audit')
+        print(f'  NOT RUN: {out["note"]}.')
+        ledger.deviations.append(
+            'ANALYSIS_PLAN.md §10.1 audit gate not evaluated: '
+            + out['note'])
+        return out
+    checks = [{'check': c.get('name'), 'status': c.get('status'),
+               'findings': len(c.get('findings') or [])}
+              for c in rep.get('checks', [])]
+    print(f'  runs discovered     : {rep.get("runs_discovered")}')
+    print(f'  runs in scope       : {rep.get("runs_in_scope")}')
+    print(f'  plan hash           : {rep.get("plan_hash")}')
+    print()
+    print(table(checks, ('check', 'status', 'findings')))
+    out.update({'ran': True, 'ok': bool(ok), 'checks': checks,
+                'errors': rep.get('errors'), 'warnings': rep.get('warnings'),
+                'runs_discovered': rep.get('runs_discovered')})
+    failing = [c['check'] for c in checks if c['status'] == 'FAIL']
+    if ok:
+        print()
+        print('  AUDIT PASSED: every check in audit.py is green on this tree.')
+        return out
+    print()
+    print(f'  AUDIT FAILED: {rep.get("errors")} error(s), '
+          f'{rep.get("warnings")} warning(s) on {", ".join(failing)}.')
+    if opts.override_audit:
+        print('  ' + '*' * 70)
+        print('  OVERRIDE IN FORCE: --allow-audit-failure was passed, so '
+              'the sections below are')
+        print('  emitted over a FAILED audit. ANALYSIS_PLAN.md §10.1 permits '
+              'that only with an')
+        print('  explicit override stamped into the output; this is the '
+              'stamp, and it is also')
+        print('  written into the JSON and into §12. Every number below '
+              'inherits it.')
+        print('  ' + '*' * 70)
+        ledger.deviations.append(
+            f'--allow-audit-failure in force over a FAILED audit ({failing}): '
+            'ANALYSIS_PLAN.md §10.1 requires the override stamped into the '
+            'output, and every number in this report carries it')
+    return out
+
+
 def section_provenance(df: pd.DataFrame, opts: Options,
                        ledger: Ledger) -> dict:
     """§10.1 -- provenance and the pre-registration hash.
@@ -1131,11 +1797,92 @@ def section_provenance(df: pd.DataFrame, opts: Options,
     else:
         print()
         print('  Plan hash matches: the pre-registration covers this analysis.')
+
+    prim = verify_primitives_against_statlib()
+    print()
+    print('  Estimator cross-check against statlib.py (the module that holds '
+          'the')
+    print('  pre-registered estimators and cannot read a run):')
+    if not prim['ran']:
+        print(f'    NOT RUN: {prim["note"]}')
+        ledger.deviations.append(
+            f'the estimators in stats.py were not checked against statlib.py: '
+            f'{prim["note"]}')
+    elif prim['agree']:
+        print(f'    {len(prim["rows"])} estimator value(s) checked; '
+              f'{prim["note"]}.')
+    else:
+        print(f'    *** {prim["note"]} ***')
+        print('    Two implementations of one estimator means one number in '
+              'the paper has two')
+        print('    definitions, which is exactly what load_per_seed refuses '
+              'for the per-run')
+        print('    scalars. Fix the disagreement before quoting anything '
+              'below.')
+        ledger.deviations.append(
+            f'stats.py and statlib.py disagree numerically: {prim["note"]}')
     return {'plan_hash_current': current, 'design_hash': design,
             'plan_hash_in_data': hashes,
             'table_digest': file_digest(opts.per_seed),
             'rows': int(len(df)), 'exploratory': exploratory,
-            'n_boot': opts.n_boot, 'boot_seed': opts.boot_seed}
+            'n_boot': opts.n_boot, 'boot_seed': opts.boot_seed,
+            'statlib_agreement': prim}
+
+
+def section_reference_returns(df: pd.DataFrame, opts: Options,
+                              ledger: Ledger) -> dict:
+    """§10.3 -- the reference returns and the normalisation used.
+
+    `ANALYSIS_PLAN.md` §10 lists this as item 3 and this module used to skip it
+    entirely, printing only the `reference_returns.json` digest in §1. The
+    digest says the file did not change; it does not say what the numbers are,
+    and every score in every table below is `(return - random) / (threshold -
+    random)` with these numbers in it. A reader who cannot see them cannot
+    check a single normalised value, and cannot see that the environments
+    differ by hundreds of return points, which is the whole reason `DESIGN.md`
+    §5.1 forbids comparing raw returns across them.
+    """
+    h1('1b. REFERENCE RETURNS AND THE NORMALISATION (ANALYSIS_PLAN.md §10.3)')
+    print('  normalised score = (return - random_return) / (threshold - '
+          'random_return),')
+    print('  so 0 is the measured random policy and 1 is the registered solved '
+          'threshold')
+    print('  (DESIGN.md §5.1). The random-policy references are MEASURED, in '
+          'measure_references.py,')
+    print('  not assumed: a multiplicative gate on raw return is neither sign- '
+          'nor origin-safe.')
+    rows = []
+    for env_id in sorted(set(str(v) for v in df['env'].dropna().unique())):
+        try:
+            ref = envs.reference(env_id)
+        except (KeyError, ValueError, FileNotFoundError) as exc:
+            rows.append({'env': env_id, 'note': f'no reference: {exc}'})
+            ledger.deviations.append(
+                f'{env_id} has no measured random-policy reference, so its '
+                f'normalised scores cannot be checked')
+            continue
+        rows.append({'env': env_id,
+                     'random_return': ref.get('random_return'),
+                     'random_sd': ref.get('random_sd'),
+                     'noop_return': ref.get('noop_return'),
+                     'noop_score': ref.get('noop_score'),
+                     'threshold': ref.get('threshold'),
+                     'denominator': ref.get('denominator'),
+                     'episodes': ref.get('episodes'),
+                     'note': ''})
+    print()
+    print(table(rows, ('env', 'random_return', 'random_sd', 'noop_return',
+                       'noop_score', 'threshold', 'denominator', 'episodes',
+                       'note'), nd=3))
+    print('  noop_score is where a do-nothing policy sits on this same scale. '
+          'It is printed')
+    print('  because RQ5 turns on it: a family whose noop score moves across '
+          'levels confounds')
+    print('  shift severity with task difficulty (DESIGN.md §5.1), and §9c '
+          'carries that caveat.')
+    return {'references': rows,
+            'file': getattr(envs, 'REFERENCE_FILE', None),
+            'digest': file_digest(getattr(envs, 'REFERENCE_FILE', '') or '')}
 
 
 def section_inventory(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
@@ -1170,12 +1917,31 @@ def section_inventory(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
         ss = sorted(int(x) for x in s['seed'].unique())
         ts = sorted(int(x) for x in t['seed'].unique())
         labels = sorted(set(str(x) for x in t['label'].unique()))
+        # Rows against distinct seeds, both printed. A row count presented as a
+        # seed count is how a duplicated (arm, seed) hides: n_transfer read 10
+        # while the arm held 11 rows and one seed was silently collapsed.
+        pair = paired_by_seed(t, s, opts.metrics[0])
+        # `paired_seeds` is the number §5 will actually analyse, taken from the
+        # same helper §5 uses -- not `len(set(ss) & set(ts))`, which intersects
+        # raw seed labels and therefore counts a seed that is duplicated in one
+        # arm, or that has no value for the endpoint, as a usable pair. That
+        # column drives the PIPELINE VALIDATION banner below, so the banner was
+        # being withheld on data where every confirmatory member is suppressed:
+        # on runs_demo it read 3 for all four cells while §5a reported n=0 for
+        # all eight members, and one injected duplicate row made it read 10
+        # where §5's paired sample was 9.
         comp.append({'cell': cell, 'n_scratch': len(ss), 'n_transfer': len(ts),
-                     'paired_seeds': len(set(ss) & set(ts)),
+                     'rows_scratch': len(s), 'rows_transfer': len(t),
+                     'paired_seeds': len(pair['seeds']),
+                     'seed_labels_shared': len(set(ss) & set(ts)),
                      'scratch_only': ','.join(str(x) for x in
                                               sorted(set(ss) - set(ts))) or '-',
                      'transfer_only': ','.join(str(x) for x in
                                                sorted(set(ts) - set(ss))) or '-',
+                     'duplicated_seeds':
+                         ','.join(str(x) for x in
+                                  sorted(set(pair['dup_a'])
+                                         | set(pair['dup_b']))) or '-',
                      'transfer_labels': ';'.join(labels) or '-'})
         if len(labels) > 1:
             ledger.refusals.append(
@@ -1185,8 +1951,21 @@ def section_inventory(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
             ledger.deviations.append(
                 f'{cell}: scratch and transfer seed sets differ; the arm is '
                 'incomplete and DESIGN.md §8.4 refuses a partial arm')
-    print(table(comp, ('cell', 'n_scratch', 'n_transfer', 'paired_seeds',
-                       'scratch_only', 'transfer_only', 'transfer_labels')))
+        for note in pairing_problems(pair, opts.metrics[0]):
+            print(f'  {cell}: {note}')
+            ledger.deviations.append(f'{cell}: {note}')
+    print(table(comp, ('cell', 'n_scratch', 'n_transfer', 'rows_scratch',
+                       'rows_transfer', 'paired_seeds', 'seed_labels_shared',
+                       'scratch_only', 'transfer_only', 'duplicated_seeds',
+                       'transfer_labels')))
+    print(f'  paired_seeds is the sample §5 will analyse on '
+          f'{opts.metrics[0]}, from the same helper')
+    print('  §5 uses: a seed duplicated in either arm, or with no value for '
+          'the endpoint, is')
+    print('  not a pair. seed_labels_shared is the raw intersection of the '
+          'two seed columns,')
+    print('  printed beside it so the gap between what exists and what pairs '
+          'is visible.')
     out['completeness'] = comp
     smallest = min((c['paired_seeds'] for c in comp), default=0)
     if smallest < MIN_N_FOR_INFERENCE:
@@ -1209,14 +1988,35 @@ def section_inventory(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
                     'seeds': ','.join(str(int(s)) for s in
                                       sorted(g['seed'].unique()))})
     print(table(blk, ('seed_block', 'runs', 'seeds')))
-    tune = df[df['seed_block'] == 'TUNE']
-    if len(tune):
-        print(f'  REFUSAL: {len(tune)} run(s) sit in the TUNE block. '
-              'ANALYSIS_PLAN.md §8 forbids any reported estimate computed on '
-              'TUNE seeds (selection leakage). They are excluded from every '
-              'estimate below.')
-        ledger.refusals.append(f'{len(tune)} TUNE-block runs excluded from all '
-                               'estimates (selection leakage)')
+    # The TUNE runs were removed in `main` before this section ran, so a
+    # branch testing for them here could never fire and the exclusion appeared
+    # nowhere in the printed report: it survived only as a field in the JSON.
+    # `ANALYSIS_PLAN.md` §10.2 requires exclusions reported, so the count is
+    # carried in and printed whether or not any row remains.
+    tune_seeds = ','.join(str(s) for s in opts.tune_seeds_excluded) or '-'
+    if opts.tune_runs_excluded:
+        print(f'  REFUSAL: {opts.tune_runs_excluded} run(s) sat in the TUNE '
+              f'block (seeds {tune_seeds}) and were removed before any section '
+              'of this report ran.')
+        print('  ANALYSIS_PLAN.md §8 forbids any reported estimate computed '
+              'on TUNE seeds')
+        print('  (selection leakage): revision 1 selected hyperparameters on '
+              'seeds 0-4 and then')
+        print('  ran confirmatory arms on 0-9, so half of every confirmatory '
+              'sample was tuned on.')
+        ledger.refusals.append(
+            f'{opts.tune_runs_excluded} TUNE-block run(s) (seeds '
+            f'{tune_seeds}) excluded from every estimate (selection leakage, '
+            'ANALYSIS_PLAN.md §8)')
+    else:
+        print('  No run sits in the TUNE block, so no selection-leakage '
+              'exclusion was needed.')
+    leftover = df[df['seed_block'] == 'TUNE']
+    if len(leftover):
+        print(f'  ERROR: {len(leftover)} TUNE-block run(s) reached the '
+              'inventory. The exclusion in main() did not hold.')
+        ledger.refusals.append(f'{len(leftover)} TUNE-block run(s) survived '
+                               'the exclusion filter')
     donors = df[df['seed_block'].isin(SOURCE_ONLY_BLOCKS)]
     if len(donors):
         print(f'  {len(donors)} run(s) sit in a source-only block '
@@ -1382,72 +2182,166 @@ def section_descriptives(df: pd.DataFrame, opts: Options, ledger: Ledger,
     (`DESIGN.md` §2.5): a cell whose scratch baseline sits near the ceiling has
     less room to gain and more to lose, so a between-cell comparison of deltas
     is partly a comparison of headroom.
+
+    **n here is a count of seeds, and every statistic is computed on one value
+    per seed.** It used to be a count of rows: `len(_clean(g[metric]))`. On the
+    repo's own `runs_demo` tree, where most arms hold two run directories per
+    (label, seed), that printed n=6 for a 3-seed arm; injecting one duplicate
+    row at `final_score=99` moved an arm's mean from 1.1635 to 10.0577 and its
+    SD from 0.0664 to 29.4989; and doubling an arm wholesale *narrowed* its
+    interval, because duplication buys artefactual precision. The caption
+    called the interval a "seed-level bootstrap" while `bootstrap_statistic`
+    was resampling rows. This is the table `report.py` renders as the paper's
+    descriptives, and §3b's headroom feeds RQ3's pre-registered two-scale
+    agreement gate, so a row count standing in for a seed count reached both.
     """
     h1(f'3. DESCRIPTIVES on {metric} (normalised score; random policy = 0, '
        'threshold = 1)')
     ledger.est(f'descriptives on {metric}')
     rows = []
+    refusals: list[str] = []
     # Grouped by environment as well as by arm. Scores are normalised per
     # environment, so rows from different environments are not comparable and
     # must not be presented as though they were (DESIGN.md §5.1); the env
     # column makes that visible instead of leaving it to be inferred.
     for (env, cell, cond, label), g in df.groupby(
             ['env', 'cell', 'condition', 'label'], dropna=False):
-        x = _clean(g[metric])
-        if not len(x):
+        sv = seed_vector(g, metric, f'{label} arm on {env}')
+        if not sv['n'] and not sv['refused']:
             continue
+        rec: dict[str, Any] = {
+            'env': env, 'cell': cell, 'condition': cond, 'label': label,
+            'seed_block': '/'.join(sorted(set(str(b) for b in
+                                              g['seed_block'].dropna()))),
+            'n': sv['n'], 'n_rows': sv['n_rows'], 'seeds': sv['seeds']}
+        if sv['refused']:
+            # The arm is ambiguous, so it has no mean. §5 withholds a
+            # suppressed member's point estimate at every n and this does the
+            # same: the row stays, as the inventory of what was run, and the
+            # numbers that cannot be computed are absent rather than wrong.
+            rec.update({'mean': None, 'sd': None, 'median': None,
+                        'ci_lo': None, 'ci_hi': None, 'min': None,
+                        'max': None, 'note': sv['reason']})
+            refusals.append(f'{cell}/{label} on {env}: {sv["reason"]}')
+            ledger.other_suppressed.append(
+                f'descriptives {metric} {cell}/{label}: {sv["reason"]}')
+            rows.append(rec)
+            continue
+        x = sv['values']
         boot = bootstrap_statistic(x, lambda a: float(np.mean(a)),
                                    opts.n_boot, opts.boot_seed, vec=mean_vec)
-        rows.append({'env': env, 'cell': cell, 'condition': cond,
-                     'label': label, 'seed_block':
-                         '/'.join(sorted(set(str(b) for b in
-                                             g['seed_block'].dropna()))),
-                     'n': len(x), 'mean': float(np.mean(x)), 'sd': sd(x),
-                     'median': float(np.median(x)),
-                     'ci_lo': boot['lo'], 'ci_hi': boot['hi'],
-                     'min': float(np.min(x)), 'max': float(np.max(x))})
+        rec.update({'mean': float(np.mean(x)), 'sd': sd(x),
+                    'median': float(np.median(x)),
+                    'ci_lo': boot['lo'], 'ci_hi': boot['hi'],
+                    'min': float(np.min(x)), 'max': float(np.max(x)),
+                    'note': ('; '.join(
+                        f'seed {s} has a run but no {metric} value'
+                        for s in sv['metric_missing'])
+                        if sv['metric_missing'] else '')})
+        rows.append(rec)
     order = {c: i for i, c in enumerate(CELL_ORDER)}
     rows.sort(key=lambda r: (str(r['env']), order.get(r['cell'], 99),
                              str(r['condition']), str(r['label'])))
     print(table(rows, ('env', 'cell', 'condition', 'label', 'seed_block', 'n',
-                       'mean', 'sd', 'median', 'ci_lo', 'ci_hi', 'min',
-                       'max')))
+                       'n_rows', 'mean', 'sd', 'median', 'ci_lo', 'ci_hi',
+                       'min', 'max', 'note')))
+    print('  n is DISTINCT SEEDS; n_rows is run directories. Where they differ '
+          'the arm holds')
+    print('  more than one run for a seed, and every statistic on that row is '
+          'withheld: two')
+    print('  runs claiming one seed have no across-seed mean until the '
+          'ambiguity is resolved.')
     print('  CI: bias-corrected-and-accelerated seed-level bootstrap on the '
-          'mean. No')
-    print('  normality-assuming interval appears anywhere in this module '
-          '(ANALYSIS_PLAN.md §8).')
+          'mean, resampling')
+    print('  seeds. No normality-assuming interval appears anywhere in this '
+          'module')
+    print('  (ANALYSIS_PLAN.md §8).')
+    if refusals:
+        print(f'  {len(refusals)} arm(s) carry no estimate:')
+        for r in refusals:
+            print(f'    {r}')
 
     h2('3b. scratch baseline, threshold and headroom per cell')
     hrows = []
     for cell in CELL_ORDER:
-        s = _clean(scratch_arm(df[df['cell'] == cell], opts)[metric])
-        if not len(s):
+        # The scratch arm of a cell pools every scratch label at the target
+        # environment, so two labels that both ran seed 0 give that seed two
+        # values here even when no (label, seed) is duplicated. That is the
+        # same ambiguity and gets the same refusal: it is not resolvable by
+        # keeping one label's row, and it used to be resolved by keeping
+        # whichever row pandas visited last.
+        sv = seed_vector(scratch_arm(df[df['cell'] == cell], opts), metric,
+                         f'{cell} scratch arm')
+        if not sv['n'] and not sv['refused']:
             continue
-        m = float(np.mean(s))
-        hrows.append({'cell': cell, 'n': len(s), 'scratch_mean': m,
-                      'scratch_sd': sd(s), 'threshold': 1.0,
-                      'headroom': 1.0 - m})
-    print(table(hrows, ('cell', 'n', 'scratch_mean', 'scratch_sd',
-                        'threshold', 'headroom')))
+        rec = {'cell': cell, 'n': sv['n'], 'n_rows': sv['n_rows'],
+               'threshold': 1.0}
+        if sv['refused']:
+            rec.update({'scratch_mean': None, 'scratch_sd': None,
+                        'headroom': None, 'note': sv['reason']})
+            ledger.other_suppressed.append(
+                f'headroom {metric}/{cell}: {sv["reason"]}')
+        else:
+            m = float(np.mean(sv['values']))
+            rec.update({'scratch_mean': m, 'scratch_sd': sd(sv['values']),
+                        'headroom': 1.0 - m, 'note': ''})
+        hrows.append(rec)
+    print(table(hrows, ('cell', 'n', 'n_rows', 'scratch_mean', 'scratch_sd',
+                        'threshold', 'headroom', 'note')))
     print('  headroom = 1.0 - scratch mean: what remains between this cell and '
           'the')
     print('  registered solved threshold. A cell with little headroom cannot '
           'gain much and')
     print('  can lose a great deal, which is why every RQ3 statement below '
           'carries it.')
-    if len(hrows) > 1:
-        worst = min(hrows, key=lambda r: r['headroom'])
-        best = max(hrows, key=lambda r: r['headroom'])
+    for r in hrows:
+        if r.get('note'):
+            print(f'  {r["cell"]}: no headroom is computed. {r["note"]}')
+    # The two sentences below are generated between-cell comparisons, and
+    # ANALYSIS_PLAN.md §9 forbids a number from fewer than three seeds being
+    # "quoted, compared, or used to choose between hypotheses". At n=1 this
+    # used to emit "mlp-vanilla headroom is 0.0308 score units above
+    # dueling-vanilla headroom" from two single-seed means, which is precisely
+    # the comparison §9 names. The table above stays: it is the inventory of
+    # what was run, with its n in every row. The generated comparison does not.
+    #
+    # The gate reads n, and n is now seeds. It used to read a row count, so a
+    # 2-seed dataset recorded twice presented as n=4 and both sentences fired
+    # from two seeds -- the guard added to enforce §9 was defeated by the same
+    # confusion it was added to stop.
+    usable = [r for r in hrows if r['n'] >= MIN_N_FOR_INFERENCE
+              and r['headroom'] is not None]
+    if len(usable) > 1:
+        worst = min(usable, key=lambda r: r['headroom'])
+        best = max(usable, key=lambda r: r['headroom'])
         print('  ' + phrase_direction(best['headroom'] - worst['headroom'],
                                       f'{best["cell"]} headroom',
                                       f'{worst["cell"]} headroom'))
-    sds = {r['cell']: r['scratch_sd'] for r in hrows}
-    if len(sds) > 1:
+        sds = {r['cell']: r['scratch_sd'] for r in usable}
         pairs = sorted(sds.items(), key=lambda kv: (kv[1] if
                                                     np.isfinite(kv[1]) else 0))
-        print('  ' + phrase_dispersion(f'{pairs[-1][0]} scratch', pairs[-1][1],
-                                       f'{pairs[0][0]} scratch', pairs[0][1]))
-    return {'per_arm': rows, 'headroom': hrows}
+        if len(pairs) > 1:
+            print('  ' + phrase_dispersion(f'{pairs[-1][0]} scratch',
+                                           pairs[-1][1],
+                                           f'{pairs[0][0]} scratch',
+                                           pairs[0][1]))
+    elif len(hrows) > 1:
+        ambiguous = [r['cell'] for r in hrows if r['headroom'] is None]
+        print('  No between-cell headroom or dispersion sentence is emitted: '
+              'fewer than two cells')
+        print(f'  reach n={MIN_N_FOR_INFERENCE} DISTINCT SEEDS with a '
+              'computable headroom, and ANALYSIS_PLAN.md §9')
+        print('  forbids comparing numbers computed from fewer than three '
+              'seeds. The per-cell')
+        print('  values above carry their n.')
+        if ambiguous:
+            print(f'  {len(ambiguous)} of those cell(s) have no headroom at '
+                  f'all rather than too few seeds: {", ".join(ambiguous)}. '
+                  'The reason is printed above.')
+    return {'per_arm': rows, 'headroom': hrows,
+            'arms_refused': refusals,
+            'headroom_refused': [r['cell'] for r in hrows
+                                 if r.get('note')]}
 
 
 def section_convergence(df: pd.DataFrame, opts: Options,
@@ -1478,10 +2372,49 @@ def section_convergence(df: pd.DataFrame, opts: Options,
         'column (convergence_slope_se) is named rather than approximated')
     rows = []
     failing = []
+    unevaluable = []
     for (cell, cond, label), g in df.groupby(['cell', 'condition', 'label'],
                                              dropna=False):
-        s = _clean(g['convergence_slope'])
-        if not len(s):
+        # Seeds, not rows. The Clopper-Pearson interval below is an exact
+        # binomial interval whose n is the number of independent units, and
+        # two run directories for one seed are not two units: on runs_demo
+        # this printed frac_positive = 4/6 and a CP interval on 6 pseudo-units
+        # from 3 seeds, and the n<3 floor beside it counted the same 6.
+        sv = seed_vector(g, 'convergence_slope', f'{label} arm')
+        s = sv['values']
+        if not sv['n'] and not sv['refused']:
+            continue
+        rec: dict[str, Any] = {'cell': cell, 'condition': cond,
+                               'label': label, 'n': sv['n'],
+                               'n_rows': sv['n_rows']}
+        if sv['refused']:
+            rec.update({'median_slope': None, 'ci_lo': None, 'ci_hi': None,
+                        'frac_positive': None, 'cp_lo': None, 'cp_hi': None,
+                        'still_moving': None, 'note': sv['reason']})
+            rows.append(rec)
+            unevaluable.append(f'{cell}/{label}')
+            ledger.other_suppressed.append(
+                f'convergence gate {cell}/{label}: {sv["reason"]}')
+            continue
+        if len(s) < MIN_N_FOR_INFERENCE:
+            # ANALYSIS_PLAN.md §9: under n<3, no test and no interval. The
+            # exact binomial interval on the fraction of positive slopes is an
+            # interval, and the fraction itself is a single-seed number; both
+            # used to be printed at n=1 (cp_lo 0.0000, cp_hi 0.9750 per arm).
+            # Worse, the bootstrap interval is already suppressed at that n, so
+            # `still_moving` came out False for every arm by construction and
+            # the section then read the resulting silence as evidence of
+            # convergence. The arm is listed with its n and nothing else.
+            rec.update({'median_slope': None, 'ci_lo': None, 'ci_hi': None,
+                        'frac_positive': None, 'cp_lo': None, 'cp_hi': None,
+                        'still_moving': None,
+                        'note': f'n={len(s)} < {MIN_N_FOR_INFERENCE}: no '
+                                'estimate, no interval, no proportion '
+                                '(ANALYSIS_PLAN.md §9)'})
+            rows.append(rec)
+            unevaluable.append(f'{cell}/{label}')
+            ledger.other_suppressed.append(
+                f'convergence gate {cell}/{label}: n={len(s)}')
             continue
         boot = bootstrap_statistic(s, lambda a: float(np.median(a)),
                                    opts.n_boot, opts.boot_seed, vec=median_vec)
@@ -1489,20 +2422,24 @@ def section_convergence(df: pd.DataFrame, opts: Options,
         lo, hi = clopper_pearson(k, len(s))
         moving = bool(np.isfinite(boot['lo']) and np.isfinite(boot['hi'])
                       and (boot['lo'] > 0 or boot['hi'] < 0))
-        rows.append({'cell': cell, 'condition': cond, 'label': label,
-                     'n': len(s), 'median_slope': boot['estimate'],
-                     'ci_lo': boot['lo'], 'ci_hi': boot['hi'],
-                     'frac_positive': k / len(s), 'cp_lo': lo, 'cp_hi': hi,
-                     'still_moving': moving})
+        rec.update({'median_slope': boot['estimate'],
+                    'ci_lo': boot['lo'], 'ci_hi': boot['hi'],
+                    'frac_positive': k / len(s), 'cp_lo': lo, 'cp_hi': hi,
+                    'still_moving': moving, 'note': ''})
+        rows.append(rec)
         if moving:
             failing.append(f'{cell}/{label}')
-    print(table(rows, ('cell', 'condition', 'label', 'n', 'median_slope',
-                       'ci_lo', 'ci_hi', 'frac_positive', 'cp_lo', 'cp_hi',
-                       'still_moving')))
+    print(table(rows, ('cell', 'condition', 'label', 'n', 'n_rows',
+                       'median_slope', 'ci_lo', 'ci_hi', 'frac_positive',
+                       'cp_lo', 'cp_hi', 'still_moving', 'note')))
     print('  window: the final-window slope as recorded by train.py '
           '(result.convergence_window_episodes);')
     print('  units are score per episode. "still_moving" means the arm-level '
           'interval excludes zero.')
+    print('  n is DISTINCT SEEDS: the exact interval on frac_positive counts '
+          'independent units,')
+    print('  and two run directories recorded for one seed are one unit, not '
+          'two.')
     print()
     if failing:
         print(f'  GATE FAILED for {len(failing)} arm(s): {", ".join(failing)}')
@@ -1515,14 +2452,42 @@ def section_convergence(df: pd.DataFrame, opts: Options,
         ledger.deviations.append(
             f'convergence gate failed in {len(failing)} arm(s): P1 is '
             '"performance at budget", not asymptotic performance')
+    elif unevaluable and not [r for r in rows if r['still_moving'] is not None]:
+        print(f'  GATE NOT EVALUATED: no arm reaches n = '
+              f'{MIN_N_FOR_INFERENCE} distinct seeds with an unambiguous '
+              'slope per seed, so no arm')
+        print('  has an interval on its final-window slope. The per-arm '
+              'reason is in the note column.')
+        print('  Silence here is the absence of a measurement, not evidence '
+              'of convergence: the')
+        print('  previous version printed "consistent with convergence" in '
+              'exactly this case,')
+        print('  which reads a null positively from single seeds. The word '
+              '"asymptotic" is NOT')
+        print('  licensed; P1 is "performance at budget" (DESIGN.md §5.2).')
+        ledger.deviations.append(
+            f'convergence gate not evaluated: all {len(unevaluable)} arm(s) '
+            f'are below n={MIN_N_FOR_INFERENCE}, so P1 is "performance at '
+            'budget" and the word "asymptotic" is unlicensed')
     else:
-        print('  No arm shows a final-window slope distinguishable from zero '
-              'at 95%. That is')
-        print('  consistent with convergence but does not establish it: at '
-              'this n the interval')
-        print('  is wide, so the licensed statement is the interval above, not '
-              '"converged".')
-    return {'available': True, 'per_arm': rows, 'failing': failing}
+        print('  No arm with an estimable interval shows a final-window slope '
+              'distinguishable')
+        print('  from zero at 95%. That is consistent with convergence but '
+              'does not establish it:')
+        print('  at this n the interval is wide, so the licensed statement is '
+              'the interval above,')
+        print('  not "converged".')
+        if unevaluable:
+            print(f'  {len(unevaluable)} arm(s) carry no interval at all '
+                  f'(fewer than {MIN_N_FOR_INFERENCE} distinct seeds, or an '
+                  'ambiguous seed) and are')
+            print('  outside that statement: ' + ', '.join(unevaluable))
+            ledger.deviations.append(
+                f'{len(unevaluable)} arm(s) have no estimable slope interval '
+                f'(below n={MIN_N_FOR_INFERENCE} seeds, or ambiguous) and the '
+                'convergence gate was not evaluated for them')
+    return {'available': True, 'per_arm': rows, 'failing': failing,
+            'unevaluable': unevaluable}
 
 
 def _paired_delta(df: pd.DataFrame, cell: str, metric: str, opts: Options
@@ -1579,6 +2544,19 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
     members: list[dict] = []
     pvals: dict[tuple[str, str], float] = {}
     for metric in computed:
+        endpoint_absent = (metric not in df.columns
+                           or not _clean(df[metric]).size)
+        if endpoint_absent:
+            # A co-primary endpoint with no value anywhere is not four
+            # suppressed cells with a local explanation: it is half the
+            # confirmatory family missing from the dataset, and §12 is where
+            # that belongs.
+            ledger.deviations.append(
+                f'co-primary endpoint {metric!r} has no finite value in any '
+                f'run of the analysis set, so {len(CELL_ORDER)} of '
+                f'{CONFIRMATORY_FAMILY_SIZE} confirmatory members do not '
+                'exist in this dataset (DESIGN.md §5.2 declares it '
+                'co-primary)')
         for cell in CELL_ORDER:
             pd_ = _paired_delta(df, cell, metric, opts)
             key = (metric, cell)
@@ -1587,7 +2565,15 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
             rec: dict[str, Any] = {
                 'metric': metric, 'cell': cell, 'n': n,
                 'seeds': pd_['seeds'],
-                'n_transfer_rows': pd_['n_a'], 'n_scratch_rows': pd_['n_b'],
+                # Rows and distinct usable seeds, both, and each named for what
+                # it is. `n_transfer_rows` used to hold a seed count.
+                'n_transfer_rows': pd_['rows_a'],
+                'n_scratch_rows': pd_['rows_b'],
+                'n_transfer_seeds': pd_['n_a'],
+                'n_scratch_seeds': pd_['n_b'],
+                'duplicated_transfer_seeds': pd_['dup_a'],
+                'duplicated_scratch_seeds': pd_['dup_b'],
+                'seeds_without_metric': pd_['metric_missing'],
                 'unpaired_transfer_seeds': pd_['only_a'],
                 'unpaired_scratch_seeds': pd_['only_b'],
                 'transfer_labels': pd_['transfer_labels'],
@@ -1602,14 +2588,37 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                     'freeze_updates is not constant across the arm '
                     f'({pd_["freeze_updates_observed"]}); DESIGN.md §8.4 '
                     'refuses to aggregate runs that differ in an invariant')
+            elif pd_['dup_a'] or pd_['dup_b']:
+                rec['suppressed'] = '; '.join(
+                    pairing_problems(pd_, metric)) or 'duplicated rows'
             elif pd_['n_a'] == 0 or pd_['n_b'] == 0:
-                empty = ('transfer' if pd_['n_a'] == 0 else 'scratch')
+                # The cause is READ OFF the data rather than asserted. The
+                # previous text hard-coded "under --source-policy valid this
+                # happens when every source fails the gate", and printed that
+                # diagnosis for any empty arm: on a table whose final_score
+                # column was entirely NaN, with every source valid, four
+                # members were suppressed with a false explanation.
+                empty = 'transfer' if pd_['n_a'] == 0 else 'scratch'
+                rows_present = (pd_['rows_a'] if empty == 'transfer'
+                                else pd_['rows_b'])
+                if rows_present == 0:
+                    why = ('no run in the analysis set in force matches that '
+                           'arm at all. Under --source-policy valid this is '
+                           'what a cell whose sources all fail the DESIGN.md '
+                           '§4.3 gate looks like, but the filter that emptied '
+                           'it is named in §2d and in the analysis-set note, '
+                           'not guessed at here')
+                elif not _clean(df[metric]).size:
+                    why = (f'the arm has {rows_present} run(s) and the '
+                           f'{metric} column is empty for EVERY run in the '
+                           'table, so the endpoint itself is missing from '
+                           'this dataset')
+                else:
+                    why = (f'the arm has {rows_present} run(s) but no finite '
+                           f'{metric} value among them')
                 rec['suppressed'] = (
-                    f'the {empty} arm is empty in the analysis set in force. '
-                    'Under --source-policy valid this happens when every '
-                    'source fails the DESIGN.md §4.3 gate: the primary '
-                    'estimand is defined on valid sources only, so it does '
-                    'not exist here. Nothing is substituted for it')
+                    f'the {empty} arm is empty in the analysis set in force: '
+                    f'{why}. Nothing is substituted for it')
             elif pd_['only_a'] or pd_['only_b']:
                 rec['suppressed'] = (
                     f'incomplete arm: seeds {pd_["only_a"]} appear only in '
@@ -1622,14 +2631,14 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                     '(ANALYSIS_PLAN.md §9)')
             if 'suppressed' in rec:
                 # A suppressed member's point estimate is withheld too, not
-                # only its test. ANALYSIS_PLAN.md §9: a number from fewer than
-                # three seeds "may not be quoted, compared, or used to choose
-                # between hypotheses", and printing it in a results table is
-                # quoting it.
-                rec.update({'mean_delta': (float(np.mean(d))
-                                           if n >= MIN_N_FOR_INFERENCE
-                                           else None),
-                            'p_signflip': None})
+                # only its test, and that holds at EVERY n. The version this
+                # replaces withheld it only below n=3, so a member refused as
+                # an incomplete arm (9 of 10 seeds) or refused because
+                # freeze_updates was not constant across the arm still had its
+                # mean delta printed in the results table: the silently
+                # seed-dropped number quoted after all, and the aggregate that
+                # DESIGN.md §8.4 had just refused to compute printed anyway.
+                rec.update({'mean_delta': None, 'p_signflip': None})
                 members.append(rec)
                 ledger.suppressed.append(
                     f'{metric}/{cell}: {rec["suppressed"]}')
@@ -1646,12 +2655,12 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
             except ValueError as exc:                     # all-zero differences
                 w_stat, w_p = float('nan'), None
                 rec['wilcoxon_note'] = str(exc)
-            u_stat, u_p = sps.mannwhitneyu(pd_['a'], pd_['b'],
-                                           alternative='two-sided')
-            r_pear = (float(sps.pearsonr(pd_['a'], pd_['b'])[0]) if n > 2
-                      else float('nan'))
-            r_spear = (float(sps.spearmanr(pd_['a'], pd_['b'])[0]) if n > 2
-                       else float('nan'))
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                u_stat, u_p = sps.mannwhitneyu(pd_['a'], pd_['b'],
+                                               alternative='two-sided')
+            r_pear = correlation('pearson', pd_['a'], pd_['b'])
+            r_spear = correlation('spearman', pd_['a'], pd_['b'])
             rec.update({
                 'mean_delta': float(np.mean(d)),
                 'median_delta': float(np.median(d)),
@@ -1659,7 +2668,13 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                 'transfer_mean': float(np.mean(pd_['a'])),
                 'scratch_mean': float(np.mean(pd_['b'])),
                 'hl': hl['estimate'], 'ci_lo': hl['lo'], 'ci_hi': hl['hi'],
-                'ci_method': hl['method'],
+                'ci_method': hl['method'], 'ci_note': hl.get('note', ''),
+                'degenerate_interval': bool(hl.get('degenerate')),
+                # The paired values themselves, so §10's unpaired sigma is
+                # computed on the same seeds the test used rather than on the
+                # whole arm.
+                'transfer_values': [float(v) for v in pd_['a']],
+                'scratch_values': [float(v) for v in pd_['b']],
                 'p_signflip': sf['p'], 'signflip_mode': sf['mode'],
                 'min_attainable_p': sf['min_attainable_p'],
                 'wilcoxon_W': float(w_stat), 'p_wilcoxon': w_p,
@@ -1682,9 +2697,24 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
     h2('5a. the eight tests')
     print(table(members, ('metric', 'cell', 'n', 'scratch_mean',
                           'transfer_mean', 'mean_delta', 'hl', 'ci_lo',
-                          'ci_hi', 'p_signflip', 'p_holm', 'p_wilcoxon',
-                          'mannwhitney_U', 'p_mannwhitney', 'rho_pearson',
-                          'rho_spearman')))
+                          'ci_hi', 'ci_method', 'p_signflip', 'p_holm',
+                          'p_wilcoxon', 'mannwhitney_U', 'p_mannwhitney',
+                          'rho_pearson', 'rho_spearman')))
+    # The interval's method travels with the interval. §3 states the CI is BCa;
+    # when the bias fraction lands on a boundary the estimate falls back to the
+    # percentile interval, and that fallback used to be invisible here, so
+    # eight percentile intervals could be read as eight BCa ones.
+    fell_back = [r for r in members
+                 if r.get('ci_method') not in (None, 'BCa')
+                 and 'suppressed' not in r]
+    if fell_back:
+        print()
+        print(f'  {len(fell_back)} of {len(members)} interval(s) are NOT BCa. '
+              'The method column above')
+        print('  carries each one, and the reason follows:')
+        for r in fell_back:
+            print(f'    {r["metric"]}/{r["cell"]}: {r["ci_method"]} -- '
+                  f'{r.get("ci_note") or "no note recorded"}')
     n_sup = sum(1 for r in members if 'suppressed' in r)
     if n_sup:
         print()
@@ -1709,18 +2739,53 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
     print(f'  2/2^{example_n} = {2 / 2 ** example_n:.5f}, attained exactly '
           'when every seed moves the same way.')
     strict = ALPHA_STRICTEST
-    reachable = (2 / 2 ** example_n) < strict
+    # The exact two-sided p is k/2^n for an EVEN k: a sign assignment and its
+    # negation are both at least as extreme as each other, so the attainable
+    # values step by 2/2^n. `k_max` is the largest even k with k/2^n strictly
+    # below the strictest Holm step, which is the same comparison
+    # `significant_holm` makes on the adjusted p.
+    total = 2 ** example_n
+    k_max = int(math.ceil(strict * total - 1e-12)) - 1
+    k_max = min(k_max - (k_max % 2), total)
     print(f'  The strictest Holm step is alpha = {strict:.5f}.')
-    if reachable:
-        print('  Therefore a cell is confirmed if and only if ALL of its seeds '
-              'move in the same')
-        print('  direction: the bar is unanimity (ANALYSIS_PLAN.md §2.2). '
-              'Anything less cannot')
-        print('  clear the corrected threshold at this sample size.')
+    if k_max >= 2:
+        vals = ', '.join(f'{k / total:.5f}' for k in range(2, k_max + 1, 2))
+        # ANALYSIS_PLAN.md 2.2 stated this as an "if and only if" and so did
+        # this section, and both were FALSE. Unanimity attains the FLOOR of the
+        # attainable p-values; the BAR is the Holm step, and at n=10 three
+        # attainable values sit below it. sign_flip_test([1.0]*9 + [-0.01])
+        # returns p = 0.00391 with the seeds split 9 to 1, which clears 0.00625
+        # and is Holm-significant in the table above, against a printed rule
+        # saying it cannot be. The plan's sentence was corrected on 2026-08-26
+        # and the correction is logged in ANALYSIS_PLAN.md 11.
+        print(f'  The exact p moves in units of 2/{total}, because a sign '
+              'assignment and its negation')
+        print('  are always equally extreme, so the attainable values '
+              'strictly below that alpha are')
+        print(f'  {vals}: {k_max // 2} distinct outcome(s) clear it, not one.')
+        print(f'  THE BAR IS THEREFORE: at most {k_max} of the {total} sign '
+              'assignments may be at least')
+        print('  as extreme as the observed mean (ANALYSIS_PLAN.md §2.2). '
+              'Unanimity attains the')
+        print(f'  floor {2 / total:.5f} and so is SUFFICIENT, but it is NOT '
+              'NECESSARY: one seed moving')
+        print('  against the rest by a small enough margin leaves only 4 '
+              'assignments at least as')
+        print(f'  extreme, i.e. p = {4 / total:.5f}, which still clears '
+              f'{strict:.5f}.')
+        print(f'  That bar applies to the SMALLEST p in the family of '
+              f'{CONFIRMATORY_FAMILY_SIZE}. Holm compares the jth')
+        print('  smallest against alpha/(m-j+1), so every later step is '
+              'looser still, and the')
+        print(f'  verdict in the table above is p_holm < {ALPHA:.2f} at '
+              'whichever step the member')
+        print('  lands on. No cell is confirmed on unanimity as such, and '
+              'none is refused for')
+        print('  the want of it.')
     else:
         print(f'  Therefore NO result at n={example_n} can clear the '
               'corrected threshold: the')
-        print(f'  smallest attainable p ({2 / 2 ** example_n:.5f}) exceeds '
+        print(f'  smallest attainable p ({2 / total:.5f}) exceeds '
               f'{strict:.5f}. The tests below')
         print('  are reported for completeness and CANNOT be significant. '
               'This is a property')
@@ -1739,9 +2804,23 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
         print('    ' + phrase_interval_verdict(rec['ci_lo'], rec['ci_hi'],
                                                'the paired shift (HL)'))
         print('    ' + rec['unanimous'])
-        rho = rec['rho_pearson']
-        if np.isfinite(rho) and rho < 0:
-            print(f'    rho = {rho:+.3f} < 0: the matched-seed pairing does '
+        # The decision rule runs on SPEARMAN. Both coefficients are
+        # reported, as §2.1 requires, but the branch cannot be driven by a
+        # moment-based correlation on data the design declares non-normal
+        # (DESIGN.md §5.3, ANALYSIS_PLAN.md §4): Pearson on ten bimodal
+        # LunarLander scores is exactly the parametric summary §8 forbids
+        # elsewhere in this module. §2.1 does not name a coefficient, so the
+        # choice is made here, once, and stated.
+        rho = rec['rho_spearman']
+        if not np.isfinite(rho):
+            print('    rho: not estimable in this cell (an arm has no '
+                  'variation across seeds, or')
+            print('    fewer than three pairs). The pairing cannot be checked '
+                  'here, so no claim')
+            print('    about it is made in either direction.')
+        elif rho < 0:
+            print(f'    Spearman rho = {rho:+.3f} < 0 (Pearson '
+                  f'{rec["rho_pearson"]:+.3f}): the matched-seed pairing does '
                   'NOT hold in this cell.')
             print('    ANALYSIS_PLAN.md §2.1 pre-commits to giving the '
                   'unpaired result equal')
@@ -1749,10 +2828,11 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                   f'{rec["mannwhitney_U"]:.1f}, p = '
                   f'{rec["p_mannwhitney"]:.5f}.')
         else:
-            print(f'    rho = {rho:+.3f}: reported whatever its value; the '
-                  'paired test stays')
-            print('    primary by pre-registration, not by comparison of '
-                  'p-values.')
+            print(f'    Spearman rho = {rho:+.3f} (Pearson '
+                  f'{rec["rho_pearson"]:+.3f}): reported whatever their '
+                  'values; the paired test')
+            print('    stays primary by pre-registration, not by comparison '
+                  'of p-values.')
         agree = [('sign-flip', rec['p_signflip']),
                  ('Wilcoxon', rec['p_wilcoxon']),
                  ('Mann-Whitney', rec['p_mannwhitney'])]
@@ -1808,35 +2888,63 @@ def section_equivalence(conf: dict, df: pd.DataFrame, opts: Options,
         worst_sd = max([v for v in (sd_scratch, sd_transfer)
                         if np.isfinite(v)], default=float('nan'))
         lo, hi = rec.get('ci_lo', float('nan')), rec.get('ci_hi', float('nan'))
+        degenerate = bool(rec.get('degenerate_interval')
+                          or (np.isfinite(lo) and np.isfinite(hi)
+                              and hi - lo <= 0.0))
         if 'suppressed' in rec:
             verdict = 'suppressed'
             reason = rec['suppressed']
         elif not (np.isfinite(lo) and np.isfinite(hi)):
             verdict = 'no interval'
             reason = 'no interval emitted'
+        elif degenerate:
+            # A zero-width interval is not a precise answer. It is what a
+            # constant arm, or a transfer arm equal to its scratch arm at every
+            # seed, produces: the resampling unit has no variation, so nothing
+            # about sampling uncertainty is estimable. This branch is above the
+            # containment check because [+0.0000, +0.0000] lies inside any
+            # margin and used to be reported as EQUIVALENT, which is the
+            # affirmed null this module exists to prevent.
+            verdict = 'DEGENERATE'
+            reason = (f'the interval [{lo:+.4f}, {hi:+.4f}] has zero width: '
+                      'every bootstrap replicate is identical, so the arm has '
+                      'no across-seed variation and no equivalence or '
+                      'exclusion claim is available at all')
+        elif lo >= margin or hi <= -margin:
+            # NON-equivalence, and the dispersion gate does not govern it.
+            # ANALYSIS_PLAN.md §4's feasibility rule limits *equivalence*
+            # claims in a dispersed cell; an interval lying wholly beyond the
+            # margin is a difference, and calling it "untestable" (as this
+            # section did, for a CI of [-0.1564, -0.0844] against a margin of
+            # 0.05) discards a finding the data supports.
+            verdict = 'DIFFERENT'
+            reason = (f'the whole interval [{lo:+.4f}, {hi:+.4f}] lies outside '
+                      f'+/-{margin}')
         elif np.isfinite(worst_sd) and worst_sd > margin:
             verdict = 'UNTESTABLE'
             reason = (f'across-seed SD {worst_sd:.4f} exceeds the margin '
-                      f'{margin}: equivalence is untestable in this cell at '
-                      f'n={rec["n"]} (ANALYSIS_PLAN.md §4)')
+                      f'{margin}: an EQUIVALENCE claim is untestable in this '
+                      f'cell at n={rec["n"]} (ANALYSIS_PLAN.md §4). The '
+                      'exclusion bound below is unaffected')
         elif lo > -margin and hi < margin:
             verdict = 'EQUIVALENT'
             reason = (f'the whole interval [{lo:+.4f}, {hi:+.4f}] lies inside '
-                      f'+/-{margin}')
-        elif lo >= margin or hi <= -margin:
-            verdict = 'DIFFERENT'
-            reason = (f'the whole interval [{lo:+.4f}, {hi:+.4f}] lies outside '
                       f'+/-{margin}')
         else:
             verdict = 'INCONCLUSIVE'
             reason = (f'the interval [{lo:+.4f}, {hi:+.4f}] straddles the '
                       'margin boundary')
+        # A suppressed member has no interval, so it has no exclusion bound.
+        # Mapping its NaN to 0.0 put a machine-readable "nothing worse than
+        # zero is excluded" into the JSON for every single-seed cell, and
+        # report.py renders that column as "worse than X excluded".
+        bound = (abs(lo) if (np.isfinite(lo) and lo < 0 and not degenerate)
+                 else (0.0 if (np.isfinite(lo) and not degenerate) else None))
         rows.append({'metric': metric, 'cell': cell, 'n': rec['n'],
                      'ci_lo': lo, 'ci_hi': hi, 'sd_scratch': sd_scratch,
                      'sd_transfer': sd_transfer, 'margin': margin,
-                     'verdict': verdict,
-                     'exclusion_bound': (abs(lo) if np.isfinite(lo) and lo < 0
-                                         else 0.0),
+                     'verdict': verdict, 'degenerate': degenerate,
+                     'exclusion_bound': bound,
                      'reason': reason})
     print()
     print(table(rows, ('metric', 'cell', 'n', 'ci_lo', 'ci_hi', 'sd_scratch',
@@ -1844,7 +2952,12 @@ def section_equivalence(conf: dict, df: pd.DataFrame, opts: Options,
     print()
     for r in rows:
         print(f'  {r["metric"]}/{r["cell"]}: {r["verdict"]} -- {r["reason"]}')
-        print('    ' + phrase_exclusion_bound(r['ci_lo']))
+        if r['degenerate']:
+            print('    no exclusion bound: a zero-width interval excludes '
+                  'nothing at 95%, it')
+            print('    reports that nothing was estimable.')
+        else:
+            print('    ' + phrase_exclusion_bound(r['ci_lo']))
     print()
     print('  The exclusion bound is printed for every cell whatever the '
           'verdict, because it')
@@ -1858,6 +2971,11 @@ def section_equivalence(conf: dict, df: pd.DataFrame, opts: Options,
 # The control set. `DESIGN.md` §4: contrasts are named after WHAT WAS
 # MANIPULATED, never after a mechanism.
 # ---------------------------------------------------------------------------
+
+#: The conditions of `DESIGN.md` §4, in declaration order. Named once so that
+#: the per-seed reduction, the present/absent accounting and `validate.py`'s
+#: "every control is accounted for" check all read the same list.
+CONTROL_CONDITIONS: tuple[str, ...] = ('C0', 'C1', 'C2', 'C2K0', 'C3', 'C3b')
 
 #: (key, description, selector) for the per-seed condition vector.
 CONTROL_EXCLUSION_RESTRICTIONS: dict[str, str] = {
@@ -1893,7 +3011,26 @@ def _condition_arms(df: pd.DataFrame, opts: Options) -> dict:
     base = dict(env=opts.target_env, source_env=opts.source_env)
     c1 = primary_transfer_arm(df, opts)
     fw = sorted(set(c1['freeze_updates'].dropna().unique().tolist()))
-    protocol_fw = fw[0] if len(fw) == 1 else None
+    # The observed window is preferred, because a pilot invocation legitimately
+    # shortens it and matching the registry's value would then select nothing.
+    # But deriving it from C1 ALONE meant that losing C1 -- which is what the
+    # source-validity filter does to a cell whose source fails the DESIGN.md
+    # §4.3 gate -- set it to None and deleted C2, C3 and C3b from the control
+    # set as a side effect, while the inventory two sections earlier plainly
+    # listed those arms. The registry knows the protocol window whether or not
+    # C1 survived, so it is the fallback rather than nothing.
+    fw_source = 'observed in the C1 arm'
+    if len(fw) == 1:
+        protocol_fw = fw[0]
+    elif len(fw) > 1:
+        protocol_fw = None
+        fw_source = (f'ambiguous: the C1 arm carries {fw}, so no single '
+                     'protocol window can be identified')
+    else:
+        protocol_fw = registry.PROTOCOL['freeze_updates']
+        fw_source = ('registry.PROTOCOL (the C1 arm is empty here, so the '
+                     'window is read from the pre-registered protocol rather '
+                     'than deleting every condition that depends on it)')
     untr = protocol_match(rows_where(df, condition='transfer_untrained',
                                      **base))
     perm = protocol_match(rows_where(df, condition='transfer_permuted', **base))
@@ -1906,7 +3043,8 @@ def _condition_arms(df: pd.DataFrame, opts: Options) -> dict:
         c3 = c3[c3['freeze_updates'] == protocol_fw]
         c3b = c3b[c3b['freeze_updates'] == protocol_fw]
     return {'C0': scratch_arm(df, opts), 'C1': c1, 'C2': c2, 'C2K0': c2k0,
-            'C3': c3, 'C3b': c3b, 'protocol_freeze_updates': protocol_fw}
+            'C3': c3, 'C3b': c3b, 'protocol_freeze_updates': protocol_fw,
+            'protocol_freeze_updates_source': fw_source}
 
 
 def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
@@ -1965,50 +3103,114 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
     for cell in CELL_ORDER:
         cdf = df[df['cell'] == cell]
         arms = _condition_arms(cdf, opts)
-        per_seed: dict[str, dict[int, float]] = {}
-        for key in ('C0', 'C1', 'C2', 'C2K0', 'C3', 'C3b'):
-            a = arms[key]
-            vals: dict[int, float] = {}
-            for _, r in a.iterrows():
-                v = r.get(metric)
-                if pd.notna(v):
-                    vals[int(r['seed'])] = float(v)
-            per_seed[key] = vals
-        present = [k for k, v in per_seed.items() if v]
-        missing = [k for k, v in per_seed.items() if not v]
-        common = sorted(set.intersection(*[set(per_seed[k]) for k in present])
-                        ) if present else []
+        # THE per-seed reduction, from the single helper §5 uses. This loop
+        # used to be `for _, r in a.iterrows(): vals[int(r['seed'])] =
+        # float(v)`, which is last-wins on (arm, seed) and therefore on CSV
+        # row order. Reading runs_demo/per_seed.csv forwards and then
+        # row-reversed, the same rows in the same multiset, moved every one of
+        # the 16 contrast rows on final_score and flipped two printed
+        # verdicts: dueling-vanilla C1-C0 went from "positive: the interval
+        # excludes zero and everything below +0.1615" to "not distinguishable
+        # from zero: the interval [-0.0966, +0.4097] covers zero", and
+        # dueling-vanilla C1-C3 went the other way. C1-C0 is the confirmatory
+        # estimand §5 had just refused on that same data. The collapse also
+        # crossed LABELS: C0 pools every scratch label in the cell, so
+        # `smoke-scratch` overwrote `scratch-mlp-vanilla` at all three seeds
+        # and the baseline of every contrast belonged to a different arm from
+        # the one §5 uses.
+        info: dict[str, dict] = {}
+        for key in CONTROL_CONDITIONS:
+            info[key] = seed_vector(arms[key], metric,
+                                    f'{key} condition of {cell}')
+        per_seed = {k: dict(zip(v['seeds'], (float(x) for x in v['values'])))
+                    for k, v in info.items()}
+        # `present` keeps its meaning for the reader and for validate.py:
+        # every declared condition lands in exactly one of the two lists. But
+        # a condition that is present and AMBIGUOUS is not usable, and saying
+        # so is the whole point.
+        present = [k for k in CONTROL_CONDITIONS
+                   if info[k]['n'] or info[k]['refused']]
+        missing = [k for k in CONTROL_CONDITIONS if k not in present]
+        refused = [k for k in present if info[k]['refused']]
+        estimable = [k for k in present if not info[k]['refused']]
         h2(f'7.{cell}')
         print(f'  conditions present: {", ".join(present) or "none"}'
               + (f'   absent: {", ".join(missing)}' if missing else ''))
+        print(f'  protocol freeze window used to select C2/C3/C3b: '
+              f'{fmt(arms["protocol_freeze_updates"])} '
+              f'({arms["protocol_freeze_updates_source"]})')
         if missing:
             print('  A contrast whose condition is absent is not computed and '
                   'not approximated.')
-        per_cond_seeds = {k: sorted(per_seed[k]) for k in present}
-        dropped = {k: sorted(set(per_cond_seeds[k]) - set(common))
-                   for k in present}
-        dropped = {k: v for k, v in dropped.items() if v}
-        if dropped:
-            print(f'  listwise-complete seeds for the JOINT estimate: '
-                  f'{common}')
-            print('  seeds present in some conditions but not all, therefore '
-                  'outside the joint')
-            print(f'  estimate (reported, not dropped silently): {dropped}')
-            ledger.deviations.append(
-                f'{cell} control set: seeds {dropped} are not complete across '
-                f'all conditions, so the joint estimate uses {common}')
+        cell_note: Optional[str] = None
+        if refused:
+            print(f'  AMBIGUOUS condition(s): {", ".join(refused)}. Every '
+                  'contrast that needs one is')
+            print('  NOT computed, on the same ground and in the same words '
+                  'as §5 (DESIGN.md §8.4):')
+            for k in refused:
+                print(f'    {k}: {info[k]["reason"]}')
+                ledger.deviations.append(
+                    f'control contrasts {metric}/{cell}: {k} is ambiguous. '
+                    f'{info[k]["reason"]}')
+            cell_note = ('ambiguous condition(s) '
+                         + ', '.join(f'{k} ({info[k]["reason"]})'
+                                     for k in refused))
+        # The joint estimate is ONE resampling of ONE per-seed vector, so it
+        # exists only where the conditions entering it match seed for seed.
+        # This used to take the intersection and analyse the survivors, which
+        # is the seed-dropping ANALYSIS_PLAN.md §8 forbids outright and which
+        # §5 refuses one section earlier; printing the dropped seeds first did
+        # not turn the result into a listwise-complete estimate.
+        seed_sets = {k: tuple(info[k]['seeds']) for k in estimable}
+        distinct = set(seed_sets.values())
+        if len(distinct) > 1:
+            print('  INCOMPLETE CONTROL SET: the conditions do not match seed '
+                  'for seed --')
+            for k in estimable:
+                print(f'    {k}: seeds {list(seed_sets[k])}')
+            print('  A partial arm is refused (DESIGN.md §8.4) and no seed is '
+                  'dropped to rescue an')
+            print('  estimate (ANALYSIS_PLAN.md §8), so the joint estimate is '
+                  'NOT computed for this')
+            print('  cell. The per-condition seeds above say exactly what is '
+                  'missing from where.')
+            reason = ('incomplete control set: '
+                      + '; '.join(f'{k} has seeds {list(seed_sets[k])}'
+                                  for k in estimable))
+            ledger.refusals.append(
+                f'control contrasts {metric}/{cell}: {reason}')
+            out['cells'][cell] = {
+                'n': 0, 'suppressed': True, 'present': present,
+                'missing': missing, 'ambiguous': refused,
+                'contrasts': [], 'correlations': [],
+                'reason': ((cell_note + '; ') if cell_note else '') + reason,
+                'protocol_freeze_updates': arms['protocol_freeze_updates'],
+                'protocol_freeze_updates_source':
+                    arms['protocol_freeze_updates_source']}
+            continue
+        common = sorted(distinct.pop()) if distinct else []
         if len(common) < MIN_N_FOR_INFERENCE:
-            print(f'  n={len(common)} < {MIN_N_FOR_INFERENCE}: no estimate and '
-                  'no interval (ANALYSIS_PLAN.md §9).')
-            out['cells'][cell] = {'n': len(common), 'suppressed': True,
-                                  'present': present, 'missing': missing}
-            ledger.other_suppressed.append(f'control contrasts {cell}: '
-                                           f'n={len(common)}')
+            print(f'  n={len(common)} < {MIN_N_FOR_INFERENCE} DISTINCT SEEDS: '
+                  'no estimate and no interval')
+            print('  (ANALYSIS_PLAN.md §9).')
+            out['cells'][cell] = {
+                'n': len(common), 'suppressed': True, 'present': present,
+                'missing': missing, 'ambiguous': refused,
+                'contrasts': [], 'correlations': [], 'reason': cell_note,
+                'protocol_freeze_updates': arms['protocol_freeze_updates'],
+                'protocol_freeze_updates_source':
+                    arms['protocol_freeze_updates_source']}
+            # The metric is in the entry. Without it, the two invocations
+            # of this section (one per co-primary endpoint) wrote two
+            # identical lines into the ledger with nothing to tell them apart.
+            ledger.other_suppressed.append(
+                f'control contrasts {metric}/{cell}: n={len(common)}')
             continue
 
         mat = np.column_stack([[per_seed[k][s] for s in common]
-                               for k in present])
-        col = {k: i for i, k in enumerate(present)}
+                               for k in estimable])
+        col = {k: i for i, k in enumerate(estimable)}
         n = mat.shape[0]
         idx = boot_indices(n, opts.n_boot, opts.boot_seed)
         usable = [c for c in contrast_defs
@@ -2048,10 +3250,8 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
         if len(keys) > 1:
             for a, b in combinations(keys, 2):
                 x, y = per_seed_contrast[a], per_seed_contrast[b]
-                rho = (float(sps.spearmanr(x, y)[0]) if n > 2
-                       else float('nan'))
-                brho = (float(sps.spearmanr(reps[a], reps[b])[0])
-                        if len(reps[a]) and len(reps[b]) else float('nan'))
+                rho = correlation('spearman', x, y)
+                brho = correlation('spearman', reps[a], reps[b])
                 crows.append({'a': a, 'b': b, 'rho_seeds': rho,
                               'rho_bootstrap_estimators': brho})
             print()
@@ -2100,12 +3300,16 @@ def section_controls(df: pd.DataFrame, opts: Options, ledger: Ledger,
             print('  learned structure dominates mechanics and the DESIGN.md '
                   '§2.2 thesis is wrong.')
 
-        out['cells'][cell] = {'n': n, 'present': present, 'missing': missing,
+        out['cells'][cell] = {'n': n, 'present': present,
+                              'missing': missing, 'ambiguous': refused,
                               'joint_seeds': common,
                               'contrasts': rows,
                               'correlations': crows if len(keys) > 1 else [],
+                              'reason': cell_note,
                               'protocol_freeze_updates':
-                                  arms['protocol_freeze_updates']}
+                                  arms['protocol_freeze_updates'],
+                              'protocol_freeze_updates_source':
+                                  arms['protocol_freeze_updates_source']}
 
     h2('7z. hypothesis bookkeeping (estimation, no p-values)')
     h1_neg = []
@@ -2168,20 +3372,42 @@ def section_c4(df: pd.DataFrame, opts: Options, ledger: Ledger,
     rows = []
     for cell in CELL_ORDER:
         cdf = iface[iface['cell'] == cell]
-        s = rows_where(cdf, condition='scratch')
-        t = protocol_match(rows_where(cdf, condition='transfer'))
+        # target_side(), for the reason scratch_arm()'s docstring gives: the C4
+        # donors are scratch runs drawn from the disjoint C4SRC block, and
+        # DESIGN.md §3.4 bars that block from target-side estimation. Selecting
+        # the baseline with a bare condition filter pooled those donors into
+        # the very baseline they are meant to be independent of, doubling
+        # n_scratch and shifting the interval.
+        s = target_side(rows_where(cdf, condition='scratch'))
+        t = protocol_match(target_side(rows_where(cdf, condition='transfer')))
         pair = paired_by_seed(t, s, metric)
         d = pair['a'] - pair['b']
         rec: dict[str, Any] = {'cell': cell, 'n': len(d),
+                               'metric': metric,
                                'n_transfer': pair['n_a'],
                                'n_scratch': pair['n_b'],
+                               'rows_transfer': pair['rows_a'],
+                               'rows_scratch': pair['rows_b'],
                                'transfer_only_seeds': pair['only_a'],
-                               'scratch_only_seeds': pair['only_b']}
-        if len(d) < MIN_N_FOR_INFERENCE:
+                               'scratch_only_seeds': pair['only_b'],
+                               'pairing_problems':
+                                   pairing_problems(pair, metric)}
+        # The pairing problems were printed and the PASS/FAIL verdict was
+        # emitted anyway, so a positive control could be declared PASS on an
+        # arm §5 would have refused. C4 is a pre-registered criterion
+        # (DESIGN.md §4.2) and a criterion evaluated on a dropped-seed sample
+        # is not the criterion.
+        refusal = paired_refusal(pair, metric)
+        if refusal:
+            rec.update({'verdict': 'suppressed',
+                        'reason': f'REFUSED: {refusal}'})
+            ledger.other_suppressed.append(f'C4 {metric}/{cell}: {refusal}')
+        elif len(d) < MIN_N_FOR_INFERENCE:
             rec.update({'verdict': 'suppressed',
                         'reason': f'n={len(d)} < {MIN_N_FOR_INFERENCE}: no '
                                   f'test, no interval (ANALYSIS_PLAN.md §9)'})
-            ledger.other_suppressed.append(f'C4 {cell}: n={len(d)}')
+            ledger.other_suppressed.append(
+                f'C4 {metric}/{cell}: n={len(d)}')
         else:
             res = bootstrap_statistic(d, hodges_lehmann_paired, opts.n_boot,
                                       opts.boot_seed, vec=hl_vec)
@@ -2202,6 +3428,8 @@ def section_c4(df: pd.DataFrame, opts: Options, ledger: Ledger,
             print(f'    incomplete arm: transfer-only seeds '
                   f'{r["transfer_only_seeds"]}, scratch-only seeds '
                   f'{r["scratch_only_seeds"]}')
+        for note in r['pairing_problems']:
+            print(f'    {note}')
     fails = [r for r in rows if r['verdict'] == 'FAIL']
     if fails:
         print()
@@ -2225,15 +3453,30 @@ def section_c4(df: pd.DataFrame, opts: Options, ledger: Ledger,
 # ---------------------------------------------------------------------------
 
 def _cell_deltas(df: pd.DataFrame, opts: Options, metric: str
-                 ) -> dict[str, dict[int, float]]:
+                 ) -> tuple[dict[str, dict[int, float]], dict[str, str]]:
+    """Per-cell paired deltas, and the cells that have none, with the reason.
+
+    The refusal is §5's: a duplicated (arm, seed) is ambiguous and a partial
+    arm is refused (`DESIGN.md` §8.4), and no seed is dropped after it has run
+    (`ANALYSIS_PLAN.md` §8). This used to return `pair['seeds']` whatever they
+    were, so the estimand §5 had just refused as an incomplete arm came back
+    in 9b over the surviving seeds, with an interval and a directional
+    sentence and nothing marking it as a dropped-seed estimate.
+    """
     out: dict[str, dict[int, float]] = {}
+    refusals: dict[str, str] = {}
     for cell in CELL_ORDER:
         cdf = df[df['cell'] == cell]
         pair = paired_by_seed(primary_transfer_arm(cdf, opts),
                               scratch_arm(cdf, opts), metric)
+        reason = paired_refusal(pair, metric)
+        if reason:
+            out[cell] = {}
+            refusals[cell] = reason
+            continue
         out[cell] = {s: float(a - b) for s, a, b in
                      zip(pair['seeds'], pair['a'], pair['b'])}
-    return out
+    return out, refusals
 
 
 def sub_rq1(df: pd.DataFrame, opts: Options, ledger: Ledger,
@@ -2248,25 +3491,65 @@ def sub_rq1(df: pd.DataFrame, opts: Options, ledger: Ledger,
     h2('9a. RQ1 -- between-cell scratch comparison (Brunner-Munzel theta = '
        'P(X>Y))')
     ledger.est('RQ1 between-cell scratch comparison')
+    # One value per seed, from the single audited helper. This took
+    # `_clean(scratch_arm(...)[metric])`, a vector of ROWS: on a tree with two
+    # run directories per (label, seed) it reported n_a=6 from 3 seeds and fed
+    # six pseudo-observations to Brunner-Munzel, whose theta and bootstrap-t
+    # interval both count independent units.
+    arms = {cell: seed_vector(scratch_arm(df[df['cell'] == cell], opts),
+                              metric, f'{cell} scratch arm')
+            for cell in CELL_ORDER}
     rows = []
     for a, b in combinations(CELL_ORDER, 2):
-        xa = _clean(scratch_arm(df[df['cell'] == a], opts)[metric])
-        xb = _clean(scratch_arm(df[df['cell'] == b], opts)[metric])
-        if not len(xa) or not len(xb):
+        sa, sb = arms[a], arms[b]
+        rec: dict[str, Any] = {'a': a, 'b': b, 'n_a': sa['n'], 'n_b': sb['n'],
+                               'rows_a': sa['n_rows'], 'rows_b': sb['n_rows']}
+        bad = [f'{c}: {v["reason"]}' for c, v in ((a, sa), (b, sb))
+               if v['refused']]
+        if bad:
+            rec['note'] = 'REFUSED: ' + '; '.join(bad)
+            rows.append(rec)
+            ledger.other_suppressed.append(
+                f'RQ1 {metric} {a} vs {b}: {rec["note"]}')
             continue
+        if not sa['n'] or not sb['n']:
+            continue
+        # ANALYSIS_PLAN.md §9: under n<3 no test and no interval, and a
+        # single-seed number may not be quoted or compared. `mean_a` and
+        # `mean_b` used to be printed side by side in one row at n_a=n_b=1,
+        # which is that comparison laid out for the reader even though
+        # Brunner-Munzel itself refused theta.
+        if min(sa['n'], sb['n']) < MIN_N_FOR_INFERENCE:
+            rec['note'] = (f'n={min(sa["n"], sb["n"])} < '
+                           f'{MIN_N_FOR_INFERENCE} distinct seeds: no number '
+                           'is quoted and no interval is emitted '
+                           '(ANALYSIS_PLAN.md §9)')
+            rows.append(rec)
+            ledger.other_suppressed.append(
+                f'RQ1 {metric} {a} vs {b}: n={min(sa["n"], sb["n"])}')
+            continue
+        xa, xb = sa['values'], sb['values']
         bm = brunner_munzel(xa, xb, opts.n_boot, opts.boot_seed)
-        rows.append({'a': a, 'b': b, 'n_a': len(xa), 'n_b': len(xb),
-                     'mean_a': float(np.mean(xa)), 'mean_b': float(np.mean(xb)),
-                     'sd_a': sd(xa), 'sd_b': sd(xb), 'theta': bm['theta'],
-                     'ci_lo': bm['lo'], 'ci_hi': bm['hi'],
-                     'note': bm['note']})
-    print(table(rows, ('a', 'b', 'n_a', 'n_b', 'mean_a', 'mean_b', 'sd_a',
-                       'sd_b', 'theta', 'ci_lo', 'ci_hi')))
+        rec.update({'mean_a': float(np.mean(xa)), 'mean_b': float(np.mean(xb)),
+                    'sd_a': sd(xa), 'sd_b': sd(xb), 'theta': bm['theta'],
+                    'ci_lo': bm['lo'], 'ci_hi': bm['hi'],
+                    'note': bm['note']})
+        rows.append(rec)
+    print(table(rows, ('a', 'b', 'n_a', 'n_b', 'rows_a', 'rows_b', 'mean_a',
+                       'mean_b', 'sd_a', 'sd_b', 'theta', 'ci_lo', 'ci_hi',
+                       'note')))
     print('  theta = P(a run of cell a scores above a run of cell b), '
           'ties at 0.5. theta = 0.5')
     print('  is no difference. Associational: no causal reading is licensed '
           '(DESIGN.md §2.4).')
+    print('  n_a and n_b are DISTINCT SEEDS; rows_a and rows_b are run '
+          'directories. Where they')
+    print('  differ the arm holds more than one run for a seed and the whole '
+          'row is withheld.')
     for r in rows:
+        if r.get('theta') is None:
+            print(f'  {r["a"]} vs {r["b"]}: {r.get("note")}')
+            continue
         print(f'  {r["a"]} vs {r["b"]}: ' + phrase_dispersion(
             r['a'], r['sd_a'], r['b'], r['sd_b']))
     return {'rows': rows}
@@ -2285,11 +3568,23 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
     """
     h2('9b. RQ3 -- between-cell contrast of deltas and the 2x2 interaction')
     ledger.est('RQ3 between-cell delta contrasts and interaction')
-    deltas = _cell_deltas(df, opts, metric)
+    deltas, delta_refusals = _cell_deltas(df, opts, metric)
+    for cell, reason in delta_refusals.items():
+        print(f'  {cell}: no paired delta is computed. {reason}')
+        ledger.refusals.append(f'RQ3 {cell} on {metric}: {reason}')
     headroom = {}
     for cell in CELL_ORDER:
-        s = _clean(scratch_arm(df[df['cell'] == cell], opts)[metric])
-        headroom[cell] = (1.0 - float(np.mean(s))) if len(s) else float('nan')
+        # Seeds, not rows, and the same refusal §3b applies. This recomputed
+        # §3b's headroom independently as `np.mean` over `_clean(...[metric])`,
+        # a ROW mean: one duplicated scratch row at final_score=99 moved this
+        # cell's headroom_a column from -0.1635 to -9.0577 while §3b beside it
+        # was already refusing the arm. The headroom feeds RQ3's pre-registered
+        # two-scale agreement gate, so a row mean standing in for a seed mean
+        # decided which wording was licensed.
+        sv = seed_vector(scratch_arm(df[df['cell'] == cell], opts), metric,
+                         f'{cell} scratch arm')
+        headroom[cell] = (float('nan') if sv['refused'] or not sv['n']
+                          else 1.0 - float(np.mean(sv['values'])))
     # Two distinct sets, because an override changes whether a contrast is
     # COMPUTED but not whether it is CONFOUNDED. Conflating them would let the
     # override quietly launder the confound out of the output.
@@ -2308,6 +3603,28 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
             rec['note'] = ('REFUSED: intensity-confounded cross-architecture '
                            'contrast (DESIGN.md §3.1)')
             rows.append(rec)
+            continue
+        gone = [c for c in (a, b) if c in delta_refusals]
+        if gone:
+            rec['note'] = ('REFUSED: ' + '; '.join(
+                f'{c}: {delta_refusals[c]}' for c in gone))
+            rows.append(rec)
+            continue
+        # The two cells' delta vectors are matched on seed here as well: a
+        # seed that ran in one cell and not the other cannot enter a
+        # between-cell contrast, and dropping it silently is the same fault
+        # one level up.
+        if set(da) != set(db):
+            rec['note'] = (
+                f'REFUSED: incomplete pairing across cells. Seeds '
+                f'{sorted(set(da) - set(db))} have a delta in {a} only and '
+                f'{sorted(set(db) - set(da))} in {b} only. A partial arm is '
+                f'refused (DESIGN.md §8.4) and no seed is dropped after '
+                f'it has run (ANALYSIS_PLAN.md §8)')
+            rows.append(rec)
+            ledger.refusals.append(
+                f'RQ3 {a} vs {b} on {metric}: the two cells do not share one '
+                'seed set, so the contrast is not computed')
             continue
         if len(common) < MIN_N_FOR_INFERENCE:
             rec['note'] = f'n={len(common)}: suppressed'
@@ -2329,11 +3646,22 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
         else:
             adj = {'estimate': float('nan'), 'lo': float('nan'),
                    'hi': float('nan')}
-        agree = ''
+        # ANALYSIS_PLAN.md §3 and DESIGN.md §2.5 require AGREEMENT between
+        # the normalised and the headroom-adjusted scale before any RQ3
+        # wording is used. The adjusted scale only exists where both cells have
+        # positive headroom, and on the real P0 data every LunarLander scratch
+        # mean exceeds 1.0, so headroom is negative in every cell, the adjusted
+        # columns came out blank, `scales` came out empty and NOTHING was
+        # printed: the requirement passed by being absent, and the raw interval
+        # was presented as though the check had been met.
         if np.isfinite(raw['lo']) and np.isfinite(adj['lo']):
             raw_excl = raw['lo'] > 0 or raw['hi'] < 0
             adj_excl = adj['lo'] > 0 or adj['hi'] < 0
             agree = 'agree' if raw_excl == adj_excl else 'DISAGREE'
+        elif np.isfinite(raw['lo']):
+            agree = 'UNAVAILABLE'
+        else:
+            agree = ''
         conf_note = ('INTENSITY-CONFOUNDED (override in force)'
                      if (a, b) in confounded_pairs else '')
         rec.update({'hl': raw['estimate'], 'ci_lo': raw['lo'],
@@ -2358,10 +3686,48 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
                   'headroom-adjusted scales DISAGREE on')
             print('    whether the interval excludes zero. No wording is '
                   'licensed for this pair.')
+            ledger.refusals.append(
+                f'RQ3 {r["a"]} vs {r["b"]}: the two scales disagree, so no '
+                'wording is licensed (ANALYSIS_PLAN.md §3)')
+        elif r.get('scales') == 'UNAVAILABLE':
+            print(f'  {r["a"]} vs {r["b"]}: the headroom-adjusted scale does '
+                  'NOT EXIST here (headroom')
+            print(f'    {fmt(r["headroom_a"])} and {fmt(r["headroom_b"])}; a '
+                  'non-positive headroom means the scratch')
+            print('    baseline is at or above the registered solved '
+                  'threshold, so "fraction of the')
+            print('    remaining distance" is undefined or sign-flipped). '
+                  'ANALYSIS_PLAN.md §3 requires')
+            print('    AGREEMENT ACROSS BOTH SCALES before any RQ3 wording is '
+                  'used, and a check that')
+            print('    cannot be computed has not been met. The interval '
+                  'above stands as an')
+            print('    estimate; NO RQ3 wording is licensed for this pair.')
+            ledger.refusals.append(
+                f'RQ3 {r["a"]} vs {r["b"]}: the headroom-adjusted scale is '
+                f'undefined (headroom {fmt(r["headroom_a"])}, '
+                f'{fmt(r["headroom_b"])}), so the two-scale agreement check of '
+                'ANALYSIS_PLAN.md §3 cannot be met and no wording is licensed')
 
     inter: dict[str, Any] = {'available': False}
     want = ['mlp-vanilla', 'mlp-double', 'dueling-vanilla', 'dueling-double']
-    if all(w in deltas and deltas[w] for w in want):
+    unequal = (len({tuple(sorted(deltas.get(w, {}))) for w in want}) > 1
+               if all(w in deltas and deltas[w] for w in want) else False)
+    if unequal:
+        print()
+        print('  2x2 interaction: REFUSED. The four cells do not share one '
+              'seed set, so the')
+        print('  interaction would be computed on the seeds that happen to '
+              'appear in all four.')
+        for w in want:
+            print(f'    {w}: seeds {sorted(deltas.get(w, {}))}')
+        print('  A partial arm is refused (DESIGN.md §8.4) and no seed is '
+              'dropped after it has')
+        print('  run (ANALYSIS_PLAN.md §8).')
+        ledger.refusals.append(
+            f'RQ3 2x2 interaction on {metric} refused: the four cells do not '
+            'share one seed set')
+    elif all(w in deltas and deltas[w] for w in want):
         common = sorted(set.intersection(*[set(deltas[w]) for w in want]))
         arch_pairs = {('mlp-vanilla', 'dueling-vanilla'),
                       ('mlp-double', 'dueling-double')}
@@ -2390,13 +3756,46 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
                 mat, interaction, opts.n_boot, opts.boot_seed,
                 vec=lambda S: hl_vec((S[..., 3] - S[..., 2])
                                      - (S[..., 1] - S[..., 0])))
+            hs = [headroom.get(w, float('nan')) for w in want]
+            scales_ok = all(np.isfinite(h) and h > 0 for h in hs)
+            if scales_ok:
+                hh = np.asarray(hs, dtype=float)
+                adj_res = bootstrap_statistic(
+                    mat / hh, interaction, opts.n_boot, opts.boot_seed,
+                    vec=lambda S: hl_vec((S[..., 3] - S[..., 2])
+                                         - (S[..., 1] - S[..., 0])))
+                raw_excl = res['lo'] > 0 or res['hi'] < 0
+                adj_excl = adj_res['lo'] > 0 or adj_res['hi'] < 0
+                inter_scales = 'agree' if raw_excl == adj_excl else 'DISAGREE'
+            else:
+                adj_res = {'estimate': float('nan'), 'lo': float('nan'),
+                           'hi': float('nan')}
+                inter_scales = 'UNAVAILABLE'
             print()
             print(f'  2x2 interaction (target_rule effect on delta, dueling '
                   f'minus mlp), n={len(common)}:')
             print(f'    HL {res["estimate"]:+.4f}   95% CI '
                   f'[{res["lo"]:+.4f}, {res["hi"]:+.4f}]')
-            print('    ' + phrase_interval_verdict(res['lo'], res['hi'],
-                                                   'the interaction'))
+            print(f'    headroom-adjusted HL {fmt(adj_res["estimate"])}   '
+                  f'95% CI [{fmt(adj_res["lo"])}, {fmt(adj_res["hi"])}]   '
+                  f'scales: {inter_scales}')
+            if inter_scales == 'agree':
+                print('    ' + phrase_interval_verdict(res['lo'], res['hi'],
+                                                       'the interaction'))
+            else:
+                print('    NO WORDING IS LICENSED for the interaction: the '
+                      'headroom-adjusted scale')
+                print(f'    {"disagrees with" if inter_scales == "DISAGREE" else "does not exist for"} '
+                      'the normalised one, and ANALYSIS_PLAN.md §3 requires '
+                      'agreement')
+                print('    across both scales before an RQ3 statement is '
+                      'made. The interval stands as')
+                print('    an estimate and nothing is said about its '
+                      'direction.')
+                ledger.refusals.append(
+                    f'RQ3 2x2 interaction: two-scale agreement '
+                    f'{inter_scales}, so no wording is licensed '
+                    '(ANALYSIS_PLAN.md §3)')
             print('    MDE for this contrast is ~2.7 sigma '
                   '(ANALYSIS_PLAN.md §6), larger than any')
             print('    plausible effect, so this is an interval by design and '
@@ -2406,6 +3805,10 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
             inter = {'available': True, 'n': len(common),
                      'hl': res['estimate'], 'ci_lo': res['lo'],
                      'ci_hi': res['hi'],
+                     'hl_headroom_adj': adj_res['estimate'],
+                     'adj_lo': adj_res['lo'], 'adj_hi': adj_res['hi'],
+                     'scales': inter_scales,
+                     'wording_licensed': bool(inter_scales == 'agree'),
                      'intensity_confounded': bool(confounded)}
     else:
         print('  2x2 interaction: not all four cells have paired deltas; not '
@@ -2448,29 +3851,61 @@ def sub_rq5(df: pd.DataFrame, opts: Options, ledger: Ledger,
         rows = []
         groups = []
         order_vals = []
+        level_seeds = []
+        refusals: list[str] = []
         for lab, canonical in present:
             sub = df[df['env'] == canonical]
             per_cell = []
+            seeds: set[int] = set()
             for cell in CELL_ORDER:
                 cdf = sub[sub['cell'] == cell]
                 t = protocol_match(rows_where(cdf, condition='transfer'))
                 s = rows_where(cdf, condition='scratch')
                 pair = paired_by_seed(t, s, metric)
+                # The refusal §5 makes, made here too: an ambiguous or partial
+                # arm contributes no deltas rather than contributing the ones
+                # that happen to pair.
+                reason = paired_refusal(pair, metric)
+                if reason:
+                    refusals.append(f'{lab}/{cell}: {reason}')
+                    continue
                 per_cell.extend((pair['a'] - pair['b']).tolist())
+                seeds.update(int(x) for x in pair['seeds'])
             groups.append(np.asarray(per_cell, dtype=float))
+            level_seeds.append(seeds)
             order_vals.append(envs.family_level_value(family, canonical))
             rows.append({'level': lab, 'shift_value':
                          envs.family_level_value(family, canonical),
+                         'n_seeds': len(seeds),
                          'n_deltas': len(per_cell),
                          'mean_delta': (float(np.mean(per_cell))
                                         if per_cell else None),
                          'sd_delta': sd(per_cell)})
-        print(table(rows, ('level', 'shift_value', 'n_deltas', 'mean_delta',
-                           'sd_delta')))
-        if sum(len(g) for g in groups) < MIN_N_FOR_INFERENCE * 2:
-            print('    too few deltas for a trend estimate; suppressed.')
+        print(table(rows, ('level', 'shift_value', 'n_seeds', 'n_deltas',
+                           'mean_delta', 'sd_delta')))
+        print('    n_seeds is DISTINCT SEEDS at that level; n_deltas pools '
+              'the four cells, so it')
+        print('    counts up to four deltas per seed. The independent unit is '
+              'the seed.')
+        for note in refusals:
+            print(f'    no delta from {note}')
+        # ANALYSIS_PLAN.md §9's floor is on independent units, and the unit
+        # here is the SEED. The gate was `sum(len(g) for g in groups) <
+        # MIN_N_FOR_INFERENCE * 2` over pooled deltas, so two seeds across four
+        # cells and two levels gave 16 pseudo-observations and walked past a
+        # floor of 6 while no level held more than two independent units.
+        smallest = min((len(s) for s in level_seeds), default=0)
+        if smallest < MIN_N_FOR_INFERENCE:
+            print(f'    the smallest level holds {smallest} distinct seed(s), '
+                  f'below the floor of {MIN_N_FOR_INFERENCE}: no trend '
+                  'estimate and no')
+            print('    interval (ANALYSIS_PLAN.md §9). Pooling the four cells '
+                  'multiplies the row')
+            print('    count but not the number of independent units.')
             out[family] = {'available': False, 'levels': rows,
-                           'n': int(sum(len(g) for g in groups))}
+                           'n': int(sum(len(g) for g in groups)),
+                           'n_seeds_smallest_level': smallest,
+                           'refusals': refusals}
             continue
         order = np.argsort(np.asarray(order_vals))
         ordered = [groups[i] for i in order]
@@ -2504,6 +3939,15 @@ def sub_rq5(df: pd.DataFrame, opts: Options, ledger: Ledger,
     return out
 
 
+#: The column `DESIGN.md` §2.4 RQ6 requires on the budget side of the
+#: comparison: the score at the SINGLE final evaluation checkpoint. It is not
+#: `final_score`, which `aggregate.py` defines as the mean over the final k=3
+#: checkpoints (`DESIGN.md` §5.2 P1), and it is not in `per_seed.csv` today.
+#: Named here so the refusal below points at a column somebody can add rather
+#: than at a vague absence.
+RQ6_FINAL_CHECKPOINT_COLUMN = 'final_checkpoint_score'
+
+
 def sub_rq6(df: pd.DataFrame, opts: Options, ledger: Ledger,
             metric: str) -> dict:
     """RQ6 -- budget, via the prefix evaluations.
@@ -2512,6 +3956,25 @@ def sub_rq6(df: pd.DataFrame, opts: Options, ledger: Ledger,
     elapsed env steps and never reads the budget, so a 500-episode prefix *is*
     what a 500-episode run would have produced (`DESIGN.md` §2.4 RQ6);
     `validate.py` asserts that identifying condition.
+
+    **The comparison is like with like, or it is not made.** `DESIGN.md` §2.4
+    RQ6 is explicit: the 500-prefix score is a single held-out checkpoint, so
+    it is compared against the *single* final checkpoint, "never against the
+    three-checkpoint mean". The version this replaces compared
+    `prefix_score_500` against `final_score`, which is exactly that
+    three-checkpoint mean, and then emitted a budget-dependence conclusion from
+    the mismatch. `per_seed.csv` carries no single-final-checkpoint column, so
+    the correct response is the one `section_convergence` gives for the missing
+    slope standard error: name the column and refuse, rather than substitute
+    the nearest available number.
+
+    What is emitted instead is each prefix's own paired delta with its
+    interval, which is a well-defined estimate at that prefix and needs no
+    counterpart. No sign-change sentence is generated from it: a sign change
+    is a directional conclusion, and §9 forbids one at n<3 while `DESIGN.md`
+    §9 forbids one from an interval that covers zero. Both conditions are
+    checked before any such sentence can be printed, and they are checked on
+    the intervals rather than on the means.
     """
     h2('9d. RQ6 -- does the conclusion depend on the budget?')
     ledger.est('RQ6 budget prefixes')
@@ -2520,30 +3983,90 @@ def sub_rq6(df: pd.DataFrame, opts: Options, ledger: Ledger,
     if not prefixes:
         print('  no prefix_score_* columns: not computed.')
         return {'available': False}
+
+    final_col = RQ6_FINAL_CHECKPOINT_COLUMN
+    like_for_like = final_col in df.columns and bool(_clean(df[final_col]).size)
+    print(f'  prefix columns present: {prefixes}')
+    if like_for_like:
+        print(f'  budget side: {final_col}, the single final checkpoint, '
+              'which is what DESIGN.md')
+        print('  §2.4 RQ6 requires against a single prefix checkpoint.')
+    else:
+        print('  budget side: NOT AVAILABLE. DESIGN.md §2.4 RQ6 compares the '
+              'prefix checkpoint')
+        print('  against the SINGLE final checkpoint, "never against the '
+              'three-checkpoint mean".')
+        print(f'  per_seed.csv carries {metric} (the mean over the final k=3 '
+              'checkpoints, DESIGN.md')
+        print(f'  §5.2 P1) and no {final_col!r} column, so the like-for-like '
+              'comparison cannot be')
+        print('  made. It is NOT approximated with the three-checkpoint mean: '
+              'that mismatch is')
+        print('  what produced the budget-dependence conclusion this section '
+              'used to emit.')
+        ledger.deviations.append(
+            f'RQ6 budget comparison not made: per_seed.csv has no '
+            f'{final_col!r} column, and DESIGN.md §2.4 RQ6 forbids comparing '
+            f'the single prefix checkpoint against {metric}, the mean over the '
+            'final k=3 checkpoints. aggregate.py would have to expose the '
+            'per-checkpoint score the manifest already records')
+
     rows = []
     for cell in CELL_ORDER:
         cdf = df[df['cell'] == cell]
-        end = paired_by_seed(primary_transfer_arm(cdf, opts),
-                             scratch_arm(cdf, opts), metric)
-        end_d = end['a'] - end['b']
+        t_arm = primary_transfer_arm(cdf, opts)
+        s_arm = scratch_arm(cdf, opts)
+        end_d = np.array([], dtype=float)
+        if like_for_like:
+            end = paired_by_seed(t_arm, s_arm, final_col)
+            end_d = end['a'] - end['b']
         for p in prefixes:
             col = f'prefix_score_{p}'
-            pre = paired_by_seed(primary_transfer_arm(cdf, opts),
-                                 scratch_arm(cdf, opts), col)
+            pre = paired_by_seed(t_arm, s_arm, col)
             d = pre['a'] - pre['b']
-            rec = {'cell': cell, 'prefix': p, 'n': len(d),
-                   'delta_at_prefix': (float(np.mean(d)) if len(d) else None),
-                   'delta_at_budget': (float(np.mean(end_d)) if len(end_d)
-                                       else None)}
+            rec: dict[str, Any] = {'cell': cell, 'prefix': p, 'n': len(d),
+                                   'n_budget': len(end_d)}
+            # A mean of fewer than three paired deltas is a single-seed or
+            # two-seed number, and ANALYSIS_PLAN.md §9 forbids quoting one. It
+            # used to be printed in this table at n=1 and then compared against
+            # the budget number beside it.
             if len(d) >= MIN_N_FOR_INFERENCE:
                 res = bootstrap_statistic(d, hodges_lehmann_paired,
                                           opts.n_boot, opts.boot_seed,
                                           vec=hl_vec)
-                rec.update({'hl': res['estimate'], 'ci_lo': res['lo'],
-                            'ci_hi': res['hi']})
+                rec.update({'delta_at_prefix': float(np.mean(d)),
+                            'hl': res['estimate'], 'ci_lo': res['lo'],
+                            'ci_hi': res['hi'],
+                            'prefix_excludes_zero':
+                                bool(np.isfinite(res['lo'])
+                                     and (res['lo'] > 0 or res['hi'] < 0))})
+            else:
+                rec.update({'delta_at_prefix': None, 'hl': None,
+                            'ci_lo': None, 'ci_hi': None,
+                            'prefix_excludes_zero': False,
+                            'note': f'n={len(d)} < {MIN_N_FOR_INFERENCE}: no '
+                                    'estimate and no interval '
+                                    '(ANALYSIS_PLAN.md §9)'})
+            if like_for_like and len(end_d) >= MIN_N_FOR_INFERENCE:
+                bres = bootstrap_statistic(end_d, hodges_lehmann_paired,
+                                           opts.n_boot, opts.boot_seed,
+                                           vec=hl_vec)
+                rec.update({'delta_at_budget': float(np.mean(end_d)),
+                            'budget_hl': bres['estimate'],
+                            'budget_ci_lo': bres['lo'],
+                            'budget_ci_hi': bres['hi'],
+                            'budget_excludes_zero':
+                                bool(np.isfinite(bres['lo'])
+                                     and (bres['lo'] > 0 or bres['hi'] < 0))})
+            else:
+                rec.update({'delta_at_budget': None, 'budget_hl': None,
+                            'budget_ci_lo': None, 'budget_ci_hi': None,
+                            'budget_excludes_zero': False})
             rows.append(rec)
-    print(table(rows, ('cell', 'prefix', 'n', 'delta_at_prefix',
-                       'delta_at_budget', 'hl', 'ci_lo', 'ci_hi')))
+    print()
+    print(table(rows, ('cell', 'prefix', 'n', 'delta_at_prefix', 'hl',
+                       'ci_lo', 'ci_hi', 'delta_at_budget', 'budget_hl',
+                       'budget_ci_lo', 'budget_ci_hi', 'note')))
     if all(r['n'] == 0 for r in rows):
         print(f'  The prefix columns {prefixes} exist but hold no values in '
               'this dataset, so RQ6')
@@ -2553,19 +4076,45 @@ def sub_rq6(df: pd.DataFrame, opts: Options, ledger: Ledger,
         ledger.deviations.append(
             'RQ6 not estimable: prefix_score_* columns are present but empty, '
             'so no episode-prefix re-evaluation exists in this dataset')
-    print('  A sign change between a prefix and the budget would mean the '
-          'conclusion is')
-    print('  budget-dependent, which is itself a finding and is reported as '
-          'one.')
-    for r in rows:
-        a, b = r.get('delta_at_prefix'), r.get('delta_at_budget')
-        if a is not None and b is not None and np.isfinite(a) \
-                and np.isfinite(b) and a * b < 0:
+
+    changes = []
+    if like_for_like:
+        print('  A sign change between the prefix and the budget would mean '
+              'the conclusion is')
+        print('  budget-dependent, which is itself a finding. It is reported '
+              'ONLY when both sides')
+        print('  reach n >= '
+              f'{MIN_N_FOR_INFERENCE} and BOTH intervals exclude zero in '
+              'opposite directions:')
+        print('  a change of sign in two point estimates whose intervals both '
+              'cover zero is')
+        print('  direction read out of noise (DESIGN.md §9).')
+        for r in rows:
+            a, b = r.get('hl'), r.get('budget_hl')
+            if a is None or b is None:
+                continue
+            if not (r['prefix_excludes_zero'] and r['budget_excludes_zero']):
+                continue
+            if a * b >= 0:
+                continue
+            changes.append(r)
             print(f'  {r["cell"]}: the delta CHANGES SIGN between prefix '
-                  f'{r["prefix"]} ({a:+.4f}) and the')
-            print(f'    budget ({b:+.4f}). The conclusion is budget-dependent '
-                  'in this cell.')
-    return {'available': True, 'rows': rows, 'prefixes': prefixes}
+                  f'{r["prefix"]} (HL {a:+.4f}, CI')
+            print(f'    [{r["ci_lo"]:+.4f}, {r["ci_hi"]:+.4f}]) and the budget '
+                  f'(HL {b:+.4f}, CI [{r["budget_ci_lo"]:+.4f}, '
+                  f'{r["budget_ci_hi"]:+.4f}]).')
+            print('    Both intervals exclude zero, so the conclusion is '
+                  'budget-dependent in this cell.')
+        if not changes:
+            print('  No cell meets those conditions, so no budget-dependence '
+                  'statement is made in')
+            print('  either direction: this is the absence of a licensed '
+                  'claim, not evidence that')
+            print('  the conclusion is budget-independent.')
+    return {'available': True, 'rows': rows, 'prefixes': prefixes,
+            'like_for_like': like_for_like,
+            'budget_column': final_col if like_for_like else None,
+            'sign_changes': [f'{r["cell"]}@{r["prefix"]}' for r in changes]}
 
 
 def sub_dispersion(df: pd.DataFrame, opts: Options, ledger: Ledger,
@@ -2587,8 +4136,23 @@ def sub_dispersion(df: pd.DataFrame, opts: Options, ledger: Ledger,
                               scratch_arm(cdf, opts), metric)
         n = len(pair['seeds'])
         rec: dict[str, Any] = {'cell': cell, 'n': n,
-                               'sd_scratch': sd(pair['b']),
-                               'sd_transfer': sd(pair['a'])}
+                               'rows_transfer': pair['rows_a'],
+                               'rows_scratch': pair['rows_b']}
+        # §5's refusal, in §5's words. This section took whatever paired and
+        # printed an "across-seed spread" ratio over it: with one seed missing
+        # from the transfer arm it reported "mlp-vanilla transfer has an
+        # across-seed spread 1.13x wider than mlp-vanilla scratch" at n=9,
+        # unmarked, one section after §5 refused the same arm as incomplete.
+        reason = paired_refusal(pair, metric)
+        if reason:
+            rec.update({'sd_scratch': None, 'sd_transfer': None,
+                        'brown_forsythe_W': None,
+                        'note': f'REFUSED: {reason}'})
+            rows.append(rec)
+            ledger.other_suppressed.append(
+                f'dispersion {metric}/{cell}: {reason}')
+            continue
+        rec.update({'sd_scratch': sd(pair['b']), 'sd_transfer': sd(pair['a'])})
         if n >= MIN_N_FOR_INFERENCE:
             mat = np.column_stack([pair['a'], pair['b']])
 
@@ -2609,13 +4173,30 @@ def sub_dispersion(df: pd.DataFrame, opts: Options, ledger: Ledger,
 
             res = bootstrap_statistic(mat, ratio, opts.n_boot, opts.boot_seed,
                                       vec=ratio_vec)
-            bf = sps.levene(pair['a'], pair['b'], center='median')
+            # Brown-Forsythe divides by a pooled spread of absolute deviations
+            # from the median, which is exactly zero when an arm is constant.
+            # SciPy then divides by zero, writes a RuntimeWarning to a stream
+            # nothing here captures, and returns NaN. The degenerate case is
+            # detected instead and reported as not estimable, which is what a
+            # constant arm means.
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                bf = sps.levene(pair['a'], pair['b'], center='median')
+            w = float(bf.statistic)
             rec.update({'sd_ratio': res['estimate'], 'ci_lo': res['lo'],
                         'ci_hi': res['hi'],
-                        'brown_forsythe_W': float(bf.statistic)})
+                        'brown_forsythe_W': (w if np.isfinite(w) else None),
+                        'note': ('' if np.isfinite(w) else
+                                 'Brown-Forsythe W is not estimable: an arm '
+                                 'has zero spread about its median')})
         rows.append(rec)
-    print(table(rows, ('cell', 'n', 'sd_scratch', 'sd_transfer', 'sd_ratio',
-                       'ci_lo', 'ci_hi', 'brown_forsythe_W')))
+    print(table(rows, ('cell', 'n', 'rows_transfer', 'rows_scratch',
+                       'sd_scratch', 'sd_transfer', 'sd_ratio', 'ci_lo',
+                       'ci_hi', 'brown_forsythe_W', 'note')))
+    print('  n is DISTINCT SEEDS in the paired sample; rows_* are run '
+          'directories. A cell whose')
+    print('  arms are ambiguous or do not match seed for seed carries no '
+          'ratio at all.')
     print('  Brown-Forsythe W is shown for continuity with the published '
           'analysis; its')
     print('  p-value is WITHHELD, because no p-value is emitted outside the '
@@ -2628,33 +4209,109 @@ def sub_dispersion(df: pd.DataFrame, opts: Options, ledger: Ledger,
                                            r['sd_transfer'],
                                            f'{r["cell"]} scratch',
                                            r['sd_scratch']))
+        elif r.get('note'):
+            # A cell with no ratio says why, in one place, rather than leaving
+            # the reader to read a blank row as an absence of difference.
+            print(f'  {r["cell"]}: no dispersion statement is made. '
+                  f'{r["note"]}')
+    wrows = []
     if 'within_run_sd' in df.columns:
         print()
         print('  within_run_sd (training instability) and the across-seed SD '
               'above (seed')
         print('  sensitivity) are DIFFERENT metrics; the published study '
               'conflated them:')
-        wrows = []
-        for (cell, cond), g in df.groupby(['cell', 'condition']):
-            v = _clean(g['within_run_sd'])
-            if len(v):
-                wrows.append({'cell': cell, 'condition': cond, 'n': len(v),
-                              'within_run_sd_mean': float(np.mean(v))})
-        print(table(wrows, ('cell', 'condition', 'n', 'within_run_sd_mean')))
-    return {'rows': rows}
+        # Restricted to the target environment and to target-side blocks. This
+        # table used to be built from the whole frame, so one row labelled
+        # "dueling-double scratch n=40" pooled CartPole source runs, the
+        # LunarLander scratch arm, the padded interface variant and the C4SRC
+        # donor arm into a single mean, across scales that DESIGN.md §5.1
+        # normalises separately and across a block §3.4 bars from target-side
+        # estimation. The section header claims 9f-9j are restricted to the
+        # target environment; 9e was not, and was not covered by that sentence.
+        wdf = target_side(df[df['env'] == opts.target_env])
+        print(f'  restricted to {opts.target_env} and to target-side seed '
+              f'blocks: {len(wdf)} of {len(df)} run(s).')
+        # Grouped by label as well as by condition: two arms can share a
+        # condition and differ in protocol (the matched and trunk transfer
+        # sets, say), and averaging across them would report a number that
+        # belongs to no arm.
+        for (cell, cond, label), g in wdf.groupby(['cell', 'condition',
+                                                   'label'], dropna=False):
+            # Seeds, not rows, from the same helper as everything else. `n`
+            # here was `len(_clean(g['within_run_sd']))`, so an arm with two
+            # run directories per seed reported twice the sample it had and a
+            # mean over the duplicated rows.
+            sv = seed_vector(g, 'within_run_sd', f'{label} arm')
+            if not sv['n'] and not sv['refused']:
+                continue
+            wrows.append({
+                'env': opts.target_env, 'cell': cell, 'condition': cond,
+                'label': label, 'n': sv['n'], 'n_rows': sv['n_rows'],
+                'within_run_sd_mean': (None if sv['refused'] else
+                                       float(np.mean(sv['values']))),
+                'note': sv['reason'] or ''})
+        print(table(wrows, ('env', 'cell', 'condition', 'label', 'n', 'n_rows',
+                            'within_run_sd_mean', 'note')))
+        print('  n is DISTINCT SEEDS; n_rows is run directories.')
+    return {'rows': rows, 'within_run_sd': wrows}
+
+
+#: The column that would carry the end of the freeze window on the same clock
+#: as `steps_to_threshold`, i.e. in env steps. `ANALYSIS_PLAN.md` §5 asks for
+#: Kaplan-Meier "with delayed entry at the end of the freeze window where a
+#: freeze is in force", and the freeze window is indexed in gradient UPDATES
+#: (`DESIGN.md` §1), not env steps. Converting one to the other needs the
+#: run's own update-to-step ratio, and a ratio inferred from two totals is an
+#: approximation invented here rather than a measurement, which is what
+#: `section_convergence` refuses to do for the missing slope SE. So the column
+#: is named and the requirement is refused where it bites.
+FREEZE_END_COLUMN = 'freeze_end_env_steps'
 
 
 def sub_censored(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
     """Censored metrics: Kaplan-Meier and an exact interval on P(reached).
 
-    `ANALYSIS_PLAN.md` §5. The censoring is administrative -- the same budget
-    for every run, independent of the event time by construction -- which is the
+    `ANALYSIS_PLAN.md` §5. The censoring is administrative: the same budget for
+    every run, independent of the event time by construction, which is the
     benign case. The budget is never imputed as an observation and no censored
     run is dropped.
+
+    Three defects the previous version had, each of which deleted data
+    silently:
+
+    * `t = _clean(g[tcol])` stripped non-finite times while the event vector
+      was built from the whole group, so `len(t) != len(ev)` and the WHOLE ARM
+      hit `continue` and vanished from the table with no message anywhere in
+      the report. That is the exact failure §5 names: "never drop censored
+      runs (conditions on the outcome, and reintroduces the silent-seed-
+      dropping defect)". Times and events are now kept aligned row by row, a
+      run with no usable time is counted and named, and it never removes the
+      arm around it.
+    * `bool(v) if v is not None else True` read an unknown censoring flag as
+      censored, so schema drift reported 0/n reached for every arm. An unknown
+      flag is now its own category and enters neither numerator nor
+      denominator.
+    * `p_reached` and its Clopper-Pearson interval were emitted at n=1
+      (p_reached 1.0000, CI [0.0250, 1.0000] for 24 arms), which §9 forbids:
+      under n<3 no test and no interval is emitted.
+
+    A fourth, which is the row-versus-seed confusion the rest of this module
+    was rewritten around: `n_prop` counted ROWS carrying a readable censoring
+    flag, so an arm holding two run directories for one seed presented twice
+    the independent units it had. The Clopper-Pearson interval is an exact
+    binomial interval whose n is a count of independent units, and the
+    Kaplan-Meier risk set is the same count, so on the repo's own `runs_demo`
+    tree a 3-seed arm reported proportions out of 6 with intervals on six
+    pseudo-units. An arm with more than one row for a seed is now refused
+    exactly as §5 refuses it, and it leaves the log-rank comparisons too:
+    without duplicates rows and seeds coincide, so nothing else changes.
     """
     h2('9f. steps_to_threshold -- right-censored at the budget')
     ledger.est('censored steps-to-threshold (Kaplan-Meier, Clopper-Pearson)')
     out: dict[str, Any] = {}
+    entry_available = FREEZE_END_COLUMN in df.columns
+    frozen_arms = 0
     for tag, level in THRESHOLD_LEVELS:
         tcol, ccol = f'steps_to_threshold_{tag}', f'censored_{tag}'
         if tcol not in df.columns or ccol not in df.columns:
@@ -2664,23 +4321,115 @@ def sub_censored(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
         arms: dict[tuple[str, str], dict] = {}
         for (cell, cond, label), g in df.groupby(['cell', 'condition',
                                                   'label'], dropna=False):
-            t = _clean(g[tcol])
-            cens = g[ccol].map(lambda v: bool(v) if v is not None else True)
-            ev = ~np.asarray(cens.tolist(), dtype=bool)
-            if len(t) != len(ev) or not len(t):
+            # The unit of the proportion and of the risk set is the SEED, so
+            # two run directories recorded for one seed are one unit and not
+            # two. Which of them to keep is not decidable here, so the arm is
+            # refused rather than counted twice (DESIGN.md §8.4).
+            seed_counts: dict[int, int] = {}
+            for s in g['seed']:
+                seed_counts[int(s)] = seed_counts.get(int(s), 0) + 1
+            dup_seeds = sorted(s for s, c in seed_counts.items() if c > 1)
+            times = np.asarray(pd.to_numeric(g[tcol], errors='coerce'),
+                               dtype=float)
+            flags = [parse_boolean(v)[1] for v in g[ccol]]
+            n_runs = len(g)
+            unknown = int(sum(1 for v in flags if v is None))
+            censored = np.asarray([bool(v) for v in flags], dtype=bool)
+            known = np.asarray([v is not None for v in flags], dtype=bool)
+            usable_time = np.isfinite(times)
+            no_time = int(np.sum(~usable_time))
+            # Reached, not reached, and not known: three categories, and only
+            # the first two form the proportion. Counted over SEEDS, so the
+            # column named n_in_proportion holds the number the exact interval
+            # is entitled to use; where no seed is duplicated this is the same
+            # number the row count gave, and where one is the arm is refused
+            # below rather than credited with the extra unit.
+            reached = known & ~censored
+            in_denominator = known
+            seeds_col = [int(s) for s in g['seed']]
+            k = len({s for s, ok in zip(seeds_col, reached) if ok})
+            n_prop = len({s for s, ok in zip(seeds_col, in_denominator) if ok})
+            # A run that reached the threshold but recorded no time cannot
+            # enter a curve; a censored run with no time is a censored run
+            # whose censoring time was not written down. Both are counted.
+            curve_rows = usable_time & known
+            if dup_seeds:
+                # No curve and no proportion from an ambiguous arm, and it does
+                # not enter the log-rank either.
+                curve_rows = np.zeros(len(g), dtype=bool)
+            freeze = sorted(set(g['freeze_updates'].dropna().unique().tolist()))
+            has_freeze = bool(freeze) and max(float(f) for f in freeze) > 0
+            entry = None
+            if has_freeze:
+                frozen_arms += 1
+                if entry_available:
+                    entry = np.asarray(
+                        pd.to_numeric(g[FREEZE_END_COLUMN], errors='coerce'),
+                        dtype=float)[curve_rows]
+            km = kaplan_meier(times[curve_rows],
+                              reached[curve_rows], entry)
+            arms[(cell, label)] = {'t': times[curve_rows],
+                                   'e': reached[curve_rows]}
+            rec: dict[str, Any] = {
+                'cell': cell, 'condition': cond, 'label': label,
+                'n': n_runs, 'n_in_proportion': n_prop, 'reached': k,
+                'no_time_recorded': no_time,
+                'unknown_censoring': unknown,
+                'duplicated_seeds': dup_seeds,
+                'delayed_entry': bool(km['delayed_entry'])}
+            if dup_seeds:
+                rec.update({'p_reached': None, 'cp_lo': None, 'cp_hi': None,
+                            'km_median_steps': None,
+                            'note': f'REFUSED: seed(s) {dup_seeds} have '
+                                    f'more than one run in this arm, so '
+                                    f'neither the proportion nor the risk set '
+                                    f'has a well-defined n. The arm is '
+                                    f'ambiguous and is not resolved by '
+                                    f'keeping one row (DESIGN.md §8.4)'})
+                ledger.other_suppressed.append(
+                    f'P(reached {tag}) {cell}/{label}: seed(s) {dup_seeds} '
+                    f'carry more than one run')
+                rows.append(rec)
                 continue
-            k = int(np.sum(ev))
-            lo, hi = clopper_pearson(k, len(t))
-            km = kaplan_meier(t, ev)
-            arms[(cell, label)] = {'t': t, 'e': ev}
-            rows.append({'cell': cell, 'condition': cond, 'label': label,
-                         'n': len(t), 'reached': k,
-                         'p_reached': k / len(t), 'cp_lo': lo, 'cp_hi': hi,
-                         'km_median_steps': km['median']})
+            if n_prop >= MIN_N_FOR_INFERENCE:
+                lo, hi = clopper_pearson(k, n_prop)
+                rec.update({'p_reached': k / n_prop, 'cp_lo': lo, 'cp_hi': hi,
+                            'km_median_steps': km['median'], 'note': ''})
+            else:
+                # The KM median goes too. At n=1 it is that single run's own
+                # event time wearing the name of an arm-level summary, and §9
+                # forbids quoting a single-seed number, not only testing one.
+                rec.update({'p_reached': None, 'cp_lo': None, 'cp_hi': None,
+                            'km_median_steps': None,
+                            'note': f'n={n_prop} < {MIN_N_FOR_INFERENCE}: no '
+                                    'proportion, no interval and no median '
+                                    '(ANALYSIS_PLAN.md §9)'})
+                ledger.other_suppressed.append(
+                    f'P(reached {tag}) {cell}/{label}: n={n_prop}')
+            if no_time or unknown:
+                bits = []
+                if no_time:
+                    bits.append(f'{no_time} run(s) have no {tcol} value')
+                if unknown:
+                    bits.append(f'{unknown} run(s) have no readable {ccol} '
+                                'flag')
+                rec['note'] = ((rec['note'] + '; ') if rec['note'] else '') \
+                    + ', '.join(bits) + ' (reported, not dropped)'
+            rows.append(rec)
         print(f'  threshold = normalised score {level}')
-        print(table(rows, ('cell', 'condition', 'label', 'n', 'reached',
-                           'p_reached', 'cp_lo', 'cp_hi',
-                           'km_median_steps')))
+        print(table(rows, ('cell', 'condition', 'label', 'n',
+                           'n_in_proportion', 'reached', 'p_reached', 'cp_lo',
+                           'cp_hi', 'km_median_steps', 'no_time_recorded',
+                           'unknown_censoring', 'duplicated_seeds', 'note')))
+        print('  n_in_proportion counts SEEDS with a readable censoring flag: '
+              'the exact interval')
+        print('  and the risk set both count independent units, and two run '
+              'directories for one')
+        print('  seed are one unit. An arm with a duplicated seed carries no '
+              'proportion.')
+        for r in rows:
+            if r['no_time_recorded'] or r['unknown_censoring']:
+                print(f'    {r["cell"]}/{r["label"]}: {r["note"]}')
         lr = []
         for cell in CELL_ORDER:
             keys = [k for k in arms if k[0] == cell]
@@ -2701,6 +4450,37 @@ def sub_censored(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
           'informative')
     print('  statement, and it replaces a p-value entirely '
           '(ANALYSIS_PLAN.md §5).')
+    if frozen_arms and not entry_available:
+        print()
+        print('  DELAYED ENTRY NOT APPLIED. ANALYSIS_PLAN.md §5 asks for '
+              'Kaplan-Meier curves')
+        print('  "with delayed entry at the end of the freeze window where a '
+              'freeze is in')
+        print(f'  force", and {frozen_arms} arm-threshold combination(s) here '
+              'do have a freeze in')
+        print('  force. The freeze window is indexed in gradient UPDATES '
+              '(DESIGN.md §1) while')
+        print(f'  steps_to_threshold is in env steps, and per_seed.csv carries '
+              f'no {FREEZE_END_COLUMN!r}')
+        print('  column to convert it. The curves above are therefore '
+              'left-truncation-free, which')
+        print('  overstates the risk set before the freeze ends. This is '
+              'stated rather than')
+        print('  silently unimplemented, and kaplan_meier() takes the entry '
+              'times as soon as the')
+        print('  column exists.')
+        ledger.deviations.append(
+            f'ANALYSIS_PLAN.md §5 delayed entry not applied: {frozen_arms} '
+            f'arm(s) have a freeze in force and per_seed.csv carries no '
+            f'{FREEZE_END_COLUMN!r} (the freeze window is in gradient updates, '
+            'steps_to_threshold is in env steps, and inferring the ratio would '
+            'be an approximation rather than a measurement)')
+    # Nested in a dict, not left as loose scalars: report.py walks this
+    # mapping expecting every value to be a per-threshold block it can call
+    # `.get('arms')` on.
+    out['_delayed_entry'] = {'available': entry_available,
+                             'arms_with_freeze': frozen_arms,
+                             'column_required': FREEZE_END_COLUMN}
     return out
 
 
@@ -2744,20 +4524,39 @@ def sub_secondary(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
             pair = paired_by_seed(primary_transfer_arm(cdf, opts),
                                   scratch_arm(cdf, opts), col)
             d = pair['a'] - pair['b']
+            # The two arm means are placed in one row, which is an
+            # invitation to compare them. ANALYSIS_PLAN.md §9 forbids a number
+            # from fewer than three seeds being quoted or compared, so below
+            # the floor the row carries its n and nothing else: it used to
+            # print, at n=1, probe_jumpstart_score mlp-vanilla -1.2906 against
+            # -1.3260, which is the comparison §9 names.
+            # §5's refusal, in §5's words: an ambiguous arm or a partial one
+            # carries no paired estimate here either. This section took
+            # whatever paired and printed the two arm means side by side.
+            reason = paired_refusal(pair, col)
+            enough = not reason and len(d) >= MIN_N_FOR_INFERENCE
             rec = {'metric': col, 'role': role, 'cell': cell, 'n': len(d),
-                   'transfer_mean': (float(np.mean(pair['a'])) if len(d)
+                   'transfer_mean': (float(np.mean(pair['a'])) if enough
                                      else None),
-                   'scratch_mean': (float(np.mean(pair['b'])) if len(d)
-                                    else None)}
-            if len(d) >= MIN_N_FOR_INFERENCE:
+                   'scratch_mean': (float(np.mean(pair['b'])) if enough
+                                    else None),
+                   'note': ('' if enough else
+                            (f'REFUSED: {reason}' if reason else
+                             f'n={len(d)} < {MIN_N_FOR_INFERENCE}: no number '
+                             'quoted (ANALYSIS_PLAN.md §9)'))}
+            if enough:
                 res = bootstrap_statistic(d, hodges_lehmann_paired,
                                           opts.n_boot, opts.boot_seed,
                                           vec=hl_vec)
                 rec.update({'hl_delta': res['estimate'], 'ci_lo': res['lo'],
                             'ci_hi': res['hi']})
+            elif reason:
+                ledger.other_suppressed.append(
+                    f'secondary endpoint {col}/{cell}: {reason}')
             rows.append(rec)
     print(table(rows, ('metric', 'role', 'cell', 'n', 'scratch_mean',
-                       'transfer_mean', 'hl_delta', 'ci_lo', 'ci_hi')))
+                       'transfer_mean', 'hl_delta', 'ci_lo', 'ci_hi',
+                       'note')))
     print('  No p-value appears in this table. A mechanism claim in the paper '
           'must cite one')
     print('  of these instrumented signals; there is no free-text mechanism '
@@ -2768,13 +4567,30 @@ def sub_secondary(df: pd.DataFrame, opts: Options, ledger: Ledger) -> dict:
     drows = []
     for col in [c for c, r in METRIC_ROLES.items()
                 if r == DESCRIPTIVE and c in df.columns]:
-        for (cell, cond), g in df.groupby(['cell', 'condition']):
-            v = _clean(g[col])
-            if len(v):
-                drows.append({'metric': col, 'cell': cell, 'condition': cond,
-                              'n': len(v), 'mean': float(np.mean(v)),
-                              'sd': sd(v)})
-    print(table(drows, ('metric', 'cell', 'condition', 'n', 'mean', 'sd')))
+        # Grouped by label as well, and reduced to one value per seed. `n` was
+        # `len(_clean(g[col]))`, a ROW count over a group that pooled every
+        # label sharing a condition, so a cell's transfer arms at two different
+        # protocols were averaged into one number belonging to neither and an
+        # arm with two runs per seed reported twice its sample. The same fix
+        # 9e's within_run_sd table already carries, for the same reason.
+        for (cell, cond, label), g in df.groupby(['cell', 'condition',
+                                                  'label'], dropna=False):
+            sv = seed_vector(g, col, f'{label} arm')
+            if not sv['n'] and not sv['refused']:
+                continue
+            drows.append({
+                'metric': col, 'cell': cell, 'condition': cond,
+                'label': label, 'n': sv['n'], 'n_rows': sv['n_rows'],
+                'mean': (None if sv['refused'] else
+                         float(np.mean(sv['values']))),
+                'sd': None if sv['refused'] else sd(sv['values']),
+                'note': sv['reason'] or ''})
+    print(table(drows, ('metric', 'cell', 'condition', 'label', 'n', 'n_rows',
+                        'mean', 'sd', 'note')))
+    print('  n is DISTINCT SEEDS; n_rows is run directories. Grouped by label '
+          'as well as by')
+    print('  condition: two arms that share a condition and differ in '
+          'protocol are not one arm.')
     print('  These carry role "descriptive" in METRIC_ROLES. '
           '`require_confirmatory` refuses')
     print('  a test on any of them -- the mechanical fix for the published '
@@ -2819,8 +4635,24 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
 
     `ANALYSIS_PLAN.md` §7 permits Benjamini-Hochberg q-values here and nowhere
     else, "orientation only, no assertion permitted". §3 pre-commits the
-    follow-up rule: a screen selects at most one follow-up, which is then run on
-    `REPLICATE` seeds and reported as a fresh estimate.
+    follow-up rule: a screen selects at most one follow-up, which is then run
+    on `REPLICATE` seeds and reported as a fresh estimate.
+
+    Two things this section must not do, and used to:
+
+    * **Re-test the confirmatory estimand.** The primary transfer arm at
+      `registry.PROTOCOL` belongs to several screen experiments by
+      construction, so `transfer-mlp-double` appeared in E4, E5, E6 and E7 with
+      `p_raw` equal to the confirmatory sign-flip p and a softer `q_bh` beside
+      it. That is the confirmatory contrast relocated into a second
+      multiplicity family, which is exactly what §7 fixes family membership to
+      prevent. The primary arm is identified from the same selector §5 uses and
+      excluded here, with the refusal recorded.
+    * **Count one contrast several times.** A level that belongs to four screen
+      experiments used to enter the BH family four times, inflating m and
+      breaking BH's own assumption that its inputs are distinct tests. Each
+      (cell, level) contrast now enters once, and the experiments it belongs to
+      are listed in the row.
     """
     h2('9j. ablation screens -- BH q for orientation only, never an assertion')
     ledger.est('ablation screens (BH q, orientation only)')
@@ -2835,8 +4667,16 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
         print(f'  no screen-family experiments in this dataset (declared: '
               f'{", ".join(e.id for e in screens)}).')
         return {'available': False}
-    rows = []
-    pvals = []
+
+    # The confirmatory arm, per cell, by configuration rather than by name.
+    primary_labels: dict[str, set[str]] = {}
+    for cell in CELL_ORDER:
+        arm = primary_transfer_arm(df[df['cell'] == cell], opts)
+        primary_labels[cell] = set(str(v) for v in arm['label'].unique())
+
+    order_index: list[tuple[str, str]] = []
+    by_key: dict[tuple[str, str], dict] = {}
+    refused: list[str] = []
     for exp, sub in present:
         for cell in CELL_ORDER:
             cdf = sub[sub['cell'] == cell]
@@ -2844,10 +4684,39 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
             for label, g in cdf.groupby('label'):
                 if (g['condition'] == 'scratch').all():
                     continue
+                key = (cell, str(label))
+                if str(label) in primary_labels.get(cell, set()):
+                    tag = f'{exp.id}/{cell}/{label}'
+                    if tag not in refused:
+                        refused.append(tag)
+                    continue
+                if key in by_key:
+                    by_key[key]['experiments'].append(exp.id)
+                    by_key[key]['experiment'] = ';'.join(
+                        by_key[key]['experiments'])
+                    continue
                 pair = paired_by_seed(g, base, metric)
                 d = pair['a'] - pair['b']
-                rec = {'experiment': exp.id, 'cell': cell, 'level': label,
-                       'n': len(d)}
+                rec: dict[str, Any] = {
+                    'experiment': exp.id, 'experiments': [exp.id],
+                    'cell': cell, 'level': str(label), 'n': len(d)}
+                for note in pairing_problems(pair, metric, str(label),
+                                             'scratch'):
+                    rec['note'] = ((rec.get('note', '') + '; ')
+                                   if rec.get('note') else '') + note
+                # The notes above were printed and the estimate was computed
+                # anyway, so a screen level with an ambiguous or partial arm
+                # still entered the BH family with a p-value over the seeds
+                # that happened to pair. A refusal keeps it out of the family
+                # entirely, which also keeps m honest.
+                refusal = paired_refusal(pair, metric, str(label), 'scratch')
+                if refusal:
+                    rec['note'] = f'REFUSED: {refusal}'
+                    ledger.other_suppressed.append(
+                        f'screen {exp.id}/{cell}/{label}: {refusal}')
+                    by_key[key] = rec
+                    order_index.append(key)
+                    continue
                 if len(d) >= MIN_N_FOR_INFERENCE:
                     res = bootstrap_statistic(d, hodges_lehmann_paired,
                                               opts.n_boot, opts.boot_seed,
@@ -2860,8 +4729,12 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
                                 'statistic': float(np.mean(d)),
                                 'test': 'exact sign-flip on paired deltas',
                                 'rq': 'screen'})
-                    pvals.append((len(rows), sf['p']))
-                rows.append(rec)
+                by_key[key] = rec
+                order_index.append(key)
+
+    rows = [by_key[k] for k in order_index]
+    pvals = [(i, r['p_raw']) for i, r in enumerate(rows)
+             if r.get('p_raw') is not None]
     if pvals:
         order = sorted(pvals, key=lambda kp: kp[1])
         m = len(order)
@@ -2873,16 +4746,54 @@ def sub_screens(df: pd.DataFrame, opts: Options, ledger: Ledger,
             rows[i]['q_bh'] = q
             rows[i]['q'] = q
     print(table(rows, ('experiment', 'cell', 'level', 'n', 'hl', 'ci_lo',
-                       'ci_hi', 'p_raw', 'q_bh')))
+                       'ci_hi', 'p_raw', 'q_bh', 'note')))
+    print(f'  BH family size m = {len(pvals)} distinct (cell, level) '
+          'contrast(s). A contrast that')
+    print('  belongs to several screen experiments is listed once, with its '
+          'experiments joined')
+    print('  in the first column: entering it once per experiment would '
+          'inflate m and break')
+    print("  BH's own assumption that its inputs are distinct tests.")
     print('  These q-values ORIENT; they assert nothing. A screen result is '
           'never a finding.')
+    if refused:
+        print()
+        print('  REFUSED, as members of the confirmatory family rather than '
+              'screen levels:')
+        for tag in refused:
+            print(f'    {tag}')
+        print('  The primary transfer arm at registry.PROTOCOL is the '
+              'confirmatory estimand of §5.')
+        print('  ANALYSIS_PLAN.md §7 fixes family membership before launch '
+              'precisely so that a')
+        print('  result cannot be moved into a second, softer family; a BH q '
+              'on the same contrast')
+        print('  would be exactly that relocation.')
+        ledger.refusals.append(
+            f'{len(refused)} screen level(s) refused because they ARE the '
+            f'confirmatory contrast ({", ".join(refused)}): '
+            'ANALYSIS_PLAN.md §7 does not permit the primary estimand to enter '
+            'the BH screen family')
     ledger.screen_q.extend(f'{r["experiment"]}/{r["cell"]}/{r["level"]}'
                            for r in rows if 'q_bh' in r)
-    return {'available': True, 'rows': rows}
+    return {'available': True, 'rows': rows, 'bh_family_size': len(pvals),
+            'refused_as_confirmatory': refused}
 
 
 def section_estimation(df: pd.DataFrame, opts: Options, ledger: Ledger,
-                       metric: str, gate: list[dict]) -> dict:
+                       metric: str, gate: list[dict],
+                       shared: bool = True) -> dict:
+    """§10.10 -- the estimation-only analyses, for one endpoint.
+
+    `shared` controls the three subsections that do not take a metric at all
+    (RQ6, the censored endpoints and the secondary/mechanism table): they are
+    emitted once, with the first endpoint, rather than repeated identically for
+    the second. Everything else here is a function of `metric` and is emitted
+    for **each** co-primary endpoint: `auc_score` is co-primary by `DESIGN.md`
+    §5.2, and this section used to run for `opts.metrics[0]` alone, so P2 got
+    no RQ1, RQ3, RQ5, RQ6, dispersion or screen estimate at all and nothing in
+    the output said so.
+    """
     h1(f'9. ESTIMATION-ONLY ANALYSES on {metric} -- intervals, no p-values')
     print('  ANALYSIS_PLAN.md §3: every analysis in this section gets a point '
           'estimate and')
@@ -2900,14 +4811,46 @@ def section_estimation(df: pd.DataFrame, opts: Options, ledger: Ledger,
     print('  normalised per environment, so arms on different environments are '
           'never placed')
     print('  in one comparison (DESIGN.md §5.1).')
-    return {'rq1': sub_rq1(df, opts, ledger, metric),
-            'rq3': sub_rq3(df, opts, ledger, metric, gate),
-            'rq5': sub_rq5(df, opts, ledger, metric),
-            'rq6': sub_rq6(df, opts, ledger, metric),
-            'dispersion': sub_dispersion(df, opts, ledger, metric),
-            'censored': sub_censored(tdf, opts, ledger),
-            'secondary': sub_secondary(tdf, opts, ledger),
-            'screens': sub_screens(tdf, opts, ledger, metric)}
+    out: dict[str, Any] = {'metric': metric,
+                           'rq1': sub_rq1(df, opts, ledger, metric),
+                           'rq3': sub_rq3(df, opts, ledger, metric, gate),
+                           'rq5': sub_rq5(df, opts, ledger, metric)}
+    # RQ6's estimand is the episode-prefix score against the single final
+    # checkpoint (DESIGN.md §2.4 RQ6). It does not depend on the co-primary
+    # endpoint: `metric` reaches only the refusal message, never the
+    # computation. Running it once per endpoint printed the identical table and
+    # the identical budget-dependence sentence twice, under two different
+    # endpoint headings, and wrote the same entry into `sign_changes` twice, so
+    # one finding was presented as two results.
+    if shared:
+        out['rq6'] = sub_rq6(df, opts, ledger, metric)
+    else:
+        h2('9d. RQ6 -- does the conclusion depend on the budget?')
+        print('  RQ6 takes no endpoint argument: its estimand is the '
+              'episode-prefix score against')
+        print('  the single final checkpoint (DESIGN.md §2.4 RQ6), which is '
+              'the same quantity')
+        print('  whichever co-primary endpoint this section is running on. It '
+              'was emitted once,')
+        print(f'  above, with {opts.metrics[0]}, rather than printed twice as '
+              'though it were two')
+        print('  results.')
+        out['rq6'] = {'available': None, 'metric_independent': True,
+                      'emitted_with': opts.metrics[0],
+                      'note': 'RQ6 does not depend on the co-primary '
+                              'endpoint and is emitted once'}
+    out['dispersion'] = sub_dispersion(df, opts, ledger, metric)
+    if shared:
+        out['censored'] = sub_censored(tdf, opts, ledger)
+        out['secondary'] = sub_secondary(tdf, opts, ledger)
+    else:
+        print()
+        print('  9f (censored endpoints) and 9g (secondary and mechanism '
+              'endpoints) do not take')
+        print(f'  an endpoint argument either and were emitted once, above, '
+              f'with {opts.metrics[0]}.')
+    out['screens'] = sub_screens(tdf, opts, ledger, metric)
+    return out
 
 
 def section_power(df: pd.DataFrame, conf: dict, opts: Options,
@@ -2922,9 +4865,31 @@ def section_power(df: pd.DataFrame, conf: dict, opts: Options,
     SDs of §6.3 are printed beside it, per the §6.4 update rule.
     """
     h1('10. POWER AND MINIMUM DETECTABLE EFFECTS')
+    if opts.verify_mde:
+        ver = verify_mde_against_statlib()
+    else:
+        ver = dict(MDE_VERIFICATION)
+        ver['note'] = ('verification skipped by --no-mde-verify; the '
+                       'pre-registered multipliers stand unverified')
     print('  Multipliers, pre-registered in ANALYSIS_PLAN.md §6.2 and not '
           're-tuned (§6.4).')
     print(f'  Source: {MDE_SOURCE}.')
+    if ver.get('ran'):
+        print()
+        print(f'  Re-derived from statlib at the planned n={ver["n"]} and '
+              f'compared (tolerance {MDE_AGREEMENT_TOLERANCE}):')
+        print(table(ver['rows'], ('test', 'alpha_level', 'n',
+                                  'pre_registered', 'statlib', 'abs_diff',
+                                  'agree', 'note'), nd=3))
+        if not ver['agree']:
+            ledger.deviations.append(
+                'the pre-registered MDE multipliers of ANALYSIS_PLAN.md §6.2 '
+                'do not reproduce under statlib: ' + MDE_SOURCE)
+    else:
+        print(f'  NOT verified this invocation: {ver.get("note")}')
+        ledger.deviations.append(
+            'the MDE multipliers were not verified against statlib: '
+            + str(ver.get('note')))
     print(table([{'test': k[0], 'alpha': ('0.05' if k[1] == 'nominal'
                                           else f'{ALPHA_STRICTEST:.5f} '
                                                '(Holm over '
@@ -2938,9 +4903,14 @@ def section_power(df: pd.DataFrame, conf: dict, opts: Options,
                          'n': rec['n'], 'note': 'suppressed'})
             continue
         cell, metric = rec['cell'], rec['metric']
-        cdf = df[df['cell'] == cell]
-        s = _clean(scratch_arm(cdf, opts)[metric])
-        t = _clean(primary_transfer_arm(cdf, opts)[metric])
+        # The unpaired sigma is pooled over THE SEEDS THE TEST USED, taken
+        # straight off the paired sample, not over whatever else sits in the
+        # two arms. Pooling over the whole arm meant that on any dataset with
+        # an incomplete arm the unpaired MDE was reported against a different n
+        # from the paired MDE printed beside it, with both rows labelled with
+        # the paired n.
+        s = _clean(rec.get('scratch_values') or [])
+        t = _clean(rec.get('transfer_values') or [])
         sigma_d = rec['sd_delta']
         pooled = float(np.sqrt((sd(s) ** 2 + sd(t) ** 2) / 2.0)) \
             if (np.isfinite(sd(s)) and np.isfinite(sd(t))) else float('nan')
@@ -2954,6 +4924,7 @@ def section_power(df: pd.DataFrame, conf: dict, opts: Options,
         powered = bool(np.isfinite(mde['paired_holm8'])
                        and mde['paired_holm8'] < UNPOWERED_MDE)
         rows.append({'metric': metric, 'cell': cell, 'n': rec['n'],
+                     'n_pooled': int(min(len(s), len(t))),
                      'sigma_delta': sigma_d, 'sigma_pooled': pooled,
                      'observed_delta': rec['mean_delta'], **mde,
                      'powered': powered,
@@ -2962,9 +4933,15 @@ def section_power(df: pd.DataFrame, conf: dict, opts: Options,
                               '1.0 score unit, the whole distance from random '
                               'play to solved: NOT POWERED')})
     print()
-    print(table(rows, ('metric', 'cell', 'n', 'sigma_delta', 'sigma_pooled',
-                       'observed_delta', 'paired_nominal', 'paired_holm8',
-                       'unpaired_nominal', 'unpaired_holm8', 'powered')))
+    print(table(rows, ('metric', 'cell', 'n', 'n_pooled', 'sigma_delta',
+                       'sigma_pooled', 'observed_delta', 'paired_nominal',
+                       'paired_holm8', 'unpaired_nominal', 'unpaired_holm8',
+                       'powered')))
+    print('  n is the paired sample; n_pooled is the per-arm count the '
+          'unpaired sigma was')
+    print('  pooled over. They are the same by construction on a complete '
+          'arm, and printing')
+    print('  both is what makes an incomplete one visible.')
     print('  MDE units are normalised score. A cell is flagged NOT POWERED '
           'when its MDE at')
     print(f'  the Holm-corrected alpha reaches {UNPOWERED_MDE} score units -- '
@@ -3005,7 +4982,8 @@ def section_power(df: pd.DataFrame, conf: dict, opts: Options,
                                            r['planned_sd']))
     return {'per_member': rows, 'planning_comparison': prows,
             'multipliers': {f'{k[0]}/{k[1]}': v
-                            for k, v in MDE_MULTIPLIERS.items()}}
+                            for k, v in MDE_MULTIPLIERS.items()},
+            'multiplier_source': MDE_SOURCE, 'verification': ver}
 
 
 def section_ledger(ledger: Ledger, conf: dict) -> dict:
@@ -3291,13 +5269,113 @@ def self_test() -> int:
     check('the strictest Holm alpha is 0.00625',
           abs(ALPHA_STRICTEST - 0.00625) < 1e-12)
 
+    h2('the guards that used to fail open')
+    check('an unrecognised boolean token is refused, not read as absent',
+          parse_boolean('no') == (False, None)
+          and parse_boolean('yes') == (False, None),
+          str((parse_boolean('no'), parse_boolean('yes'))))
+    check('a blank cell is a genuine absence',
+          parse_boolean('') == (True, None)
+          and parse_boolean(float('nan')) == (True, None))
+    check('the tokens aggregate.py writes still parse',
+          [parse_boolean(v)[1] for v in (True, False, 'True', 'False', 1, 0)]
+          == [True, False, True, False, True, False])
+
+    frame = pd.DataFrame({
+        'seed': [0, 1, 2, 2, 3],
+        'final_score': [0.1, 0.2, 0.3, 0.9, float('nan')]})
+    arm = arm_by_seed(frame, 'final_score')
+    check('a duplicated (arm, seed) is reported, not collapsed',
+          arm['duplicates'] == [2] and 2 not in arm['values'], str(arm))
+    check('a duplicated seed with differing values is flagged as conflicting',
+          arm['conflicting'] == [2], str(arm))
+    check('a seed whose metric is absent is reported as a gap',
+          arm['metric_missing'] == [3], str(arm))
+    check('rows are counted as rows', arm['n_rows'] == 5)
+    both = pd.DataFrame({'seed': [0, 1], 'final_score': [float('nan')] * 2})
+    pair = paired_by_seed(both, both, 'final_score')
+    check('a seed missing the metric in BOTH arms does not vanish',
+          pair['metric_missing'] == [0, 1] and len(pair['seeds']) == 0,
+          str(pair))
+    notes = pairing_problems(paired_by_seed(frame, frame, 'final_score'),
+                             'final_score')
+    check('the pairing problems are stated in prose: both duplicated arms '
+          'and the gap',
+          len(notes) == 3 and sum('more than one row' in s for s in notes) == 2
+          and any('no final_score value' in s for s in notes), str(notes))
+
+    flat = bootstrap_statistic(np.full(6, 0.25),
+                               lambda a: float(np.mean(a)), n_boot=500,
+                               vec=mean_vec)
+    check('a constant arm yields a degenerate interval, flagged as such',
+          flat['degenerate'] and flat['lo'] == flat['hi'], str(flat))
+    check('a degenerate interval is not silently a BCa one',
+          flat['method'] == 'degenerate', str(flat))
+    varied = bootstrap_statistic(np.array([0.1, 0.4, 0.2, 0.35, 0.15, 0.3]),
+                                 lambda a: float(np.mean(a)), n_boot=1000,
+                                 vec=mean_vec)
+    check('an ordinary sample is not flagged degenerate',
+          not varied['degenerate'] and varied['lo'] < varied['hi'],
+          str(varied))
+    check('every interval carries the method that produced it',
+          'method' in varied and varied['method'] in ('BCa', 'percentile'),
+          str(varied))
+
+    check('a constant input gives no correlation rather than a warning',
+          not np.isfinite(correlation('pearson', [1.0, 1.0, 1.0],
+                                      [1.0, 2.0, 3.0])))
+    check('spearman is computed where it exists',
+          abs(correlation('spearman', [1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+              - 1.0) < 1e-12)
+
+    km_plain = kaplan_meier([1.0, 2.0, 3.0], [True, True, True])
+    km_late = kaplan_meier([1.0, 2.0, 3.0], [True, True, True],
+                           entry=[0.0, 0.0, 2.5])
+    check('delayed entry changes the risk set, and only then',
+          km_plain['curve'][0]['at_risk'] == 3
+          and km_late['curve'][0]['at_risk'] == 2
+          and not km_plain['delayed_entry'] and km_late['delayed_entry'],
+          f'{km_plain["curve"][0]}, {km_late["curve"][0]}')
+    check('a non-finite time is counted, not silently dropped',
+          kaplan_meier([1.0, float('nan')], [True, False])
+          ['dropped_nonfinite'] == 1)
+
+    check('the mechanism table carries the DESIGN.md §5.5 plasticity signals',
+          all(metric_role(m) == MECHANISM for m in
+              ('effective_rank', 'stable_rank', 'param_norm_total',
+               'param_norm_trunk', 'q_max')))
+
+    h2('the estimators against statlib.py')
+    prim = verify_primitives_against_statlib(n_boot=500)
+    if prim['ran']:
+        for row in prim['rows']:
+            check(f'{row["primitive"]} matches statlib', row['agree'],
+                  f'{row["here"]} vs {row["statlib"]}')
+    else:
+        check('statlib.py is importable, so the estimators can be checked',
+              False, str(prim['note']))
+
     h2('MDE table provenance')
+    ver = verify_mde_against_statlib()
+    if ver['ran']:
+        for row in ver['rows']:
+            check(f'the {row["test"]}/{row["alpha_level"]} multiplier '
+                  f'reproduces under statlib', row['agree'],
+                  f'statlib {row["statlib"]} vs pre-registered '
+                  f'{row["pre_registered"]}')
+    else:
+        check('the MDE multipliers were verified against statlib', False,
+              str(ver['note']))
+    # Exact equality, not a slack of 0.011. This is a transcription check
+    # against a table of four printed numbers, so any slack at all is a second
+    # tolerance sitting behind the first one, and a drift of 0.01 in the
+    # transcription is exactly what it would hide.
     check('the multipliers match the pre-registered ANALYSIS_PLAN.md §6.2 '
-          'values',
-          abs(MDE_MULTIPLIERS[('paired', 'nominal')] - 1.00) < 0.011
-          and abs(MDE_MULTIPLIERS[('paired', 'holm8')] - 1.54) < 0.011
-          and abs(MDE_MULTIPLIERS[('unpaired', 'nominal')] - 1.39) < 0.011
-          and abs(MDE_MULTIPLIERS[('unpaired', 'holm8')] - 1.87) < 0.011,
+          'values, digit for digit',
+          MDE_MULTIPLIERS == {('paired', 'nominal'): 1.00,
+                              ('paired', 'holm8'): 1.54,
+                              ('unpaired', 'nominal'): 1.41,
+                              ('unpaired', 'holm8'): 1.88},
           str(MDE_MULTIPLIERS))
     check('the paired multiplier is smaller than the unpaired one, which is '
           'why pairing is primary',
@@ -3369,6 +5447,31 @@ def build_parser() -> argparse.ArgumentParser:
                         "'pooled': the pre-declared SECONDARY of DESIGN.md "
                         "§4.3, pooled over source competence -- never called "
                         "ITT, and recorded as a deviation")
+    p.add_argument('--audit-root', default=None,
+                   help='the run tree the ANALYSIS_PLAN.md §10.1 audit gate '
+                        'runs over. Defaults to the directory holding the '
+                        'per-seed table; the gate reports itself as not '
+                        'evaluated when no run tree is there')
+    p.add_argument('--allow-audit-failure', action='store_true',
+                   help='emit the report over a FAILED audit. '
+                        'ANALYSIS_PLAN.md §10.1 permits this only with an '
+                        'explicit override, and the override is stamped into '
+                        'the output, into the JSON and into §12. Named as '
+                        'report.py and tables.py name the same override')
+    p.add_argument('--seeds', default=None,
+                   help='the seed set the runs were launched at, passed '
+                        'through to audit.py. Reducing it is the '
+                        'STANDING_INSTRUCTIONS S8 validation invocation and is '
+                        'recorded by the audit rather than assumed here')
+    p.add_argument('--overrides', nargs='*', default=None,
+                   help='launch-level overrides that were in force, as '
+                        'field=value, passed through to audit.py')
+    p.add_argument('--no-mde-verify', action='store_true',
+                   help='skip re-deriving the ANALYSIS_PLAN.md §6.2 MDE '
+                        'multipliers with statlib. The pre-registered values '
+                        'are used either way (§6.4 forbids re-tuning); the '
+                        'verification is what says whether they still '
+                        'reproduce')
     p.add_argument('--n-boot', type=int, default=N_BOOT)
     p.add_argument('--boot-seed', type=int, default=BOOT_SEED)
     p.add_argument('--self-test', action='store_true',
@@ -3400,7 +5503,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         interface_env=envs.parse(args.interface_env).canonical(),
         allow_intensity_confound=args.allow_intensity_confound,
         source_policy=args.source_policy, n_boot=args.n_boot,
-        boot_seed=args.boot_seed, json_out=args.json_out)
+        boot_seed=args.boot_seed, json_out=args.json_out,
+        audit_root=args.audit_root or '',
+        override_audit=bool(args.allow_audit_failure),
+        audit_seeds=args.seeds,
+        audit_overrides=tuple(args.overrides) if args.overrides else (),
+        verify_mde=not args.no_mde_verify)
     ledger = Ledger()
 
     try:
@@ -3411,14 +5519,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     df = in_experiments(raw, opts.experiments)
     if not len(df):
-        print(f'stats.py: no runs match --experiments '
-              f'{opts.experiments}; refusing to report on an empty selection.')
+        # The message names the filter that actually emptied the selection.
+        # It used to blame --experiments unconditionally, so a header-only CSV
+        # with no --experiments flag reported "no runs match --experiments
+        # None", which points the reader at a filter that was never applied.
+        if not len(raw):
+            print(f'stats.py: {opts.per_seed} has a header and no data rows. '
+                  'There is nothing to report on, and an empty report is not '
+                  'produced.')
+        else:
+            print(f'stats.py: none of the {len(raw)} row(s) in '
+                  f'{opts.per_seed} belong to --experiments '
+                  f'{list(opts.experiments or ())}; refusing to report on an '
+                  'empty selection.')
         return 1
 
     # TUNE seeds may never enter a reported estimate (ANALYSIS_PLAN.md §8).
     n_before = len(df)
+    tune_seeds = tuple(sorted(int(s) for s in
+                              df.loc[df['seed_block'] == 'TUNE',
+                                     'seed'].dropna().unique()))
     df = df[df['seed_block'] != 'TUNE']
     n_tune = n_before - len(df)
+    opts.tune_runs_excluded = n_tune
+    opts.tune_seeds_excluded = tune_seeds
 
     report: dict[str, Any] = {'invocation': {
         'argv': list(sys.argv), 'cwd': os.getcwd(),
@@ -3427,12 +5551,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         'source_env': opts.source_env, 'interface_env': opts.interface_env,
         'source_policy': opts.source_policy,
         'allow_intensity_confound': opts.allow_intensity_confound,
-        'tune_runs_excluded': n_tune}}
+        'override_audit': opts.override_audit,
+        'tune_runs_excluded': n_tune,
+        'tune_seeds_excluded': list(tune_seeds)}}
 
     print('stats.py -- executing ANALYSIS_PLAN.md §10, sections 1-12')
     print(f'  invocation: {" ".join(sys.argv)}')
 
+    # §10.1 first, and it is a gate: "If the audit fails, nothing below is
+    # emitted without an explicit override that is stamped into the output."
+    audit_result = section_audit(opts, ledger)
+    report['s1a_audit'] = audit_result
+    if audit_result['ran'] and not audit_result['ok'] \
+            and not opts.override_audit:
+        print()
+        print('  REFUSING to emit sections 1b-12: the audit of the run tree '
+              'FAILED and')
+        print('  ANALYSIS_PLAN.md §10.1 permits nothing below an audit '
+              'failure without an')
+        print('  explicit override. Run `python experiments/audit.py '
+              f'--out-root {audit_result["root"]}`')
+        print('  for the findings, fix them, or pass --allow-audit-failure to '
+              'analyse anyway with')
+        print('  the override stamped into every page. If the failure is SEED '
+              'COMPLETENESS on a')
+        print('  validation tree, --seeds is the honest fix: it tells the '
+              'audit what was actually')
+        print('  launched (STANDING_INSTRUCTIONS S8) instead of overriding a '
+              'true finding.')
+        if opts.json_out:
+            with open(opts.json_out, 'w', encoding='utf-8') as fh:
+                json.dump(_json_safe(report), fh, indent=1, sort_keys=False)
+        return 3
+
     report['s1_provenance'] = section_provenance(df, opts, ledger)
+    report['s1b_reference_returns'] = section_reference_returns(
+        df, opts, ledger)
     report['s2_inventory'] = section_inventory(df, opts, ledger)
 
     # The analysis set. Primary is valid sources only (DESIGN.md §4.3).
@@ -3448,6 +5602,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   '§2d and they are never')
             print('  silently dropped. Pass --source-policy pooled for the '
                   'pre-declared secondary.')
+            lost = sorted(set(str(v) for v in drop['label'].dropna().unique()))
+            cells = sorted(set(str(v) for v in drop['cell'].dropna().unique()))
+            for lab in lost:
+                gone = drop[drop['label'] == lab]
+                print(f'    {lab}: {len(gone)} run(s), seeds '
+                      f'{sorted(int(s) for s in gone["seed"].unique())}')
+            # Recorded as a deviation, not only printed. Removing an arm from
+            # the analysis set changes which members of the confirmatory family
+            # can be computed at all, and §12 used to say "No deviation
+            # detected" while the source-validity filter had removed a whole
+            # transfer arm and with it two of the eight members and four of the
+            # six control conditions in that cell.
+            ledger.deviations.append(
+                f'analysis-set exclusion (DESIGN.md §4.3): {len(drop)} run(s) '
+                f'across arm(s) {lost} in cell(s) {cells} have an invalid '
+                'source and are outside the primary estimand. Members of the '
+                'confirmatory family and control conditions that depend on '
+                'those arms are therefore not computable, and their absence '
+                'below is this exclusion, not a null')
     elif opts.source_policy == 'pooled':
         print()
         print('  ANALYSIS SET: POOLED OVER SOURCE COMPETENCE -- the '
@@ -3476,10 +5649,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report['s6_equivalence'] = section_equivalence(conf, analysis, opts, ledger)
     report['s7_controls'] = {
         m: section_controls(analysis, opts, ledger, m) for m in opts.metrics}
-    report['s8_c4'] = section_c4(analysis, opts, ledger, primary_metric)
-    report['s9_estimation'] = section_estimation(
-        analysis, opts, ledger, primary_metric,
-        report['s2_inventory'].get('intensity_gate', []))
+    # Both co-primary endpoints reach §8 and §9. `s8_c4` and `s9_estimation`
+    # keep the primary endpoint's shape because report.py reads them
+    # positionally; the full set is beside them under `*_by_metric`.
+    gate_rows = report['s2_inventory'].get('intensity_gate', [])
+    c4_by_metric = {m: section_c4(analysis, opts, ledger, m)
+                    for m in opts.metrics}
+    est_by_metric = {}
+    for i, m in enumerate(opts.metrics):
+        est_by_metric[m] = section_estimation(analysis, opts, ledger, m,
+                                              gate_rows, shared=(i == 0))
+    report['s8_c4'] = c4_by_metric[primary_metric]
+    report['s8_c4_by_metric'] = c4_by_metric
+    report['s9_estimation'] = est_by_metric[primary_metric]
+    report['s9_estimation_by_metric'] = est_by_metric
     report['s10_power'] = section_power(analysis, conf, opts, ledger)
     report['s11_ledger'] = section_ledger(ledger, conf)
 

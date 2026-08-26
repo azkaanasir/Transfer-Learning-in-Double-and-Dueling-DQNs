@@ -1,7 +1,7 @@
 {
   "arch_factor": {
     "dueling": 1.0,
-    "mlp": 0.68
+    "mlp": 0.85
   },
   "contention": {
     "1": 0.75,
@@ -10,46 +10,96 @@
     "6": 1.2,
     "8": 1.45
   },
-  "design_hash": "ec5d386149595cb8944ec92288ec5b6d",
+  "design_hash": "6d8fb52599d19baedeac7ed4f1fb9396",
   "entries": {
     "CartPole-v1|dueling": {
-      "note": "2 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.02), so the two coefficients are not separately identified: the per-episode overhead is held at its documented value and only the step rate is fitted; startup and the length ramp remain documented, because a finished short run shows neither",
+      "fitted": [
+        "s_per_env_step",
+        "steps_end",
+        "steps_start"
+      ],
+      "note": "2 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.02), so the two coefficients are not separately identified: the per-episode overhead is held at its documented 0.020 s and only the step rate is fitted; ramp plateau solved from the observed 176 env steps per episode over 1000 episodes, holding the documented 400-episode ramp length and the measured random-policy start of 23; the final hundred episodes of these runs averaged 408 steps, and a monotone ramp matched to the total cannot equal that when the length is not monotone. Process startup and the ramp length stay documented, because a finished run records neither",
       "ramp_episodes": 400,
-      "s_per_env_step": 0.004416,
+      "s_per_env_step": 0.006002,
       "s_per_episode": 0.02,
       "source": "harvested",
       "startup_s": 6.0,
-      "steps_end": 150.0,
+      "steps_end": 213.8,
       "steps_start": 22.52
     },
     "CartPole-v1|mlp": {
-      "note": "2 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.24), so the two coefficients are not separately identified: the per-episode overhead is held at its documented value and only the step rate is fitted; startup and the length ramp remain documented, because a finished short run shows neither",
+      "fitted": [
+        "s_per_env_step",
+        "steps_end",
+        "steps_start"
+      ],
+      "note": "2 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.24), so the two coefficients are not separately identified: the per-episode overhead is held at its documented 0.020 s and only the step rate is fitted; ramp plateau solved from the observed 167 env steps per episode over 1000 episodes, holding the documented 400-episode ramp length and the measured random-policy start of 23; the final hundred episodes of these runs averaged 342 steps, and a monotone ramp matched to the total cannot equal that when the length is not monotone. Process startup and the ramp length stay documented, because a finished run records neither",
       "ramp_episodes": 400,
-      "s_per_env_step": 0.004437,
+      "s_per_env_step": 0.006032,
       "s_per_episode": 0.02,
       "source": "harvested",
       "startup_s": 6.0,
-      "steps_end": 150.0,
+      "steps_end": 203.4,
       "steps_start": 22.52
     },
-    "LunarLander-v3|dueling": {
-      "note": "20 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.06), so the two coefficients are not separately identified: the per-episode overhead is held at its documented value and only the step rate is fitted; startup and the length ramp remain documented, because a finished short run shows neither",
+    "LunarLander-v3:extra_actions=2,pad_mode=noise,pad_obs=4|dueling": {
+      "fitted": [
+        "s_per_env_step",
+        "steps_end",
+        "steps_start"
+      ],
+      "note": "3 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.07), so the two coefficients are not separately identified: the per-episode overhead is held at its documented 0.023 s and only the step rate is fitted; ramp plateau solved from the observed 274 env steps per episode over 1000 episodes, holding the documented 300-episode ramp length and the measured random-policy start of 84; the final hundred episodes of these runs averaged 201 steps, and a monotone ramp matched to the total cannot equal that when the length is not monotone. Process startup and the ramp length stay documented, because a finished run records neither. 1 run(s) excluded before fitting: iface-scratch-dueling-vanilla (192.1 ms/step, whole-harvest gate)",
       "ramp_episodes": 300,
-      "s_per_env_step": 0.011609,
+      "s_per_env_step": 0.009352,
       "s_per_episode": 0.023,
       "source": "harvested",
       "startup_s": 6.0,
-      "steps_end": 560.0,
+      "steps_end": 307.2,
+      "steps_start": 83.7
+    },
+    "LunarLander-v3:extra_actions=2,pad_mode=noise,pad_obs=4|mlp": {
+      "fitted": [
+        "s_per_env_step",
+        "steps_end",
+        "steps_start"
+      ],
+      "note": "3 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.03), so the two coefficients are not separately identified: the per-episode overhead is held at its documented 0.023 s and only the step rate is fitted; ramp plateau solved from the observed 295 env steps per episode over 1000 episodes, holding the documented 300-episode ramp length and the measured random-policy start of 84; the final hundred episodes of these runs averaged 220 steps, and a monotone ramp matched to the total cannot equal that when the length is not monotone. Process startup and the ramp length stay documented, because a finished run records neither. 1 run(s) excluded before fitting: iface-scratch-mlp-double (164.9 ms/step, whole-harvest gate)",
+      "ramp_episodes": 300,
+      "s_per_env_step": 0.008803,
+      "s_per_episode": 0.023,
+      "source": "harvested",
+      "startup_s": 6.0,
+      "steps_end": 332.8,
+      "steps_start": 83.7
+    },
+    "LunarLander-v3|dueling": {
+      "fitted": [
+        "s_per_env_step",
+        "steps_end",
+        "steps_start"
+      ],
+      "note": "14 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.04), so the two coefficients are not separately identified: the per-episode overhead is held at its documented 0.023 s and only the step rate is fitted; ramp plateau solved from the observed 305 env steps per episode over 1000 episodes, holding the documented 300-episode ramp length and the measured random-policy start of 94; the final hundred episodes of these runs averaged 202 steps, and a monotone ramp matched to the total cannot equal that when the length is not monotone. Process startup and the ramp length stay documented, because a finished run records neither. 2 run(s) excluded before fitting: c4src-dueling-vanilla (12.5 ms/step, group gate); c4src-dueling-double (9.8 ms/step, group gate)",
+      "ramp_episodes": 300,
+      "s_per_env_step": 0.006184,
+      "s_per_episode": 0.023,
+      "source": "harvested",
+      "startup_s": 6.0,
+      "steps_end": 342.7,
       "steps_start": 94.01
     },
     "LunarLander-v3|mlp": {
-      "note": "20 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.19), so the two coefficients are not separately identified: the per-episode overhead is held at its documented value and only the step rate is fitted; startup and the length ramp remain documented, because a finished short run shows neither",
+      "fitted": [
+        "s_per_env_step",
+        "steps_end",
+        "steps_start"
+      ],
+      "note": "14 run(s) spanning only a 1.0x episode-budget range (steps/episode spread 0.18), so the two coefficients are not separately identified: the per-episode overhead is held at its documented 0.023 s and only the step rate is fitted; ramp plateau solved from the observed 355 env steps per episode over 1000 episodes, holding the documented 300-episode ramp length and the measured random-policy start of 94; the final hundred episodes of these runs averaged 226 steps, and a monotone ramp matched to the total cannot equal that when the length is not monotone. Process startup and the ramp length stay documented, because a finished run records neither. 2 run(s) excluded before fitting: c4src-mlp-double (164.1 ms/step, whole-harvest gate); c4src-mlp-vanilla (158.9 ms/step, whole-harvest gate)",
       "ramp_episodes": 300,
-      "s_per_env_step": 0.019114,
+      "s_per_env_step": 0.005151,
       "s_per_episode": 0.023,
       "source": "harvested",
       "startup_s": 6.0,
-      "steps_end": 560.0,
+      "steps_end": 401.2,
       "steps_start": 94.01
     }
   },
@@ -67,5 +117,5 @@
     "vanilla": 1.0
   },
   "schema": "throughput-v1",
-  "written": "2026-08-25T10:58:17"
+  "written": "2026-08-26T00:19:59"
 }

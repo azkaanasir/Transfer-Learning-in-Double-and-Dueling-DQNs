@@ -87,9 +87,23 @@ At n=10, the exact sign-flip test's smallest attainable two-sided p-value is
 **2/1024 = 0.00195**, obtained exactly when all ten seeds' deltas share a sign.
 Under Holm over 8, the strictest comparison is against 0.05/8 = 0.00625.
 
-> **Therefore: a cell's transfer effect is confirmed if and only if all ten
-> seeds move in the same direction.** Anything less cannot clear the corrected
-> threshold at this sample size.
+That floor is not the bar. The exact two-sided p is k/1024 for an even count k
+of sign assignments at least as extreme as the observed mean, because an
+assignment and its negation are always equally extreme, so the attainable
+values step by 2/1024 and **three** of them sit strictly below 0.00625:
+0.00195, 0.00391 and 0.00586.
+
+> **Therefore: a cell's transfer effect is confirmed when at most 6 of the 1024
+> sign assignments are at least as extreme as its observed mean.** All ten
+> seeds moving the same way attains the floor and is therefore SUFFICIENT. It
+> is **not** necessary: one seed moving against the other nine by a small
+> enough margin leaves four assignments at least as extreme, p = 0.00391, which
+> still clears 0.00625.
+
+That bar is the strictest Holm step, and Holm applies it only to the smallest p
+in the family of eight; the jth smallest is compared against 0.05/(9-j), so
+every later step is looser still. The verdict recorded for a cell is its
+Holm-adjusted p against 0.05.
 
 That is a demanding and completely transparent criterion, and stating it up
 front is what stops a marginal result from being narrated into a finding.
@@ -195,9 +209,15 @@ that justify §2's single-family decision; they are not decoration.
 | Test | alpha = 0.05 | alpha = 0.00625 (Holm over 8) |
 |---|---|---|
 | Paired sign-flip on deltas | **1.00 sigma_delta** | **1.54 sigma_delta** |
-| Unpaired Mann–Whitney | 1.39 sigma | 1.87 sigma |
+| Unpaired Mann–Whitney | 1.41 sigma | 1.88 sigma |
 
-The 1.00 versus 1.39 gap is why the paired test is primary: at this sample size
+The unpaired row read 1.39/1.87 until 2026-08-26. That was a transcription
+error, not a different computation: 6.5's table already pins 1.406 for the same
+estimator at the same n and alpha, the paragraph below already quotes 1.41, and
+`statlib.mde_mann_whitney(10)` returns 1.406 and 1.880. Corrected here and
+logged in 11.
+
+The 1.00 versus 1.41 gap is why the paired test is primary: at this sample size
 the matched-seed design reduces the detectable effect by about 28 % --
 equivalently, the unpaired test needs an effect about 39 % larger to reach the same power (1.41 against 1.01 sigma), which is the largest single power gain available to us.
 
@@ -264,6 +284,35 @@ doubled without a post-hoc decision. Pre-committed rule:
   is sqrt(2) times a single delta's) within reach of being testable rather than
   estimation-only. That is the main scientific reason to run `REPLICATE`, and
   it is stated here so the decision is not made on the basis of an n=10 result.
+
+### 6.6 The decision, taken 2026-08-26, before any confirmatory run
+
+**`REPLICATE` will not be run. The study is n=10.**
+
+This is recorded here rather than later precisely because 6.5 requires it to
+be made on compute availability only. At the point of writing, no confirmatory
+run exists: the only data on disk is the 44-run single-seed validation pass,
+which under 9 carries no result. The reason is compute and nothing else. The
+selected scope is **E1, E2, E3, E4, E5, E8i and E9 at ten seeds**, 1200 runs and
+a measured **125.3 h** at `--jobs 6`, plus the tuned replication of E1 and E2
+that `DESIGN.md` 3.3's arbitration requires, estimated at a further **31 h** and
+to be re-costed once those arms exist in the registry. About **156 h** in total,
+roughly 6.5 days on a single machine that must not sleep for the duration.
+Doubling the seed count would double all of it.
+
+**The cost of this decision is accepted and stated in advance.** At n=10 the
+confirmatory minimum detectable effect under Holm over eight is **1.53
+sigma_delta**, against 0.89 at n=20. The between-cell contrast of RQ3, whose
+standard error is sqrt(2) times a single delta's, therefore remains
+**estimation-only**: it is reported as a point estimate with a bootstrap
+interval and, where the interval permits, an exclusion bound. It is not
+tested, and no wording in the manuscript may imply that it was. If the
+observed effects turn out to be smaller than 1.53 sigma_delta, the honest
+result is an exclusion bound and not a null finding, and 4 governs how it is
+phrased.
+
+Reversing this decision later would make the pooled analysis exploratory under
+6.5, and would be logged in 11.
 
 ---
 
@@ -341,4 +390,6 @@ may not be quoted, compared, or used to choose between hypotheses.
 
 | Date | Deviation | Affected results | Re-labelled? |
 |---|---|---|---|
-| - | none | - | - |
+| 2026-08-26 | **Correction of an error in this plan, not a deviation.** §6.2's table gave the unpaired Mann-Whitney minimum detectable effect as 1.39 sigma at alpha=0.05 and 1.87 sigma under Holm over 8. Both are transcription errors against this plan's own arithmetic: §6.5 pins 1.406 for the identical estimator at the identical n and alpha, §6.2's own paragraph quotes "1.41 against 1.01 sigma", and `statlib.mde_mann_whitney` at n=10 returns 1.406 and 1.880, which round to 1.41 and 1.88. The table now reads 1.41/1.88 and `stats.py`'s `MDE_MULTIPLIERS` matches it, so its agreement check against `statlib` runs at a tolerance of 0.01 rather than the 0.02 that had been widened to admit the one disagreeing row. This is not a re-tuning under §6.4: no confirmatory run exists (§6.6), the correction claims LESS power for the unpaired test rather than more, and it reconciles the plan with itself rather than with any observed result. | None. The unpaired test is not the primary and no MDE is quoted in any result; §6.3's translated table is computed from the paired row, which is unchanged | n/a |
+| 2026-08-26 | **Correction of an error in this plan, not a deviation.** §2.2 stated the confirmatory bar as "confirmed if and only if all ten seeds move in the same direction". The "only if" half is false: the exact sign-flip p moves in units of 2/1024 and three attainable values (0.00195, 0.00391, 0.00586) sit strictly below the Holm-strictest 0.00625, so a cell split 9 to 1 with a small opposing delta returns p = 0.00391 and clears the bar without unanimity. §2.2 now states the bar as "at most 6 of the 1024 sign assignments at least as extreme as the observed mean", with unanimity named as sufficient and not necessary. `stats.py` §5b printed the plan's sentence verbatim beside a table that could contradict it and now prints the corrected rule. Made before any confirmatory run exists (§6.6); it changes no computation, only the sentence describing it, and it makes the stated bar LESS demanding than the one written down, so it is recorded here rather than left to be discovered in the results. | None. No confirmatory test has been run; `significant_holm` was already standard Holm and is unchanged | n/a |
+| 2026-08-25 | **Amendment, not a deviation.** `DESIGN.md` §7's external-validity check for RQ1 (estimation-only; §10 item 10) named no endpoint. It now fixes AUC, pre-specifies the all-cells-saturated case as uninformative, and records that the external source tunes the learning rate per configuration while we hold it fixed. Made after inspecting n=1 pilot scratch numbers, which under §9 carry no result, and before any confirmatory run exists. | None. RQ1 is outside the confirmatory family and carries no p-value | n/a |

@@ -11,8 +11,21 @@ not a cosmetic failure -- an unstated smoothing window is an unstated analysis
 choice, and a figure whose caption cannot be checked against it is an
 unfalsifiable claim.
 
-Four properties are therefore mechanical here, not editorial:
+Five properties are therefore mechanical here, not editorial:
 
+* **The analysis set is the same one `stats.py` reports on.** A figure and the
+  table beside it must not disagree about which runs exist. Three filters are
+  applied once, in `analysis_set`, and every one of them is stated in every
+  caption and recorded in every provenance file: `TUNE` seeds are removed
+  (`ANALYSIS_PLAN.md` §8, selection leakage), donor-only seed blocks are
+  removed (`DESIGN.md` §3.4: `C4SRC` and `RESERVE` runs exist to hand over a
+  checkpoint and are barred from target-side estimation), and under the default
+  `--source-policy valid` every run whose source failed the §4.3 normalised
+  gate is removed. That last one is not a detail: plotting an arm whose source
+  never learned its task, next to a table that excluded it, is the published
+  study's own error reproduced in the figures. `--source-policy pooled` draws
+  the pre-declared secondary instead and says so on the canvas and in the
+  caption; it is never called intent-to-treat.
 * **Captions are generated from the data.** `<name>.caption.txt` is written
   beside every figure and states the seed count actually plotted, the
   evaluation protocol *read out of the manifests of the runs in the figure*,
@@ -34,7 +47,13 @@ Four properties are therefore mechanical here, not editorial:
   bias-corrected bootstrap, `kaplan_meier`, `clopper_pearson`) at its fixed
   `N_BOOT` and `BOOT_SEED`. A figure computing its own CI by its own method
   would eventually disagree with the table beside it, and the reader would have
-  no way to tell which was right. **No figure draws a p-value at all**, even
+  no way to tell which was right. The interval *method* the estimator actually
+  returned travels into the caption too, because `bca_interval` falls back to a
+  percentile interval on a degenerate bootstrap distribution and a caption that
+  still said BCa would be the C8 defect in miniature. A degenerate interval
+  (zero width, from a constant sample) yields no equivalence verdict and no
+  exclusion bound at all: the cell with the least information must not produce
+  the strongest claim. **No figure draws a p-value at all**, even
   for the confirmatory family: a forest of significance verdicts invites the
   "A avoids negative transfer while B does not" comparison that `DESIGN.md` §9
   and `ANALYSIS_PLAN.md` §8 forbid. Tests live in `stats.py`'s tables, where
@@ -67,6 +86,9 @@ Usage
     python experiments/plots.py --per-seed runs/per_seed.csv \
         --curves runs/curves.csv --outdir paper/figures \
         --format pdf,png --figures learning,forest
+    python experiments/plots.py --per-seed runs/per_seed.csv \
+        --curves runs/curves.csv --outdir paper/figures_pooled \
+        --source-policy pooled
 """
 from __future__ import annotations
 
@@ -153,6 +175,20 @@ CONDITION_CODE: dict[str, str] = {
     'transfer_permuted': 'C3',
 }
 
+#: The endpoints `ANALYSIS_PLAN.md` §4 fixes an equivalence margin for. The
+#: margin is +/-0.05 *normalised-score* units, justified as ~20 return points on
+#: LunarLander, and that justification does not transfer to an area-per-env-step
+#: quantity. So P2 gets no margin band, no equivalence verdict and no
+#: "score units" label: an equivalence claim on a scale the plan never defined a
+#: margin for would be a new analysis choice made in a plotting script.
+MARGIN_ENDPOINTS: tuple[str, ...] = ('final_score',)
+
+#: The unit each endpoint's exclusion bound is quoted in.
+ENDPOINT_UNITS: dict[str, str] = {
+    'final_score': 'normalised score units',
+    'auc_score': 'normalised-score-per-env-step units',
+}
+
 CONTRAST_NAMES: tuple[tuple[str, str, str], ...] = (
     ('transfer_untrained', 'scratch', 'untrained-source'),
     ('transfer_permuted', 'transfer_untrained', 'permuted-source'),
@@ -199,7 +235,8 @@ RC = {
 # 2. Small formatting helpers
 # ---------------------------------------------------------------------------
 def _f(value: Any, digits: int = 3) -> str:
-    """Format a number for a caption, or an em dash if it is not one."""
+    """Format a number for a caption, or a two-hyphen placeholder if the value
+    is missing or non-finite. Never prints `nan`, which reads as a number."""
     try:
         x = float(value)
     except (TypeError, ValueError):
@@ -217,11 +254,22 @@ def _i(value: Any) -> str:
 
 
 def _seed_list(seeds: Sequence[int], limit: int = 12) -> str:
-    seeds = list(seeds)
-    if len(seeds) <= limit:
-        return ', '.join(str(s) for s in seeds)
-    return (', '.join(str(s) for s in seeds[:limit])
-            + f', ... (+{len(seeds) - limit} more)')
+    """Seeds for a caption, always as integers.
+
+    A single row with a missing seed used to promote the whole seed index to
+    float, and captions then read `0.0, 1.0, 2.0`. Such rows no longer reach a
+    figure (`analysis_set` removes them loudly), and this is the second belt:
+    a seed is an integer identifier, so it is printed as one.
+    """
+    out = []
+    for s in seeds:
+        try:
+            out.append(str(int(s)))
+        except (TypeError, ValueError):
+            out.append(str(s))
+    if len(out) <= limit:
+        return ', '.join(out)
+    return ', '.join(out[:limit]) + f', ... (+{len(out) - limit} more)'
 
 
 def _cell_label_with_n(cell: str, n_by_cell: dict[str, set]) -> str:
@@ -239,20 +287,47 @@ def _cell_label_with_n(cell: str, n_by_cell: dict[str, set]) -> str:
     return f"{name}\n(n={'/'.join(str(v) for v in values)})"
 
 
-def _as_bool(series: pd.Series) -> np.ndarray:
-    """CSV booleans, which arrive as bool, str or object depending on whether a
-    column had any missing values. Never guess: an unrecognised token becomes
-    False and is counted by the caller."""
-    def one(v: Any) -> bool:
+def _bool_tokens(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """CSV booleans, plus the mask of values that were actually recognised.
+
+    Booleans arrive from a CSV as bool, str or object depending on whether the
+    column had any missing values, so the parse has to be explicit. It also has
+    to be honest about failure: returning a bare `False` for an unrecognised
+    token turns a *missing* censoring flag into an *observed event*, which is
+    how three runs that never reached a threshold were reported as 3/3 reached.
+    The second return value is therefore the recognised mask, and every caller
+    that reads a flag whose absence changes a number is required to look at it.
+    """
+    def one(v: Any) -> tuple[bool, bool]:
         if isinstance(v, (bool, np.bool_)):
-            return bool(v)
+            return bool(v), True
         if isinstance(v, str):
-            return v.strip().lower() in ('true', '1', 'yes')
+            token = v.strip().lower()
+            if token in ('true', '1', 'yes', 't'):
+                return True, True
+            if token in ('false', '0', 'no', 'f'):
+                return False, True
+            return False, False
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return False, False
         try:
-            return bool(int(v))
+            return bool(int(v)), True
         except (TypeError, ValueError):
-            return False
-    return np.array([one(v) for v in series.tolist()], dtype=bool)
+            return False, False
+    pairs = [one(v) for v in series.tolist()]
+    return (np.array([p[0] for p in pairs], dtype=bool),
+            np.array([p[1] for p in pairs], dtype=bool))
+
+
+def _as_bool(series: pd.Series) -> np.ndarray:
+    """`_bool_tokens` where an unrecognised token may safely read as False.
+
+    Safe means: False is the conservative direction for this particular flag.
+    `metrics_contiguous` is one (an unreadable integrity flag should count as a
+    failed check); a censoring flag is emphatically not, and that caller uses
+    `_bool_tokens` directly.
+    """
+    return _bool_tokens(series)[0]
 
 
 def _trailing_mean(y: np.ndarray, window: int) -> np.ndarray:
@@ -382,6 +457,238 @@ def shift_labels() -> dict[str, list[dict[str, Any]]]:
     return out
 
 
+#: `--source-policy` values. The same two names and the same meanings as
+#: `stats.py`'s flag, deliberately: a figure whose analysis set differs from the
+#: table printed beside it is precisely the disagreement this module exists to
+#: make impossible.
+SOURCE_POLICIES: tuple[str, ...] = ('valid', 'pooled')
+
+#: The conditions whose source is a *trained* checkpoint and therefore has a
+#: validity verdict to have. C0 has no source at all and C2's source is
+#: untrained by construction (`DESIGN.md` §4), so an empty `source_valid` on
+#: either is the expected value, not a missing measurement. Only C1 and C3 carry
+#: the §4.3 gate, and only for them is a missing verdict worth a warning.
+SCORED_SOURCE_CONDS: tuple[str, ...] = ('transfer', 'transfer_permuted')
+
+
+def analysis_set(per_seed: pd.DataFrame,
+                 source_policy: str = 'valid') -> tuple[pd.DataFrame, dict]:
+    """The runs a figure may draw, and a full record of everything removed.
+
+    Four filters, each of which exists because leaving it out reproduces a named
+    defect. None of them is silent: the record returned here is printed to
+    stdout, summarised in every caption and written into every provenance file,
+    because "dropping a seed, for any reason, after it has run" is forbidden by
+    `ANALYSIS_PLAN.md` §8 and the only honest alternative to dropping quietly is
+    saying exactly what was dropped and why.
+
+    1. **An unusable seed.** A row whose `seed` will not parse as an integer
+       cannot be matched to its partner in any paired contrast. It used to
+       vanish inside `groupby(['label', 'seed'])`, which defaults to
+       `dropna=True`, so an arm quietly fell from n=3 to n=2 while stdout still
+       reported the full run count. Now it is removed here, counted, and named.
+    2. **`TUNE` seeds** (`DESIGN.md` §3.4, `ANALYSIS_PLAN.md` §8). No reported
+       estimate may be computed on hyperparameter-selection seeds: that is
+       selection leakage, and a figure is a reported estimate. Selection by arm
+       label alone does not exclude them, because a TUNE run of an E1 arm
+       carries the E1 label.
+    3. **Donor-only seed blocks** (`DESIGN.md` §3.4). `C4SRC` runs exist to hand
+       a checkpoint to a C4 arm and `RESERVE` runs to replace a rejected source;
+       both are barred from target-side estimation. A C4SRC donor is a scratch
+       run on the target environment, so without this filter it pools into that
+       cell's scratch baseline and shifts the denominator of every delta.
+    4. **Sources that failed the validity gate** (`DESIGN.md` §4.3), under the
+       default `valid` policy. A source is valid when its own normalised final
+       score is at least 0.6. Plotting a transfer arm whose source never learned
+       its task is the published study's actual error; in P0 it is live, because
+       `src-dueling-vanilla` scored 0.599 against the 0.600 gate. `pooled` is
+       the pre-declared secondary and keeps them, labelled as such, never called
+       intent-to-treat.
+    """
+    record: dict[str, Any] = {
+        'source_policy': source_policy,
+        'rows_in_table': int(len(per_seed)),
+        'removed': {},
+    }
+    df = per_seed
+
+    seeds = pd.to_numeric(df['seed'], errors='coerce')
+    bad_seed = ~np.isfinite(seeds.to_numpy(float))
+    if bool(bad_seed.any()):
+        lost = df[bad_seed]
+        record['removed']['unusable_seed'] = {
+            'n': int(bad_seed.sum()),
+            'reason': 'the seed does not parse as an integer, so the run '
+                      'cannot be matched to its partner in any paired '
+                      'contrast',
+            'runs': sorted(str(r) for r in lost['run_dir'].tolist()),
+            'labels': sorted(set(str(v) for v in lost['label'].tolist())),
+        }
+        df = df[~bad_seed]
+        seeds = seeds[~bad_seed]
+    df = df.assign(seed=seeds.astype('int64'))
+
+    if 'seed_block' in df.columns:
+        tune = df['seed_block'].astype(str) == 'TUNE'
+        if bool(tune.any()):
+            lost = df[tune]
+            record['removed']['tune_seeds'] = {
+                'n': int(tune.sum()),
+                'reason': 'ANALYSIS_PLAN.md 8: no estimate may be computed on '
+                          'hyperparameter-selection seeds',
+                'seeds': sorted({int(s) for s in lost['seed'].tolist()}),
+                'labels': sorted(set(str(v) for v in lost['label'].tolist())),
+            }
+            df = df[~tune]
+        donor = df['seed_block'].astype(str).isin(stats.SOURCE_ONLY_BLOCKS)
+        if bool(donor.any()):
+            lost = df[donor]
+            record['removed']['donor_only_blocks'] = {
+                'n': int(donor.sum()),
+                'blocks': sorted(set(str(v) for v in
+                                     lost['seed_block'].tolist())),
+                'reason': f'DESIGN.md 3.4: {list(stats.SOURCE_ONLY_BLOCKS)} '
+                          f'exist only to donate a source checkpoint and are '
+                          f'barred from target-side estimation',
+                'seeds': sorted({int(s) for s in lost['seed'].tolist()}),
+                'labels': sorted(set(str(v) for v in lost['label'].tolist())),
+            }
+            df = df[~donor]
+
+    if source_policy == 'valid':
+        invalid = df['source_valid'] == False                    # noqa: E712
+        if bool(invalid.any()):
+            lost = df[invalid]
+            scores = pd.to_numeric(lost.get('source_final_score'),
+                                   errors='coerce')
+            record['removed']['invalid_source'] = {
+                'n': int(invalid.sum()),
+                'reason': 'DESIGN.md 4.3: the primary estimand is valid '
+                          'sources only (normalised source score >= 0.6)',
+                'seeds': sorted({int(s) for s in lost['seed'].tolist()}),
+                'labels': sorted(set(str(v) for v in lost['label'].tolist())),
+                'source_scores': sorted(
+                    {round(float(v), 4) for v in scores.dropna().tolist()}),
+            }
+            df = df[~invalid]
+
+    # An UNSCORED source is not a passed source. `DESIGN.md` §4.3 defines
+    # validity as a score at or above the gate, so a transfer run whose
+    # `source_valid` is empty has no verdict at all, and neither policy licenses
+    # reading that as a pass. Scratch runs have no source and are expected to be
+    # empty here, so the two are counted separately: the second number is the
+    # one that means something is wrong upstream.
+    if len(df):
+        unscored = df['source_valid'].isna()
+        transfer_like = df['condition'].astype(str).isin(SCORED_SOURCE_CONDS)
+        record['rows_with_no_source_verdict'] = int(unscored.sum())
+        record['transfer_rows_with_no_source_verdict'] = int(
+            (unscored & transfer_like).sum())
+        record['arms_with_no_source_verdict'] = sorted(set(
+            str(v) for v in df.loc[unscored & transfer_like, 'label']))
+    else:
+        record['rows_with_no_source_verdict'] = 0
+        record['transfer_rows_with_no_source_verdict'] = 0
+        record['arms_with_no_source_verdict'] = []
+    record['rows_in_analysis_set'] = int(len(df))
+    return df, record
+
+
+def analysis_set_sentence(record: dict) -> str:
+    """The analysis set in one caption paragraph, generated from the record."""
+    policy = record.get('source_policy', 'valid')
+    if policy == 'valid':
+        head = ('Analysis set: VALID SOURCES ONLY, the primary estimand of '
+                'DESIGN.md 4.3 (a source is valid when its own normalised '
+                'final score is at least 0.6).')
+    else:
+        head = ('Analysis set: POOLED OVER SOURCE COMPETENCE, the pre-declared '
+                'SECONDARY of DESIGN.md 4.3 and NOT the primary estimand. It '
+                'is not intent-to-treat: source competence is known before the '
+                'target run begins, so it is not a post-randomisation '
+                'compliance event. Every number in this figure pools transfer '
+                'from a competent source with transfer from a source that '
+                'never learned, which is the published study\'s actual error, '
+                'reproduced here deliberately and labelled.')
+    parts = [head,
+             f"{record.get('rows_in_analysis_set', 0)} of "
+             f"{record.get('rows_in_table', 0)} rows in the supplied table "
+             f"enter it."]
+    removed = record.get('removed') or {}
+    names = {'unusable_seed': 'unusable seed',
+             'tune_seeds': 'TUNE seeds (ANALYSIS_PLAN.md 8)',
+             'donor_only_blocks': 'donor-only seed blocks (DESIGN.md 3.4)',
+             'invalid_source': 'source failed the DESIGN.md 4.3 validity gate'}
+    for key, rec in removed.items():
+        seeds = rec.get('seeds')
+        parts.append(f"Removed for {names.get(key, key)}: {rec['n']} run(s)"
+                     + (f" at seed(s) {_seed_list(seeds)}" if seeds else '')
+                     + (f", arms {', '.join(rec['labels'][:6])}"
+                        + (' and others' if len(rec.get('labels', [])) > 6
+                           else '')
+                        if rec.get('labels') else '')
+                     + '.')
+    if not removed:
+        parts.append('No run in the supplied table was removed by any of '
+                     'these filters.')
+    n_unscored = record.get('transfer_rows_with_no_source_verdict', 0)
+    if n_unscored:
+        arms = record.get('arms_with_no_source_verdict') or []
+        parts.append(f"WARNING: {n_unscored} run(s) in the analysis set "
+                     f"transferred from a source with NO validity verdict at "
+                     f"all (source_valid is empty, not False), in arm(s) "
+                     f"{', '.join(arms[:6])}"
+                     + (' and others' if len(arms) > 6 else '') + '. '
+                     "DESIGN.md 4.3 defines validity as a score at or above "
+                     "the gate, so an unscored source is not a passed source "
+                     "and neither policy licenses reading it as one. These "
+                     "runs are NOT removed, because removing them would be a "
+                     "filter the plan does not define; they are named here "
+                     "instead.")
+    return ' '.join(parts)
+
+
+def print_analysis_set(record: dict) -> None:
+    """The analysis set on stdout, in the shape `stats.py` prints it.
+
+    Loud rather than tidy. Every one of these removals changes a number in
+    every figure, and the previous version of this module printed a run count
+    that included runs no figure could use, which is how "96 runs" sat above a
+    forest built on 2 seeds per arm.
+    """
+    policy = record.get('source_policy', 'valid')
+    print(f"  analysis set: {record.get('rows_in_analysis_set', 0)} of "
+          f"{record.get('rows_in_table', 0)} runs, source policy {policy!r} "
+          + ('(valid sources only, the primary estimand of DESIGN.md 4.3)'
+             if policy == 'valid' else
+             '(POOLED OVER SOURCE COMPETENCE: the pre-declared SECONDARY of '
+             'DESIGN.md 4.3, never intent-to-treat)'))
+    removed = record.get('removed') or {}
+    if not removed:
+        print('    nothing removed')
+    for key, rec in removed.items():
+        print(f"    -{rec['n']:>4} {key}: {rec['reason']}")
+        if rec.get('labels'):
+            shown = ', '.join(rec['labels'][:6])
+            more = (f" (+{len(rec['labels']) - 6} more arms)"
+                    if len(rec['labels']) > 6 else '')
+            print(f"          arms: {shown}{more}")
+        if rec.get('source_scores'):
+            print(f"          source scores seen: {rec['source_scores']}")
+    if record.get('transfer_rows_with_no_source_verdict'):
+        print(f"{WARN} "
+              f"{record['transfer_rows_with_no_source_verdict']} run(s) in the "
+              f"analysis set transferred from a source with NO validity "
+              f"verdict (source_valid empty, not False): "
+              f"{', '.join((record.get('arms_with_no_source_verdict') or [])[:6])}. "
+              f"DESIGN.md 4.3 does not license an unscored source as a pass. "
+              f"They are plotted and named in every caption rather than "
+              f"removed by a rule the plan does not define.")
+    if policy == 'pooled':
+        print('    !! every figure will be stamped SECONDARY ANALYSIS SET and '
+              'no number in it is the primary estimand')
+
+
 def resolve_selection(per_seed: pd.DataFrame) -> tuple[set[str], list[dict]]:
     """One run directory per (arm label, seed), chosen deterministically.
 
@@ -401,7 +708,12 @@ def resolve_selection(per_seed: pd.DataFrame) -> tuple[set[str], list[dict]]:
     """
     keep: set[str] = set()
     collisions: list[dict] = []
-    for (label, seed), group in per_seed.groupby(['label', 'seed'], sort=True):
+    # `dropna=False`, against pandas' default: a group key that is missing must
+    # produce a visible group rather than a vanished run. `analysis_set` has
+    # already removed and named any row whose seed will not parse, so this is
+    # the second belt, not the first.
+    for (label, seed), group in per_seed.groupby(['label', 'seed'], sort=True,
+                                                 dropna=False):
         run_dirs = sorted(str(r) for r in group['run_dir'].tolist())
         keep.add(run_dirs[0])
         if len(run_dirs) > 1:
@@ -434,6 +746,12 @@ class Context:
     smooth: int
     grid_points: int
     argv: list[str]
+    #: 'valid' (primary) or 'pooled' (the DESIGN.md 4.3 secondary).
+    source_policy: str = 'valid'
+    #: What `analysis_set` removed, and why. Travels into every caption.
+    analysis: dict = field(default_factory=dict)
+    #: Duplicated (run_dir, episode) rows found in the curve table, if any.
+    curve_integrity: dict = field(default_factory=dict)
     shift_metrics: dict[str, float] = field(default_factory=dict)
     arms: dict[str, dict[str, str]] = field(default_factory=dict)
     iface: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -450,16 +768,61 @@ class Context:
 
     # -- label -> runs ----------------------------------------------------
     def rows_for_labels(self, labels: Iterable[str]) -> pd.DataFrame:
+        # The `selected` filter is applied unconditionally, not `if
+        # self.selected`. An empty selection means the analysis set is empty,
+        # and a filter that switches itself off when it has nothing to keep
+        # fails open: it would hand back every row in the table.
         wanted = [name for name in dict.fromkeys(labels) if name]
         rows = self.per_seed[self.per_seed['label'].isin(wanted)]
-        if self.selected:
-            rows = rows[rows['run_dir'].isin(self.selected)]
-        return rows
+        return rows[rows['run_dir'].isin(self.selected)]
 
     def run_dirs_for_labels(self, labels: Iterable[str]) -> list[str]:
         return self.rows_for_labels(labels)['run_dir'].tolist()
 
+    def intensity_for_labels(self, labels: Iterable[str]) -> dict:
+        """Transfer intensity of a set of arms: which parameters were carried.
+
+        `DESIGN.md` §3.1 names the intensity confound: two arms that differ in
+        how much of the network was transferred are not comparable at fixed
+        interface, and `audit.py` is required to refuse a claim that crosses
+        one. `shift_gradient` puts three panels on a shared y axis whose
+        transfer arms come from two experiments, and E8 declares
+        `transfer_set='trunk'` where E8i declares `'matched'`, so the figure's
+        own cross-panel reading crossed an unstated change in transferred
+        fraction. The reading is not refused here (refusing is `audit.py`'s
+        job), but it can no longer be made without seeing the change.
+        """
+        rows = self.rows_for_labels(labels)
+        out: dict[str, Any] = {}
+        if 'transfer_set' in rows.columns:
+            out['transfer_set'] = sorted(
+                set(str(v) for v in rows['transfer_set'].dropna()))
+        if 'transferred_param_fraction' in rows.columns:
+            vals = pd.to_numeric(rows['transferred_param_fraction'],
+                                 errors='coerce').dropna()
+            out['transferred_param_fraction'] = sorted(
+                {round(float(v), 4) for v in vals})
+        return out
+
+    def seed_blocks_for(self, seeds: Iterable[int]) -> list[str]:
+        """The `DESIGN.md` §3.4 blocks the plotted seeds belong to.
+
+        Stated in every caption and every provenance record. A seed list on its
+        own does not tell a reader whether a number is contaminated by
+        selection: the caption used to read "n=4 distinct seeds plotted (0, 1,
+        2, 200)" with nothing to say that 200 is a `TUNE` seed. `analysis_set`
+        now removes those, so this line should read `CONFIRM` on a clean table,
+        and anything else in it is visible rather than inferred.
+        """
+        if 'seed_block' not in self.per_seed.columns:
+            return []
+        wanted = {int(s) for s in seeds}
+        rows = self.per_seed[self.per_seed['seed'].isin(wanted)]
+        return sorted(set(str(v) for v in rows['seed_block'].dropna()))
+
     def envs_for_labels(self, labels: Iterable[str]) -> list[str]:
+        if 'env' not in self.per_seed.columns:
+            return []
         return list(dict.fromkeys(
             self.rows_for_labels(labels)['env'].dropna().tolist()))
 
@@ -508,52 +871,138 @@ class Context:
         return {'manifests_read': n_read,
                 **{k: sorted(v) for k, v in seen.items()}}
 
-    def references(self, envs_used: Iterable[str]) -> dict[str, dict]:
-        """Normalisation references for the environments in one figure.
+    def references(self, run_dirs: Iterable[str]) -> dict[str, dict]:
+        """Normalisation references for the runs actually in one figure.
 
-        The manifest's own `reference` block is preferred over
-        `reference_returns.json`: it is what the plotted scores were actually
-        divided by, and a figure must be described by the numbers that made it.
+        Keyed on run directories rather than on environment names, and that is
+        the whole point of the signature. The previous version scanned every row
+        of the table with a matching `env`, so the reference printed under a
+        figure could come from a run the figure does not contain, and it stopped
+        at the first manifest that had a block, so any disagreement between runs
+        was invisible. `DESIGN.md` §5.1 measures the random-policy reference per
+        environment *and per variant*, so two runs on nominally the same env
+        disagreeing about the denominator is a real possibility and a reporting
+        stopper: a figure whose scores were divided by two different numbers is
+        not on one scale.
+
+        Every distinct block found among the figure's own runs is therefore
+        collected, disagreement is reported rather than resolved, and the result
+        is cross-checked against `reference_returns.json`, which is the file
+        `audit.py` and `aggregate.py` treat as canonical.
         """
+        wanted = set(str(r) for r in run_dirs)
+        if 'env' not in self.per_seed.columns:
+            return {}
+        rows = self.per_seed[self.per_seed['run_dir'].astype(str).isin(wanted)]
         out: dict[str, dict] = {}
-        for env in dict.fromkeys(envs_used):
-            if env is None or (isinstance(env, float) and np.isnan(env)):
-                continue
-            rows = self.per_seed[self.per_seed['env'] == env]
-            ref: dict = {}
-            for run_dir in rows['run_dir'].tolist():
+        for env in dict.fromkeys(rows['env'].dropna().tolist()):
+            here = rows[rows['env'] == env]
+            distinct: dict[tuple, dict] = {}
+            n_read = 0
+            for run_dir in here['run_dir'].tolist():
                 block = self.manifest(run_dir).get('reference') or {}
-                if block.get('random_return') is not None:
-                    ref = {'random_return': block['random_return'],
-                           'threshold': block['threshold'],
-                           'noop_return': block.get('noop_return'),
-                           'origin': 'run manifest'}
-                    break
-            if not ref:
-                try:
-                    block = envs.reference(env)
-                    ref = {'random_return': block.get('random_return'),
-                           'threshold': block.get('threshold'),
-                           'noop_return': block.get('noop_return'),
-                           'origin': 'reference_returns.json'}
-                except Exception:                          # noqa: BLE001
-                    ref = {'origin': 'unavailable'}
+                if block.get('random_return') is None:
+                    continue
+                n_read += 1
+                key = (round(float(block['random_return']), 6),
+                       round(float(block['threshold']), 6))
+                distinct.setdefault(key, {
+                    'random_return': block['random_return'],
+                    'threshold': block['threshold'],
+                    'noop_return': block.get('noop_return'),
+                    'runs': []})['runs'].append(str(run_dir))
+            canonical: dict = {}
+            try:
+                block = envs.reference(env)
+                canonical = {'random_return': block.get('random_return'),
+                             'threshold': block.get('threshold'),
+                             'noop_return': block.get('noop_return')}
+            except Exception:                              # noqa: BLE001
+                canonical = {}
+            if not distinct:
+                ref = dict(canonical) if canonical else {}
+                ref.update({'origin': ('reference_returns.json (no run '
+                                       'manifest in this figure carried a '
+                                       'reference block)')
+                            if canonical else 'unavailable',
+                            'manifest_blocks_read': 0,
+                            'distinct_blocks': 0})
+                out[str(env)] = ref
+                continue
+            first = next(iter(distinct.values()))
+            ref = {'random_return': first['random_return'],
+                   'threshold': first['threshold'],
+                   'noop_return': first['noop_return'],
+                   'origin': 'run manifests of the runs in this figure',
+                   'manifest_blocks_read': n_read,
+                   'distinct_blocks': len(distinct)}
+            if len(distinct) > 1:
+                ref['disagreement'] = [
+                    {'random_return': v['random_return'],
+                     'threshold': v['threshold'], 'runs': sorted(v['runs'])}
+                    for v in distinct.values()]
+            if canonical:
+                agrees = (canonical.get('random_return') is not None
+                          and abs(float(canonical['random_return'])
+                                  - float(first['random_return'])) < 1e-6
+                          and abs(float(canonical['threshold'])
+                                  - float(first['threshold'])) < 1e-6)
+                ref['matches_reference_returns_json'] = bool(agrees)
+                if not agrees:
+                    ref['reference_returns_json'] = canonical
+            else:
+                ref['matches_reference_returns_json'] = None
             out[str(env)] = ref
         return out
+
+
+#: Columns this module indexes unconditionally, so a table lacking any of them
+#: is not a per_seed table and is refused with a friendly message rather than a
+#: `KeyError` traceback five call frames deep.
+#:
+#: `seed_block` and `source_valid` are in this list on purpose, and that is a
+#: guard rather than a convenience. Both gates that keep a figure honest read
+#: them: `TUNE` exclusion (`ANALYSIS_PLAN.md` §8) and the source-validity gate
+#: (`DESIGN.md` §4.3). A guard written as `if 'seed_block' in df.columns` fails
+#: *open*, which is how TUNE-seed leakage survived in a neighbouring module, so
+#: the column is required instead of being treated as optional. `aggregate.py`
+#: emits both for every run.
+REQUIRED_PER_SEED_COLUMNS: tuple[str, ...] = (
+    'run_dir', 'label', 'cell', 'condition', 'env', 'seed', 'seed_block',
+    'source_valid', 'final_score', 'auc_score')
+
+#: Columns a non-empty curve table must carry. `seed` is here because
+#: `series_matrix` reads it to caption the seed count, and the synthesised empty
+#: frame below includes it, so its absence in a real file was invisible until it
+#: raised.
+REQUIRED_CURVE_COLUMNS: tuple[str, ...] = ('run_dir', 'label', 'seed',
+                                           'episode', 'env_steps')
 
 
 def load(per_seed_path: str,
          curves_path: Optional[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     per_seed = pd.read_csv(per_seed_path)
-    missing = [c for c in ('run_dir', 'label', 'cell', 'condition', 'seed',
-                           'final_score', 'auc_score')
+    missing = [c for c in REQUIRED_PER_SEED_COLUMNS
                if c not in per_seed.columns]
     if missing:
         raise SystemExit(f'{WARN} {per_seed_path} is not a per_seed table: '
                          f'missing columns {missing}. It is produced by '
-                         f'experiments/aggregate.py.')
+                         f'experiments/aggregate.py. seed_block and '
+                         f'source_valid are required because the TUNE-seed '
+                         f'exclusion (ANALYSIS_PLAN.md 8) and the '
+                         f'source-validity gate (DESIGN.md 4.3) read them, and '
+                         f'a gate that switches itself off when its column is '
+                         f'absent is not a gate.')
     if curves_path and os.path.isfile(curves_path):
         curves = pd.read_csv(curves_path)
+        if len(curves):
+            missing = [c for c in REQUIRED_CURVE_COLUMNS
+                       if c not in curves.columns]
+            if missing:
+                raise SystemExit(
+                    f'{WARN} {curves_path} is not a curves table: missing '
+                    f'columns {missing}. It is produced by '
+                    f'experiments/aggregate.py.')
     else:
         curves = pd.DataFrame(columns=['run_dir', 'cell', 'condition', 'label',
                                        'seed', 'episode', 'env_steps',
@@ -561,14 +1010,65 @@ def load(per_seed_path: str,
     return per_seed, curves
 
 
+def curve_integrity(curves: pd.DataFrame) -> dict:
+    """Whether `(run_dir, episode)` is unique in the curve table.
+
+    `DESIGN.md` §8.2 names duplicated and interleaved episode rows as the
+    corruption two trainers writing into one directory produces, and `B1` of
+    `PRELAUNCH_FIXES.md` records that it very nearly happened in P0. `per_seed`
+    carries a `metrics_contiguous` flag and this module checks it, but nothing
+    checked the curve table itself, and a duplicated evaluation row is invisible
+    at `--smooth 0` while silently shifting every windowed statistic once
+    smoothing is on: one duplicated row moved a plotted curve's final grid mean
+    by 0.04 at `--smooth 5`. Duplicates are therefore counted here, reported on
+    stdout, written into every provenance record and named in the caption of
+    any figure that smooths; the surviving row is the first at each
+    `(run_dir, episode)` after a stable sort, so the figure is reproducible.
+    """
+    out = {'checked': False, 'duplicate_rows': 0, 'runs_affected': []}
+    if curves.empty or not {'run_dir', 'episode'} <= set(curves.columns):
+        return out
+    out['checked'] = True
+    dupe = curves.duplicated(subset=['run_dir', 'episode'], keep=False)
+    if not bool(dupe.any()):
+        return out
+    affected = curves.loc[dupe, 'run_dir'].astype(str)
+    out['duplicate_rows'] = int(
+        curves.duplicated(subset=['run_dir', 'episode'], keep='first').sum())
+    out['runs_affected'] = sorted(set(affected.tolist()))
+    return out
+
+
+def seeds_per_run(curves: pd.DataFrame) -> dict[str, list[int]]:
+    """Run directories in the curve table that carry more than one seed.
+
+    `series_matrix` attributes a whole run's curve to `g['seed'].iloc[0]`, so a
+    run mapping to two seeds would make the caption's seed set quietly wrong.
+    Nothing checked it; this does, and the caller reports it.
+    """
+    if curves.empty or not {'run_dir', 'seed'} <= set(curves.columns):
+        return {}
+    out: dict[str, list[int]] = {}
+    for run_dir, g in curves.groupby('run_dir'):
+        found = sorted({int(v) for v in
+                        pd.to_numeric(g['seed'], errors='coerce').dropna()})
+        if len(found) > 1:
+            out[str(run_dir)] = found
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 4. Selection and pairing
 # ---------------------------------------------------------------------------
 def arm_rows(ctx: Context, label: str) -> pd.DataFrame:
+    """One arm's runs, from the analysis set, one run per seed.
+
+    The `selected` filter is unconditional for the reason given in
+    `Context.rows_for_labels`: a filter that switches itself off when it has
+    nothing to keep fails open.
+    """
     rows = ctx.per_seed[ctx.per_seed['label'] == label]
-    if ctx.selected:
-        rows = rows[rows['run_dir'].isin(ctx.selected)]
-    return rows
+    return rows[rows['run_dir'].isin(ctx.selected)]
 
 
 @dataclass
@@ -596,14 +1096,18 @@ def _rows_to_series(rows: pd.DataFrame, metric: str, name: str,
     """seed -> metric for a set of runs, one value per seed.
 
     De-duplication is by seed within whatever rows the caller passes, sorted by
-    path so the choice is reproducible. Callers that vary a factor pass rows
-    already restricted to one level of it, so a factor level is never collapsed
-    away here.
+    path so the choice is reproducible. The sort is explicitly `mergesort`,
+    which is stable: pandas' default quicksort is not, so with two rows sharing
+    a `run_dir` (a duplicated CSV row) which one `keep='first'` retained was not
+    guaranteed to be the same from one invocation to the next, which is not what
+    "sorted by path so the choice is reproducible" promises. Callers that vary a
+    factor pass rows already restricted to one level of it, so a factor level is
+    never collapsed away here.
     """
     if metric not in rows.columns:
         return pd.Series(dtype=float)
     rows = (rows[['run_dir', 'seed', metric]].dropna(subset=[metric])
-            .sort_values('run_dir'))
+            .sort_values('run_dir', kind='mergesort'))
     dupe = rows['seed'].duplicated(keep=False)
     if bool(dupe.any()):
         for seed in sorted(set(rows.loc[dupe, 'seed'].tolist())):
@@ -649,17 +1153,52 @@ def pair(ctx: Context, base_label: str, treat_label: str, metric: str,
         duplicates=sorted(set(dupes)))
 
 
+def _note_losses(lost: dict[str, list[str]], where: str, metric: str,
+                 p: Paired) -> None:
+    """Record what one matched-seed contrast had to leave out.
+
+    `Paired` has always carried `unmatched_base`, `unmatched_treat` and
+    `duplicates`, and exactly one figure read them. Every other paired figure
+    threw them away, so an arm silently falling from n=3 to n=2 changed the
+    interaction contrast in all four cells and left no trace in the figure, the
+    caption or the provenance. `DESIGN.md` §1 lists silent seed dropping as one
+    of the six published defects; recording it in one place makes it a fact
+    every figure carries rather than a courtesy one figure extended.
+    """
+    if p.unmatched_base:
+        lost['unmatched seeds'].append(
+            f'{where}/{metric} {p.base_label} seeds '
+            f'{_seed_list(p.unmatched_base)}')
+    if p.unmatched_treat:
+        lost['unmatched seeds'].append(
+            f'{where}/{metric} {p.treat_label} seeds '
+            f'{_seed_list(p.unmatched_treat)}')
+    if p.duplicates:
+        lost['duplicated arm rows'].append(
+            f"{where}/{metric} {', '.join(p.duplicates)}")
+
+
 def estimate_shift(ctx: Context, delta: np.ndarray,
                    idx: Optional[np.ndarray] = None) -> dict:
     """Hodges-Lehmann paired shift with `stats.py`'s bias-corrected bootstrap
-    interval. `ANALYSIS_PLAN.md` §2: no mean-with-a-normal-interval anywhere."""
+    interval. `ANALYSIS_PLAN.md` §2: no mean-with-a-normal-interval anywhere.
+
+    `vec=stats.hl_vec` is not an optimisation detail. Without it the Walsh
+    average median is recomputed in Python once per bootstrap resample, which is
+    10,000 scalar passes per contrast and several dozen contrasts per
+    invocation: the forest alone took 36 s at n=3 and would take minutes at the
+    confirmatory n=10, which is long enough that a figure stops being re-run
+    after a change. `hl_vec` computes the whole stack at once and `stats.py`'s
+    `--self-test` checks the two agree.
+    """
     units = np.asarray(delta, dtype=float).reshape(-1, 1)
     if units.shape[0] == 0:
         return {'estimate': float('nan'), 'lo': float('nan'),
                 'hi': float('nan'), 'n': 0, 'method': 'none', 'note': 'no data'}
     out = stats.bootstrap_statistic(
         units, lambda u: stats.hodges_lehmann_paired(u[:, 0]),
-        n_boot=ctx.n_boot, seed=ctx.boot_seed, idx=idx)
+        n_boot=ctx.n_boot, seed=ctx.boot_seed, idx=idx,
+        vec=lambda s: stats.hl_vec(s[..., 0]))
     out.pop('reps', None)
     return out
 
@@ -693,32 +1232,162 @@ def estimate_difference(ctx: Context, units: np.ndarray, a: int, b: int,
     return out
 
 
-def exclusion_sentence(est: dict) -> str:
+def _degenerate(est: dict) -> bool:
+    """Whether an interval has collapsed to a point.
+
+    A zero-width bootstrap interval means every resample produced the same
+    value, which happens when the sample itself is constant: a floored metric, a
+    duplicated row, or an arm where every seed landed on the same number. It is
+    the *least* informative case, and both `bca_interval` (which falls back to a
+    percentile interval there) and the sentences below have to treat it as an
+    absence of information rather than as an infinitely precise measurement. The
+    unguarded version read `lo = hi = 0.0` as "a degradation of any size is
+    excluded" and "equivalence supported", which is the strongest possible pair
+    of claims from the weakest possible evidence.
+    """
+    if est.get('degenerate'):
+        return True                  # stats.py's own flag, where it sets one
+    lo, hi = est.get('lo'), est.get('hi')
+    if lo is None or hi is None:
+        return False
+    # Measured from the interval itself as well, so the guard does not depend
+    # on an upstream flag being present in every estimator's return value.
+    return bool(np.isfinite(lo) and np.isfinite(hi) and (hi - lo) <= 0.0)
+
+
+def exclusion_sentence(est: dict, units: str = 'normalised score units') -> str:
     """The only licensed positive statement about a null (`DESIGN.md` §9,
-    `ANALYSIS_PLAN.md` §4): what the interval excludes."""
+    `ANALYSIS_PLAN.md` §4): what the interval excludes.
+
+    `units` is a parameter because the bound is quoted on whatever scale the
+    endpoint lives on, and calling an area-per-env-step quantity "score units"
+    would misdescribe P2 in the caption of the figure that draws it.
+    """
     lo = est.get('lo')
     if lo is None or not np.isfinite(lo):
         return 'no exclusion bound (interval suppressed)'
+    if _degenerate(est):
+        return ('no exclusion bound: the bootstrap interval has zero width, so '
+                'the sample is constant and the interval carries no '
+                'information about what is excluded')
     if lo >= 0:
-        return 'a degradation of any size is excluded at 95%'
-    return (f'a degradation worse than {abs(lo):.3f} score units is '
+        return (f'a degradation worse than 0.000 {units} is excluded at 95% '
+                f'(the interval lies entirely at or above zero)')
+    return (f'a degradation worse than {abs(lo):.3f} {units} is '
             f'excluded at 95%')
 
 
-def equivalence_sentence(est: dict, sd: float,
+def equivalence_sentence(est: dict, sd: float, n: Optional[int] = None,
+                         endpoint: str = 'final_score',
                          margin: float = stats.EQUIVALENCE_MARGIN) -> str:
-    """`ANALYSIS_PLAN.md` §4 verbatim in its two branches: an equivalence
-    verdict, or the statement that dispersion makes equivalence untestable at
-    this n. Never TOST, and never a null read as equivalence."""
-    if np.isfinite(sd) and sd > margin:
+    """`ANALYSIS_PLAN.md` §4 in its branches: an equivalence verdict, or the
+    statement that this cell cannot support one. Never TOST, and never a null
+    read as equivalence.
+
+    Four refusals come before the verdict, and each closes a way of getting the
+    strongest available claim out of the weakest available evidence:
+
+    * **Endpoint.** §4 fixes +/-0.05 for the paired delta on the *normalised
+      score*, justified as ~20 return points on LunarLander. That justification
+      does not extend to `auc_score`, and inventing a margin for an endpoint the
+      plan never defined one for is a new analysis choice.
+    * **Sample size.** Below `MIN_N_FOR_INFERENCE` there is no interval to be
+      inside anything (`ANALYSIS_PLAN.md` §9).
+    * **Zero dispersion.** The feasibility gate is `sd > margin`, which at
+      SD = 0 passes trivially, so a degenerate arm sailed straight through it to
+      "equivalence supported".
+    * **A degenerate interval.** Same reason, at the other end.
+    """
+    if endpoint not in MARGIN_ENDPOINTS:
+        return (f'no equivalence verdict for {endpoint}: ANALYSIS_PLAN.md 4 '
+                f'fixes the +/-{margin:.2f} margin for the paired delta on the '
+                f'normalised score only, and no margin is pre-registered on '
+                f'this scale')
+    if n is not None and n < stats.MIN_N_FOR_INFERENCE:
+        return (f'equivalence not assessed (n={n} < '
+                f'{stats.MIN_N_FOR_INFERENCE}, ANALYSIS_PLAN.md 9)')
+    if not np.isfinite(sd):
+        return ('equivalence not assessed (across-seed SD undefined at this n)')
+    if sd <= 0.0:
+        return ('equivalence not assessed: the across-seed SD is exactly 0, so '
+                'this arm is constant across seeds (a floored metric, a '
+                'duplicated row, or a single distinct value) and carries no '
+                'dispersion information to test against the margin')
+    if sd > margin:
         return (f'equivalence untestable in this cell at this n '
                 f'(across-seed SD {sd:.3f} > margin {margin:.2f})')
     lo, hi = est.get('lo'), est.get('hi')
     if lo is None or not np.isfinite(lo) or not np.isfinite(hi):
         return 'equivalence not assessed (interval suppressed)'
+    if _degenerate(est):
+        return ('equivalence not assessed: the bootstrap interval has zero '
+                'width, and a point interval from a constant sample is an '
+                'absence of information, not evidence of equivalence')
     if lo > -margin and hi < margin:
         return f'CI inside +/-{margin:.2f}: equivalence supported'
     return f'CI not inside +/-{margin:.2f}: equivalence not supported'
+
+
+class MethodLog:
+    """Every interval method an estimator actually returned inside one figure.
+
+    Reviewer concern C8 is a caption that cannot be checked against its figure,
+    and the `interval=` strings in this module were hand-written constants: they
+    said "bias-corrected (BCa) seed-level bootstrap 95% CI" whatever
+    `bca_interval` in fact returned. On a degenerate bootstrap distribution it
+    returns a *percentile* interval and says so in a `note`, and that note was
+    carried in the estimate dict and then thrown away. The same string also
+    asserted globally that "no interval is drawn" whenever the smallest arm was
+    below the inference floor, while `band()` suppresses per arm, so seven of
+    eight arms could carry a band under a caption saying none did.
+
+    So the methods are counted as they arrive and the caption states the tally.
+    A figure cannot contradict itself about its own intervals if the sentence is
+    generated from what happened.
+    """
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+        self.notes: dict[str, None] = {}
+
+    def add(self, est: dict) -> dict:
+        """Record one estimate's method and note; returns it for chaining."""
+        method = str(est.get('method') or 'none')
+        self.counts[method] = self.counts.get(method, 0) + 1
+        note = str(est.get('note') or '').strip()
+        if note:
+            self.notes.setdefault(note, None)
+        return est
+
+    def add_method(self, method: str, note: str = '') -> None:
+        self.add({'method': method, 'note': note})
+
+    @property
+    def drawn(self) -> int:
+        return sum(v for k, v in self.counts.items()
+                   if not k.startswith(('suppressed', 'none')))
+
+    @property
+    def suppressed(self) -> int:
+        return sum(v for k, v in self.counts.items()
+                   if k.startswith(('suppressed', 'none')))
+
+    def sentence(self) -> str:
+        if not self.counts:
+            return ('No interval was computed anywhere in this figure: no arm '
+                    'produced an estimate.')
+        tally = ', '.join(f'{k} x{v}' for k, v in sorted(self.counts.items()))
+        out = (f'Interval methods the estimator actually returned in this '
+               f'figure: {tally} ({self.drawn} drawn, {self.suppressed} '
+               f'suppressed).')
+        if self.notes:
+            out += ' Estimator notes: ' + ' | '.join(self.notes) + '.'
+        return out
+
+    def record(self) -> dict:
+        return {'counts': dict(sorted(self.counts.items())),
+                'drawn': self.drawn, 'suppressed': self.suppressed,
+                'notes': sorted(self.notes)}
 
 
 # ---------------------------------------------------------------------------
@@ -731,13 +1400,20 @@ def curve_rows(ctx: Context, label: str) -> pd.DataFrame:
     The restriction matters: without it a label carrying two configurations
     (see `resolve_selection`) would have both averaged into one band, and a
     band over two freeze windows is not a curve of either.
+
+    The restriction is also what carries the analysis set into the curve
+    figures: `ctx.selected` is built from the filtered `per_seed`, so a run
+    excluded for a TUNE seed, a donor-only block or a failed source-validity
+    gate has no curve drawn either. It is applied unconditionally for the reason
+    in `Context.rows_for_labels`: an empty selection must yield no rows, not
+    every row.
     """
     if ctx.curves.empty or 'label' not in ctx.curves.columns:
         return ctx.curves
     rows = ctx.curves[ctx.curves['label'] == label]
-    if ctx.selected and 'run_dir' in rows.columns:
-        rows = rows[rows['run_dir'].isin(ctx.selected)]
-    return rows
+    if 'run_dir' not in rows.columns:
+        return rows.iloc[0:0]
+    return rows[rows['run_dir'].isin(ctx.selected)]
 
 
 def _support(frames: Sequence[pd.DataFrame], column: str) -> tuple[float, float,
@@ -767,19 +1443,41 @@ def _support(frames: Sequence[pd.DataFrame], column: str) -> tuple[float, float,
 
 def series_matrix(ctx: Context, frame: pd.DataFrame, column: str,
                   grid: np.ndarray) -> tuple[np.ndarray, list[int]]:
-    """One row per seed, interpolated onto `grid`. No extrapolation."""
+    """One row per seed, interpolated onto `grid`. No extrapolation.
+
+    Duplicated `(run_dir, episode)` rows are dropped here, deterministically and
+    after a stable sort, because a duplicated evaluation point enters the
+    trailing mean twice and shifts a windowed statistic without changing
+    anything visible at `--smooth 0`. The count is reported by
+    `curve_integrity` at load time and named in the caption; this is where the
+    corruption is actually kept out of the numbers.
+
+    A run with no usable `seed` no longer raises: it is skipped and the caption
+    then rests on the seeds that were readable, which the seed count states.
+    """
     rows, seeds = [], []
     if frame.empty or column not in frame.columns:
         return np.zeros((0, len(grid))), seeds
-    for run_dir, g in frame.dropna(subset=[column]).groupby('run_dir'):
-        g = g.sort_values('env_steps')
+    frame = frame.dropna(subset=[column])
+    if 'episode' in frame.columns:
+        frame = (frame.sort_values(['run_dir', 'episode'], kind='mergesort')
+                 .drop_duplicates(subset=['run_dir', 'episode'], keep='first'))
+    for run_dir, g in frame.groupby('run_dir'):
+        g = g.sort_values('env_steps', kind='mergesort')
         x = g['env_steps'].to_numpy(float)
         y = g[column].to_numpy(float)
         if len(x) < 2:
             continue
+        seed = pd.to_numeric(g['seed'], errors='coerce').dropna() \
+            if 'seed' in g.columns else pd.Series(dtype=float)
+        if seed.empty:
+            print(f'{WARN} series_matrix: no readable seed for run {run_dir}; '
+                  f'its curve is not plotted, because a curve with no seed '
+                  f'cannot be counted in the seed set the caption states')
+            continue
         y = _trailing_mean(y, ctx.smooth)
         rows.append(np.interp(grid, x, y, left=np.nan, right=np.nan))
-        seeds.append(int(g['seed'].iloc[0]))
+        seeds.append(int(seed.iloc[0]))
     if not rows:
         return np.zeros((0, len(grid))), seeds
     return np.vstack(rows), seeds
@@ -799,6 +1497,13 @@ def band(ctx: Context, mat: np.ndarray) -> dict:
         return {'n': 0, 'mean': None, 'lo': None, 'hi': None,
                 'method': 'none'}
     mean = np.nanmean(mat, axis=0)
+    if ctx.n_boot < 1:
+        # Zero resamples produced an empty replicate array, `np.nanpercentile`
+        # returned NaN bounds, no band was drawn, and the caption still read
+        # "95% percentile bootstrap over seeds, 0 resamples". The CLI now
+        # refuses n_boot < 1; this is the second belt, and it names the reason.
+        return {'n': n, 'mean': mean, 'lo': None, 'hi': None,
+                'method': 'suppressed (no bootstrap resamples requested)'}
     if n < stats.MIN_N_FOR_INFERENCE:
         return {'n': n, 'mean': mean, 'lo': None, 'hi': None,
                 'method': f'suppressed (n={n} < {stats.MIN_N_FOR_INFERENCE})'}
@@ -826,13 +1531,18 @@ def freeze_boundary(ctx: Context, frame: pd.DataFrame) -> dict:
     """
     out = {'runs': 0, 'exited': 0, 'mean_env_step': float('nan'),
            'sd_env_step': float('nan'), 'ever_frozen': 0,
-           'max_updates': float('nan')}
+           'max_updates': float('nan'), 'unreadable_frozen_flags': 0}
     if frame.empty or 'frozen' not in frame.columns:
         return out
     steps, updates_max = [], []
     for _run, g in frame.groupby('run_dir'):
-        g = g.sort_values('episode')
-        flag = _as_bool(g['frozen'])
+        g = g.sort_values('episode', kind='mergesort')
+        flag, known = _bool_tokens(g['frozen'])
+        # An unreadable freeze flag is counted rather than assumed. It reads as
+        # "not frozen", which can only move the boundary earlier or remove it,
+        # never invent one, and the count travels into the provenance so a
+        # boundary resting on guesswork is visible.
+        out['unreadable_frozen_flags'] += int((~known).sum())
         out['runs'] += 1
         if 'updates' in g.columns and len(g):
             updates_max.append(float(g['updates'].max()))
@@ -873,21 +1583,43 @@ def draw_boundary(ax: plt.Axes, boundary: dict, label: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 # 6. Emission -- the figure, its generated caption, its provenance
 # ---------------------------------------------------------------------------
-def stamp_validation(fig: plt.Figure, n: int) -> None:
+def stamp_validation(fig: plt.Figure, n: Optional[int]) -> None:
     """Mark the figure as machinery evidence, not result evidence.
 
     Faint on purpose: the stamp has to be unmissable in a slide deck and still
     leave the data readable, because the whole use of an n<3 figure is checking
     that the pipeline produced the right shape of curve.
+
+    `n` may be None, meaning the figure found no data at all. That case used to
+    escape the stamp entirely, because the caller stamped only `if n_min is not
+    None`: an empty figure came out looking like an ordinary methods figure with
+    an ordinary caption, which is the stamping rule inverted for exactly the
+    case that most needs it.
     """
     size = max(16.0, min(30.0, 4.2 * fig.get_figwidth()))
     fig.text(0.5, 0.5, stats.VALIDATION_STAMP.split(' - ')[0],
              fontsize=size, color='#B4B4B4', alpha=0.30, ha='center',
              va='center', rotation=22, zorder=0,
              transform=fig.transFigure)
-    fig.text(0.5, 0.5 - 0.055, f'n={n} seeds: {stats.VALIDATION_STAMP}',
+    detail = (f'n={n} seeds: ' if n is not None
+              else 'NO DATA in the analysis set: ')
+    fig.text(0.5, 0.5 - 0.055, detail + stats.VALIDATION_STAMP,
              fontsize=6.6, color='#A8A8A8', alpha=0.75, ha='center',
              va='center', rotation=22, zorder=0, transform=fig.transFigure)
+
+
+def stamp_pooled(fig: plt.Figure) -> None:
+    """Say on the canvas that this is the secondary analysis set.
+
+    A pooled figure separated from its caption (dropped into a slide, pasted
+    into a draft) would otherwise be indistinguishable from the primary one,
+    and the difference between them is the whole of `DESIGN.md` §4.3.
+    """
+    fig.text(0.5, 0.985, 'SECONDARY ANALYSIS SET: POOLED OVER SOURCE '
+                         'COMPETENCE (DESIGN.md 4.3), NOT THE PRIMARY '
+                         'ESTIMAND',
+             fontsize=6.0, color='#8A6D3B', alpha=0.95, ha='center', va='top',
+             zorder=5, transform=fig.transFigure)
 
 
 def protocol_sentence(protocol: dict) -> str:
@@ -918,14 +1650,28 @@ def normalisation_sentence(refs: dict[str, dict]) -> str:
         return ('normalised score = (return - random_return) / (threshold - '
                 'random_return); no reference block was readable')
     parts = []
+    warnings = []
     for env, ref in refs.items():
         parts.append(f"{env}: random {_f(ref.get('random_return'), 1)}, "
                      f"threshold {_f(ref.get('threshold'), 1)}, no-op "
                      f"{_f(ref.get('noop_return'), 1)} [{ref.get('origin')}]")
+        if ref.get('distinct_blocks', 0) > 1:
+            warnings.append(
+                f"WARNING: the runs in this figure on {env} do NOT share one "
+                f"normalisation reference ({ref['distinct_blocks']} distinct "
+                f"blocks). Their scores are not on one scale and no contrast "
+                f"between them is interpretable; the details are in the "
+                f"provenance record.")
+        if ref.get('matches_reference_returns_json') is False:
+            warnings.append(
+                f"WARNING: the reference the {env} runs were normalised by "
+                f"disagrees with reference_returns.json, which audit.py treats "
+                f"as canonical.")
     return ('normalised score = (return - random_return) / (threshold - '
             'random_return), so a uniform-random policy scores 0 and the '
             'registered threshold scores 1 (DESIGN.md 5.1) -- '
-            + '; '.join(parts))
+            + '; '.join(parts)
+            + ((' ' + ' '.join(warnings)) if warnings else ''))
 
 
 def smoothing_sentence(ctx: Context, extra: str = '') -> str:
@@ -940,11 +1686,27 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
          protocol: Optional[dict] = None, refs: Optional[dict] = None,
          interval: str = '', smoothing: Optional[str] = None,
          extra_lines: Sequence[str] = (),
-         meta: Optional[dict] = None) -> None:
-    """Write the figure, its generated caption and its provenance record."""
+         meta: Optional[dict] = None,
+         methods: Optional[MethodLog] = None,
+         dropped: Optional[dict] = None) -> None:
+    """Write the figure, its generated caption and its provenance record.
+
+    `methods` is the log of interval methods the estimators actually returned,
+    so the caption states them instead of asserting a constant. `dropped` is
+    what this particular figure lost that the analysis-set filters did not
+    remove: unmatched seeds, duplicated arm rows, censored runs with no usable
+    time. Recording it per figure closes the asymmetry where only the forest
+    kept `Paired`'s bookkeeping and the other five paired figures discarded it,
+    so an arm quietly falling from n=3 to n=2 left no trace at all.
+    """
     os.makedirs(ctx.outdir, exist_ok=True)
-    if n_min is not None and n_min < stats.MIN_N_FOR_INFERENCE:
+    # The stamp fires when there is too little data OR none at all. `n_min is
+    # None` means no arm produced an estimate, which is further below the
+    # inference floor than n=1, not above it.
+    if n_min is None or n_min < stats.MIN_N_FOR_INFERENCE:
         stamp_validation(fig, n_min)
+    if ctx.source_policy != 'valid':
+        stamp_pooled(fig)
     paths = []
     for fmt in ctx.formats:
         path = os.path.join(ctx.outdir, f'{name}.{fmt}')
@@ -954,26 +1716,64 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
 
     seeds = list(seeds)
     lines = [textwrap.fill(body, 92), '']
+    lines.append(textwrap.fill(analysis_set_sentence(ctx.analysis), 92))
     if seeds:
+        blocks = ctx.seed_blocks_for(seeds)
         lines.append(textwrap.fill(
             f'Seeds: n={len(seeds)} distinct seeds plotted '
-            f'({_seed_list(seeds)}). '
+            f'({_seed_list(seeds)}), from seed block(s) '
+            f'{", ".join(blocks) or "unknown"}. '
             + ('Below the confirmatory floor of ten seeds '
                '(STANDING_INSTRUCTIONS.md S4): estimates only, and no claim in '
                'the paper may rest on this figure.'
                if len(seeds) < 10 else
                'At or above the confirmatory floor of ten seeds '
                '(STANDING_INSTRUCTIONS.md S4).'), 92))
-    if n_min is not None and n_min < stats.MIN_N_FOR_INFERENCE:
+    else:
+        lines.append(textwrap.fill(
+            'Seeds: none. No arm in this figure had a run in the analysis set, '
+            'so nothing is plotted and there is no estimate of any kind here.',
+            92))
+    if n_min is None:
+        lines.append(textwrap.fill(
+            f'{stats.VALIDATION_STAMP}: this figure contains NO DATA. No arm '
+            f'produced an estimate, so nothing here may be quoted, compared or '
+            f'used to choose between hypotheses (ANALYSIS_PLAN.md 9). An empty '
+            f'figure is evidence about the pipeline, never about the study.',
+            92))
+    elif n_min < stats.MIN_N_FOR_INFERENCE:
         lines.append(textwrap.fill(
             f'{stats.VALIDATION_STAMP}: the smallest arm has n={n_min} < '
-            f'{stats.MIN_N_FOR_INFERENCE}, so no interval is drawn and no '
-            f'number here may be quoted, compared or used to choose between '
-            f'hypotheses (ANALYSIS_PLAN.md 9).', 92))
+            f'{stats.MIN_N_FOR_INFERENCE}, so no number here may be quoted, '
+            f'compared or used to choose between hypotheses '
+            f'(ANALYSIS_PLAN.md 9). Intervals are suppressed per arm, not '
+            f'globally: which arms carry one is in the interval line below and '
+            f'in the provenance record.', 92))
     if protocol is not None:
         lines.append(textwrap.fill('Evaluation: ' + protocol_sentence(protocol),
                                    92))
     lines.append(textwrap.fill('Interval: ' + (interval or 'none drawn'), 92))
+    if methods is not None:
+        lines.append(textwrap.fill(methods.sentence(), 92))
+    losses = '; '.join(f'{k}: {v}' for k, v in sorted((dropped or {}).items())
+                       if v)
+    if losses:
+        lines.append(textwrap.fill(
+            'Runs this figure could not use, beyond the analysis-set filters '
+            'above. Each is a seed that exists but does not enter the estimate '
+            'beside it, so the n on the axis and the n in the table can '
+            'differ, and neither is silent: ' + losses + '.', 92))
+    if ctx.curve_integrity.get('duplicate_rows') and (
+            smoothing is None and ctx.smooth > 1):
+        lines.append(textwrap.fill(
+            f"INPUT INTEGRITY: the curve table contains "
+            f"{ctx.curve_integrity['duplicate_rows']} duplicated "
+            f"(run_dir, episode) row(s) across "
+            f"{len(ctx.curve_integrity['runs_affected'])} run(s). They are "
+            f"dropped deterministically before smoothing, because a duplicated "
+            f"evaluation point enters the trailing mean twice; a table needing "
+            f"that repair has not passed DESIGN.md 8.2 and no window statistic "
+            f"from it is trustworthy.", 92))
     lines.append(textwrap.fill(smoothing if smoothing is not None
                                else smoothing_sentence(ctx), 92))
     if refs is not None:
@@ -1019,7 +1819,13 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
         'packages': ctx.prov.get('packages'),
         'bootstrap': {'n_boot': ctx.n_boot, 'seed': ctx.boot_seed},
         'smoothing_window_eval_points': ctx.smooth,
-        'seeds': seeds,
+        'seeds': [int(s) for s in seeds],
+        'seed_blocks': ctx.seed_blocks_for(seeds),
+        'analysis_set': ctx.analysis,
+        'source_policy': ctx.source_policy,
+        'interval_methods': (methods.record() if methods is not None else None),
+        'runs_not_used_by_this_figure': dropped or {},
+        'curve_table_integrity': ctx.curve_integrity,
         'analyses_carrying_a_p_value': 0,
         'arm_labels': ctx.arms,
         'arm_seed_collisions': ctx.collisions,
@@ -1064,6 +1870,7 @@ def fig_learning_curves(ctx: Context) -> None:
                              sharey=True)
     seeds: set[int] = set()
     n_min = None
+    log = MethodLog()
     meta: dict[str, Any] = {'grid_env_steps': [float(x0), float(x1)],
                             'grid_points': ctx.grid_points, 'panels': {}}
     boundaries: dict[str, dict] = {}
@@ -1081,6 +1888,7 @@ def fig_learning_curves(ctx: Context) -> None:
             n_min = mat.shape[0] if n_min is None else min(n_min, mat.shape[0])
             style = CONDITION_STYLE[cond]
             b = band(ctx, mat)
+            log.add_method(b['method'])
             if b['lo'] is not None:
                 ax.fill_between(grid, b['lo'], b['hi'], color=style['colour'],
                                 alpha=0.16, linewidth=0)
@@ -1089,6 +1897,7 @@ def fig_learning_curves(ctx: Context) -> None:
             if style['dashes'][0] is not None:
                 line.set_dashes(style['dashes'])
             panel[cond] = {'n': int(mat.shape[0]), 'band': b['method'],
+                           'seeds': sorted(int(s) for s in sds),
                            'final_grid_mean': float(b['mean'][-1])}
         bnd = freeze_boundary(ctx, frames.get((cell, 'transfer'), pd.DataFrame()))
         boundaries[cell] = bnd
@@ -1127,8 +1936,12 @@ def fig_learning_curves(ctx: Context) -> None:
                    if np.isfinite(b['max_updates'])] or [float('nan')])
     transfer_labels = [ctx.arms[c]['transfer'] for c in cells
                        if 'transfer' in ctx.arms.get(c, {})]
-    ks = sorted({int(v) for v in ctx.rows_for_labels(transfer_labels)
-                 ['freeze_updates'].dropna().tolist()})
+    # `freeze_updates` is not in the required-column set, because a table
+    # without it is still a per_seed table; indexing it unconditionally turned
+    # its absence into a traceback rather than a missing sentence.
+    trows = ctx.rows_for_labels(transfer_labels)
+    ks = (sorted({int(v) for v in trows['freeze_updates'].dropna().tolist()})
+          if 'freeze_updates' in trows.columns else [])
     if exited:
         bnd_text = (f'The freeze boundary is drawn per cell at the mean env '
                     f'step where the window ended ({exited} of {total} '
@@ -1136,9 +1949,9 @@ def fig_learning_curves(ctx: Context) -> None:
     else:
         bnd_text = (f'No freeze boundary is drawn: none of the {total} transfer '
                     f'runs left the freeze window within its budget (window '
-                    f'{ks} gradient updates against at most {_i(max_upd)} '
-                    f'updates performed), so the entire curve is inside the '
-                    f'window.')
+                    f'{ks or "not recorded in this table"} gradient updates '
+                    f'against at most {_i(max_upd)} updates performed), so the '
+                    f'entire curve is inside the window.')
 
     emit(ctx, 'learning_curves', fig,
          body=('Normalised evaluation score against environment steps, one '
@@ -1154,11 +1967,12 @@ def fig_learning_curves(ctx: Context) -> None:
                'every point rests on the same number of seeds. ' + bnd_text),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
-         refs=ctx.references(ctx.envs_for_labels(labels_used)),
+         refs=ctx.references(ctx.run_dirs_for_labels(labels_used)),
          interval=(f'shaded band = 95% percentile bootstrap over seeds, '
                    f'{ctx.n_boot} resamples, fixed seed {ctx.boot_seed} '
-                   f'(stats.boot_indices); suppressed where n < '
-                   f'{stats.MIN_N_FOR_INFERENCE}'),
+                   f'(stats.boot_indices); suppressed per arm where n < '
+                   f'{stats.MIN_N_FOR_INFERENCE}, never suppressed globally'),
+         methods=log,
          extra_lines=[
              'The dashed horizontal line at 1.0 is the registered solved '
              'threshold and the solid line at 0.0 is the measured random '
@@ -1180,6 +1994,9 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
     meta: dict[str, Any] = {'cells': {}}
     seeds: set[int] = set()
     n_min = None
+    log = MethodLog()
+    lost: dict[str, list[str]] = {'unmatched seeds': [],
+                                  'duplicated arm rows': []}
     margin = stats.EQUIVALENCE_MARGIN
     labels_used = [lbl for cell in cells for lbl in
                    (ctx.arms[cell].get('scratch'),
@@ -1187,8 +2004,14 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
     n_by_cell: dict[str, set[int]] = {}
 
     for ax, endpoint in zip(axes, endpoints):
-        ax.axvspan(-margin, margin, color=_GREY, alpha=0.13, linewidth=0,
-                   zorder=0)
+        # The margin band is drawn only where a margin exists. ANALYSIS_PLAN.md
+        # 4 fixes +/-0.05 for the normalised-score delta and justifies it as ~20
+        # return points on LunarLander; painting the same band on the
+        # area-per-env-step panel would extend a pre-registered quantity to a
+        # scale it was never defined for, by nothing more than a shared axis.
+        if endpoint in MARGIN_ENDPOINTS:
+            ax.axvspan(-margin, margin, color=_GREY, alpha=0.13, linewidth=0,
+                       zorder=0)
         ax.axvline(0.0, color=_BLACK, linewidth=0.7, zorder=1)
         ypos = list(range(len(cells)))[::-1]
         for y, cell in zip(ypos, cells):
@@ -1196,16 +2019,27 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
             if 'scratch' not in labels or 'transfer' not in labels:
                 continue
             p = pair(ctx, labels['scratch'], labels['transfer'], endpoint)
+            # Recorded before the empty-pair exit, not after: the case where an
+            # arm is missing entirely is the one whose lost seeds most need
+            # naming, and it is exactly the case the early `continue` used to
+            # skip past.
+            _note_losses(lost, cell, endpoint, p)
             if p.n == 0:
                 ax.text(0.0, y, ' no matched seeds', fontsize=6.4,
                         color=_GREY, va='center', style='italic')
                 continue
             seeds.update(p.seeds)
             n_min = p.n if n_min is None else min(n_min, p.n)
-            est = estimate_shift(ctx, p.delta)
+            est = log.add(estimate_shift(ctx, p.delta))
             sd_base = float(np.std(p.base, ddof=1)) if p.n > 1 else float('nan')
             sd_treat = float(np.std(p.treat, ddof=1)) if p.n > 1 else float('nan')
-            sd_cell = float(np.nanmax([sd_base, sd_treat]))
+            # `np.nanmax` over two NaNs warns on stderr and returns NaN. At n=1
+            # both SDs are NaN by construction, so the project's own primary
+            # table printed the warning eight times per invocation. The NaN is
+            # the right answer and the equivalence branch handles it; only the
+            # noise is wrong.
+            sds = [v for v in (sd_base, sd_treat) if np.isfinite(v)]
+            sd_cell = float(max(sds)) if sds else float('nan')
             ax.plot(p.delta, [y + 0.22] * p.n, marker='|', linestyle='none',
                     color=_GREY, markersize=4.5, markeredgewidth=0.8, zorder=2)
             if np.isfinite(est['lo']) and np.isfinite(est['hi']):
@@ -1221,10 +2055,13 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
                 'n': p.n, 'seeds': p.seeds,
                 'hodges_lehmann': est['estimate'], 'ci_lo': est['lo'],
                 'ci_hi': est['hi'], 'ci_method': est['method'],
+                'ci_note': est.get('note', ''),
                 'across_seed_sd_scratch': sd_base,
                 'across_seed_sd_transfer': sd_treat,
-                'exclusion': exclusion_sentence(est),
-                'equivalence': equivalence_sentence(est, sd_cell),
+                'exclusion': exclusion_sentence(
+                    est, ENDPOINT_UNITS.get(endpoint, 'units')),
+                'equivalence': equivalence_sentence(
+                    est, sd_cell, n=p.n, endpoint=endpoint),
                 'unmatched_scratch_seeds': p.unmatched_base,
                 'unmatched_transfer_seeds': p.unmatched_treat,
                 'duplicate_arm_seeds': p.duplicates,
@@ -1243,7 +2080,8 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
         Line2D([], [], color=_GREY, marker='|', linestyle='none',
                label='per-seed delta'),
         Patch(facecolor=_GREY, alpha=0.13,
-              label=f'+/-{margin:.2f} equivalence margin'),
+              label=f'+/-{margin:.2f} equivalence margin (final_score panel '
+                    f'only)'),
     ]
     fig.tight_layout(rect=(0, 0.13, 1, 1))
     _legend(fig, handles, ncol=3)
@@ -1265,18 +2103,27 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
                'equivalence margin of ANALYSIS_PLAN.md 4, drawn so a reader can '
                'see directly whether an interval lies inside it; it is not a '
                'test, and a CI that merely covers zero is not evidence of '
-               'equivalence.'),
+               'equivalence. The margin is drawn on the final_score panel '
+               'ONLY: the plan fixes it in normalised-score units, justified '
+               'as about 20 return points on LunarLander, and that '
+               'justification does not carry over to an area-per-env-step '
+               'quantity, so auc_score gets no band and no equivalence '
+               'verdict.'),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
-         refs=ctx.references(ctx.envs_for_labels(labels_used)),
+         refs=ctx.references(ctx.run_dirs_for_labels(labels_used)),
          interval=(f'Hodges-Lehmann paired shift with a bias-corrected (BCa) '
-                   f'seed-level bootstrap 95% CI, {ctx.n_boot} resamples, '
-                   f'fixed seed {ctx.boot_seed} (stats.bootstrap_statistic); '
-                   f'suppressed where n < {stats.MIN_N_FOR_INFERENCE}'),
+                   f'seed-level bootstrap 95% CI requested at {ctx.n_boot} '
+                   f'resamples, fixed seed {ctx.boot_seed} '
+                   f'(stats.bootstrap_statistic); suppressed where n < '
+                   f'{stats.MIN_N_FOR_INFERENCE}. BCa is what is requested, '
+                   f'not necessarily what was returned: the tally below is '
+                   f'what the estimator actually produced'),
+         methods=log, dropped={k: '; '.join(v) for k, v in lost.items()},
          smoothing='smoothing window: none (endpoint scalars, not curves)',
          extra_lines=[
-             'Exclusion and equivalence statements generated per cell: '
-             + ' | '.join(verdicts) if verdicts else
+             ('Exclusion and equivalence statements generated per cell: '
+              + ' | '.join(verdicts)) if verdicts else
              'No cell had a matched scratch/transfer pair.',
              'No p-value is drawn. These four contrasts on two endpoints are '
              'the whole confirmatory family, and their Holm-adjusted p-values '
@@ -1297,6 +2144,9 @@ def fig_control_decomposition(ctx: Context) -> None:
     meta: dict[str, Any] = {'endpoint': endpoint, 'cells': {}}
     seeds: set[int] = set()
     n_min = None
+    log = MethodLog()
+    lost: dict[str, list[str]] = {'seeds lost to the four-way intersection': [],
+                                  'duplicated arm rows': []}
     missing: dict[str, list[str]] = {}
 
     # --- pass 1: estimate everything, so the y range can be shared ---------
@@ -1326,6 +2176,19 @@ def fig_control_decomposition(ctx: Context) -> None:
         # cannot support.
         common = sorted(set.intersection(*[set(v.index)
                                            for v in per_cond.values()]))
+        # A seed that has a run in some conditions but not all is dropped by
+        # this intersection. That is correct (the joint bootstrap needs one seed
+        # set) and it must not be quiet: the loss is recorded per condition and
+        # printed in the caption, because a cell silently falling from n=3 to
+        # n=2 is the silent-seed-dropping defect of DESIGN.md 1.
+        for cond, series in per_cond.items():
+            dropped_seeds = sorted(set(series.index) - set(common))
+            if dropped_seeds:
+                lost['seeds lost to the four-way intersection'].append(
+                    f'{cell} {cond} seeds {_seed_list(dropped_seeds)}')
+        if dupes:
+            lost['duplicated arm rows'].append(
+                f"{cell} {', '.join(sorted(set(dupes)))}")
         if not common:
             prepared[cell] = {'reason': 'no seed has a run in every condition',
                               'absent': absent}
@@ -1337,16 +2200,21 @@ def fig_control_decomposition(ctx: Context) -> None:
         n_min = n if n_min is None else min(n_min, n)
         idx = (stats.boot_indices(n, ctx.n_boot, ctx.boot_seed)
                if n >= stats.MIN_N_FOR_INFERENCE else None)
-        levels = {cond: estimate_mean(ctx, units, present.index(cond), idx)
+        levels = {cond: log.add(estimate_mean(ctx, units,
+                                              present.index(cond), idx))
                   for cond in present}
         contrasts: dict[str, dict] = {}
         for hi_c, lo_c, name in CONTRAST_NAMES:
             if hi_c not in present or lo_c not in present:
                 continue
-            est = estimate_difference(
-                ctx, units, present.index(hi_c), present.index(lo_c), idx)
+            est = log.add(estimate_difference(
+                ctx, units, present.index(hi_c), present.index(lo_c), idx))
+            # `note` is carried, not dropped. It is where bca_interval records
+            # that it fell back to a percentile interval and why, so without it
+            # the reason the method changed is unrecoverable from provenance.
             contrasts[name] = {'contrast': f'{hi_c} - {lo_c}',
                                'hi_cond': hi_c, 'lo_cond': lo_c,
+                               'note': est.get('note', ''),
                                **{k: est[k] for k in ('estimate', 'lo', 'hi',
                                                       'method')}}
         prepared[cell] = {'present': present, 'absent': absent, 'units': units,
@@ -1355,9 +2223,12 @@ def fig_control_decomposition(ctx: Context) -> None:
                           'duplicate_arm_seeds': sorted(set(dupes))}
         meta['cells'][cell] = {
             'n': n, 'seeds': common, 'order': present,
-            'levels': {k: {kk: v[kk] for kk in ('estimate', 'lo', 'hi',
-                                                'method')}
+            'levels': {k: {kk: v.get(kk) for kk in ('estimate', 'lo', 'hi',
+                                                    'method', 'note')}
                        for k, v in levels.items()},
+            'seeds_lost_to_intersection': {
+                c: sorted(set(s.index) - set(common))
+                for c, s in per_cond.items() if set(s.index) - set(common)},
             'contrasts': contrasts, 'conditions_absent': absent,
             'duplicate_arm_seeds': sorted(set(dupes))}
 
@@ -1467,7 +2338,8 @@ def fig_control_decomposition(ctx: Context) -> None:
                'not the singular-value spectrum.' + absent_text),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
-         refs=ctx.references(ctx.envs_for_labels(labels_used)),
+         refs=ctx.references(ctx.run_dirs_for_labels(labels_used)),
+         methods=log, dropped={k: '; '.join(v) for k, v in lost.items()},
          interval=(f'one joint seed-level bootstrap per cell -- a single shared '
                    f'resampling of seeds ({ctx.n_boot} resamples, fixed seed '
                    f'{ctx.boot_seed}) supplies every level and every contrast, '
@@ -1500,6 +2372,11 @@ def fig_interaction_2x2(ctx: Context) -> None:
     meta: dict[str, Any] = {'cells': {}, 'interaction': {}}
     seeds: set[int] = set()
     n_min = None
+    log = MethodLog()
+    lost: dict[str, list[str]] = {'unmatched seeds': [],
+                                  'duplicated arm rows': [],
+                                  'seeds lost to the four-cell intersection':
+                                      []}
     labels_used = [lbl for cell in CELL_ORDER
                    for lbl in (ctx.arms.get(cell, {}).get('scratch'),
                                ctx.arms.get(cell, {}).get('transfer')) if lbl]
@@ -1511,6 +2388,7 @@ def fig_interaction_2x2(ctx: Context) -> None:
             if 'scratch' not in labels or 'transfer' not in labels:
                 continue
             p = pair(ctx, labels['scratch'], labels['transfer'], endpoint)
+            _note_losses(lost, cell, endpoint, p)
             if p.n == 0:
                 continue
             deltas[cell] = pd.Series(p.delta, index=p.seeds)
@@ -1527,15 +2405,17 @@ def fig_interaction_2x2(ctx: Context) -> None:
                 cell = f'{arch}-{rule}'
                 if cell not in deltas:
                     continue
-                est = estimate_shift(ctx, deltas[cell].to_numpy(float))
+                est = log.add(estimate_shift(ctx, deltas[cell].to_numpy(float)))
                 xs.append(j)
                 ys.append(est['estimate'])
                 los.append(est['lo'])
                 his.append(est['hi'])
                 meta['cells'].setdefault(cell, {})[endpoint] = {
                     'n': int(len(deltas[cell])),
+                    'seeds': sorted(int(s) for s in deltas[cell].index),
                     'hodges_lehmann': est['estimate'], 'ci_lo': est['lo'],
-                    'ci_hi': est['hi'], 'ci_method': est['method']}
+                    'ci_hi': est['hi'], 'ci_method': est['method'],
+                    'ci_note': est.get('note', '')}
             if not xs:
                 continue
             st = rule_style[rule]
@@ -1552,6 +2432,11 @@ def fig_interaction_2x2(ctx: Context) -> None:
         if len(deltas) == 4:
             common = sorted(set.intersection(*[set(s.index)
                                                for s in deltas.values()]))
+            for cell, s in deltas.items():
+                gone = sorted(set(s.index) - set(common))
+                if gone:
+                    lost['seeds lost to the four-cell intersection'].append(
+                        f'{cell}/{endpoint} seeds {_seed_list(gone)}')
             if common:
                 units = np.column_stack([deltas[c].reindex(common)
                                          .to_numpy(float) for c in CELL_ORDER])
@@ -1571,6 +2456,7 @@ def fig_interaction_2x2(ctx: Context) -> None:
                     units, inter, n_boot=ctx.n_boot, seed=ctx.boot_seed,
                     idx=idx)
                 est.pop('reps', None)
+                log.add(est)
                 meta['interaction'][endpoint] = {
                     'definition': '(d[dueling-double] - d[dueling-vanilla]) - '
                                   '(d[mlp-double] - d[mlp-vanilla])',
@@ -1612,7 +2498,8 @@ def fig_interaction_2x2(ctx: Context) -> None:
                'lines here are not a finding.'),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
-         refs=ctx.references(ctx.envs_for_labels(labels_used)),
+         refs=ctx.references(ctx.run_dirs_for_labels(labels_used)),
+         methods=log, dropped={k: '; '.join(v) for k, v in lost.items()},
          interval=(f'Hodges-Lehmann paired shift per cell with a '
                    f'bias-corrected bootstrap 95% CI; the interaction contrast '
                    f'is a paired mean under one joint resampling of the seeds '
@@ -1649,11 +2536,15 @@ def fig_shift_gradient(ctx: Context) -> None:
                              gridspec_kw={'width_ratios': [3, 3, 1.35]})
     meta: dict[str, Any] = {'endpoint': endpoint, 'families': {},
                             'interface_corner': {},
+                            'transferred_intensity': {},
                             'x_axis': ('measured divergence from --shift-metrics'
                                        if ctx.shift_metrics
                                        else 'declared manipulated level')}
     seeds: set[int] = set()
     n_min = None
+    log = MethodLog()
+    lost: dict[str, list[str]] = {'unmatched seeds': [],
+                                  'duplicated arm rows': []}
     labels_used: list[str] = []
     for cell in CELL_ORDER:
         for rec in ctx.shifts.get(cell, []):
@@ -1685,11 +2576,12 @@ def fig_shift_gradient(ctx: Context) -> None:
                 else:
                     x = abs(level - base_value)
                 p = pair(ctx, rec['scratch'], rec['transfer'], endpoint)
+                _note_losses(lost, f'{family}/{env}/{cell}', endpoint, p)
                 if p.n == 0:
                     continue
                 seeds.update(p.seeds)
                 n_min = p.n if n_min is None else min(n_min, p.n)
-                est = estimate_shift(ctx, p.delta)
+                est = log.add(estimate_shift(ctx, p.delta))
                 points.setdefault(cell, []).append((float(x), est, str(env)))
         if confounded:
             ax.set_facecolor('#F4F1EC')
@@ -1721,10 +2613,17 @@ def fig_shift_gradient(ctx: Context) -> None:
                             linewidth=1.1)
             rec_out[cell] = [{'x': x, 'env': env,
                               'estimate': est['estimate'], 'lo': est['lo'],
-                              'hi': est['hi']} for x, est, env in pts]
+                              'hi': est['hi'], 'method': est['method'],
+                              'note': est.get('note', '')}
+                             for x, est, env in pts]
         meta['families'][family] = {'levels': max(len(v) for v in
                                                   points.values()),
                                     'points': rec_out}
+        fam_labels = [rec['transfer'] for cell in CELL_ORDER
+                      for rec in ctx.shifts.get(cell, [])
+                      if 'transfer' in rec]
+        meta['transferred_intensity'][family] = \
+            ctx.intensity_for_labels(fam_labels)
         ax.set_title(title, fontsize=7.6)
         ax.set_xlabel('measured divergence' if ctx.shift_metrics
                       else '|change in the manipulated variable| from source')
@@ -1737,14 +2636,15 @@ def fig_shift_gradient(ctx: Context) -> None:
         if 'scratch' not in labels or 'transfer' not in labels:
             continue
         p = pair(ctx, labels['scratch'], labels['transfer'], endpoint)
+        _note_losses(lost, f'interface/{cell}', endpoint, p)
         if p.n == 0:
             continue
         seeds.update(p.seeds)
         n_min = p.n if n_min is None else min(n_min, p.n)
-        est = estimate_shift(ctx, p.delta)
+        est = log.add(estimate_shift(ctx, p.delta))
         corner[cell] = {'n': p.n, 'estimate': est['estimate'], 'lo': est['lo'],
                         'hi': est['hi'], 'method': est['method'],
-                        'seeds': p.seeds}
+                        'note': est.get('note', ''), 'seeds': p.seeds}
     if corner:
         ax.axhline(0.0, color=_BLACK, linewidth=0.7)
         for j, (cell, rec) in enumerate(corner.items()):
@@ -1763,7 +2663,50 @@ def fig_shift_gradient(ctx: Context) -> None:
                  hide_x=True)
     ax.set_title('interface change,\nzero dynamics shift', fontsize=7.0)
     meta['interface_corner'] = corner
+    meta['transferred_intensity']['interface_only'] = ctx.intensity_for_labels(
+        [lbl for cell in CELL_ORDER
+         for lbl in [ctx.iface.get(cell, {}).get('transfer')] if lbl])
     axes[0].set_ylabel(f'delta {endpoint} (transfer - scratch)')
+
+    # Do the panels share a transfer protocol? The answer is generated, not
+    # asserted, because on the registry as it stands they do not: E8's shift
+    # arms declare transfer_set='trunk' and E8i's interface arms declare
+    # 'matched'. The verdict is on `transfer_set`, which is the declared
+    # protocol; the transferred parameter *fraction* is reported alongside but
+    # does not by itself raise the warning, because it differs between mlp and
+    # dueling by construction (different parameter counts under the same
+    # protocol) and that is a property of the 2x2, not a protocol change.
+    panels = {k: v for k, v in meta['transferred_intensity'].items()
+              if v.get('transfer_set')}
+    per_panel = {k: tuple(v['transfer_set']) for k, v in panels.items()}
+    sets_seen = sorted({s for v in per_panel.values() for s in v})
+    fracs = {k: v.get('transferred_param_fraction', [])
+             for k, v in meta['transferred_intensity'].items()}
+    frac_text = '; '.join(f'{k} {v or "not recorded"}'
+                          for k, v in sorted(fracs.items())) or 'not recorded'
+    if len(set(per_panel.values())) > 1 or len(sets_seen) > 1:
+        intensity_note = (
+            'PROTOCOL IS NOT FIXED ACROSS THESE PANELS. The transfer arms '
+            f'drawn here do not all declare the same transfer_set '
+            f'({"; ".join(f"{k}: {list(v)}" for k, v in sorted(per_panel.items()))}), '
+            'so reading the panels against one another crosses an unstated '
+            'change in how much of the network was carried over. That is the '
+            'intensity confound of DESIGN.md 3.1: it is stated here rather '
+            'than hidden, and audit.py is the point at which a claim crossing '
+            'it is refused. The shared y axis is a shared scale, not a licence '
+            'to compare across panels. Transferred parameter fraction per '
+            f'panel: {frac_text}.')
+        ax.annotate('transfer protocol differs\nfrom the shift panels',
+                    xy=(0.5, 0.995), xycoords='axes fraction', fontsize=5.2,
+                    color='#8A6D3B', ha='center', va='top')
+    else:
+        intensity_note = (
+            'Transfer protocol is fixed across the panels drawn: every '
+            f'transfer arm here declares transfer_set '
+            f'{sets_seen or "not recorded"}, so the cross-panel reading does '
+            'not cross a DESIGN.md 3.1 protocol change. Transferred parameter '
+            f'fraction per panel (which varies with architecture under one '
+            f'protocol, and is not itself a protocol change): {frac_text}.')
 
     handles = [Line2D([], [], color=CELL_STYLE[c]['colour'],
                       marker=CELL_STYLE[c]['marker'],
@@ -1786,7 +2729,7 @@ def fig_shift_gradient(ctx: Context) -> None:
 
     emit(ctx, 'shift_gradient', fig,
          body=('The within-variant transfer delta against shift level, at '
-               'fixed interface and fixed protocol, for the two '
+               'fixed interface, for the two '
                'same-interface families. Wind is the primary axis for H4 '
                'because its no-op score is flat across levels; the gravity '
                'panel is shaded and annotated because weakening gravity makes '
@@ -1801,12 +2744,14 @@ def fig_shift_gradient(ctx: Context) -> None:
                'variant\'s changed return scale out of the effect. ' + x_note),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
-         refs=ctx.references(ctx.envs_for_labels(labels_used)),
+         refs=ctx.references(ctx.run_dirs_for_labels(labels_used)),
+         methods=log, dropped={k: '; '.join(v) for k, v in lost.items()},
          interval=(f'Hodges-Lehmann paired shift per level with a '
                    f'bias-corrected bootstrap 95% CI, {ctx.n_boot} resamples, '
                    f'seed {ctx.boot_seed}. The ordered-alternative trend '
                    f'statistic for H4 is reported by stats.py, not drawn here'),
          smoothing='smoothing window: none (endpoint scalars, not curves)',
+         extra_lines=[intensity_note],
          meta=meta)
 
 
@@ -1820,16 +2765,43 @@ def _freeze_family(ctx: Context) -> pd.DataFrame:
     E4's K=10k level and E1's transfer arm are the same configuration and
     therefore the same run directory (`registry.py`: `all_jobs` de-duplicates
     by configuration digest), so neither label alone enumerates the family.
-    Membership in E1 or E4 is still required, which is what keeps E0's smoke
-    runs -- a different episode budget entirely -- out of the curve.
+
+    Three restrictions that were missing, each of which let a run into the
+    figure that the scratch side of the same pairing could never contain:
+
+    * **`ctx.selected`.** The scratch arm comes through `pair`, which restricts
+      to one run per (label, seed); this side did not, so a colliding run
+      directory entered the treatment side of a contrast whose baseline had
+      already excluded it. An asymmetric analysis set is not a contrast.
+    * **The budget.** The docstring claimed membership in E1 or E4 keeps E0's
+      smoke runs out because they have "a different episode budget entirely",
+      but the guard was by experiment tag, not by budget, so a 14-episode run
+      tagged `E1;E4` was plotted against 1000-episode scratch runs. The budget
+      is now compared to the protocol's directly, which is what the sentence
+      always meant.
+    * **The analysis set.** `ctx.per_seed` is already filtered for TUNE seeds,
+      donor blocks and source validity, so reading it (rather than the raw
+      table) is what keeps a TUNE run matching every substantive field out.
     """
     ps = ctx.per_seed
     protocol = registry.PROTOCOL
+    needed = ('condition', 'env', 'source_env', 'transfer_set', 'freeze_group')
+    missing = [c for c in needed if c not in ps.columns]
+    if missing:
+        print(f'{WARN} freeze_duration: the per-seed table has no {missing} '
+              f'column(s), so the freeze-duration family cannot be identified '
+              f'by configuration and the figure is drawn empty rather than '
+              f'from a guess')
+        return ps.iloc[0:0]
     mask = ((ps['condition'] == 'transfer')
             & (ps['env'] == registry.TARGET_ENV)
             & (ps['source_env'] == registry.SOURCE_ENV)
             & (ps['transfer_set'] == protocol['transfer_set'])
-            & (ps['freeze_group'] == protocol['freeze_group']))
+            & (ps['freeze_group'] == protocol['freeze_group'])
+            & ps['run_dir'].isin(ctx.selected))
+    if 'num_episodes' in ps.columns:
+        budget = pd.to_numeric(ps['num_episodes'], errors='coerce')
+        mask = mask & (budget == float(registry.COMMON['num_episodes']))
     if 'experiments' in ps.columns:
         member = ps['experiments'].fillna('').apply(
             lambda s: bool({'E1', 'E4'} & set(str(s).split(';'))))
@@ -1842,9 +2814,15 @@ def fig_freeze_duration(ctx: Context) -> None:
     fam = _freeze_family(ctx)
     fig, ax = plt.subplots(figsize=(COLUMN_WIDTH * 1.55, 2.9))
     meta: dict[str, Any] = {'endpoint': endpoint, 'cells': {},
-                            'levels_found': []}
+                            'levels_found': [],
+                            'family_budget_episodes':
+                                int(registry.COMMON['num_episodes']),
+                            'family_runs': int(len(fam))}
     seeds: set[int] = set()
     n_min = None
+    log = MethodLog()
+    lost: dict[str, list[str]] = {'unmatched seeds': [],
+                                  'duplicated arm rows': []}
     if fam.empty:
         _no_data(ax, 'no freeze-duration family runs in the supplied table')
     else:
@@ -1873,11 +2851,12 @@ def fig_freeze_duration(ctx: Context) -> None:
                 # pairing by label would return one level's runs for both.
                 arm_labels = ', '.join(sorted(set(rows['label'].tolist())))
                 p = pair(ctx, base, f'K={k}', endpoint, treat_rows=rows)
+                _note_losses(lost, f'{cell}/K={k}', endpoint, p)
                 if p.n == 0:
                     continue
                 seeds.update(p.seeds)
                 n_min = p.n if n_min is None else min(n_min, p.n)
-                est = estimate_shift(ctx, p.delta)
+                est = log.add(estimate_shift(ctx, p.delta))
                 pts.append((pos[k], k, arm_labels, est, p.n))
             if not pts:
                 continue
@@ -1894,6 +2873,7 @@ def fig_freeze_duration(ctx: Context) -> None:
             meta['cells'][cell] = [
                 {'freeze_updates': k, 'labels': lab, 'n': n,
                  'estimate': est['estimate'], 'lo': est['lo'], 'hi': est['hi'],
+                 'method': est['method'], 'note': est.get('note', ''),
                  'x_position': x, 'off_scale': k <= 0}
                 for x, k, lab, est, n in pts]
         ax.set_xscale('log')
@@ -1928,12 +2908,16 @@ def fig_freeze_duration(ctx: Context) -> None:
                f'fingerprints. {n_levels} window level(s) are present in the '
                'supplied table. A window of 0 and a window that is never '
                'released have no position on a log axis and are drawn at '
-               'bracketed off-scale ticks, labelled as such.'),
+               'bracketed off-scale ticks, labelled as such. The family is '
+               'identified by configuration and restricted to the protocol '
+               f"budget of {registry.COMMON['num_episodes']} episodes, so a "
+               'smoke run tagged E1 or E4 at a shorter budget is not plotted '
+               'against full-length scratch arms.'),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(fam['run_dir'].tolist() if not fam.empty
                                else []),
-         refs=ctx.references(list(fam['env'].dropna().unique())
-                             if not fam.empty else []),
+         refs=ctx.references(fam['run_dir'].tolist() if not fam.empty else []),
+         methods=log, dropped={k: '; '.join(v) for k, v in lost.items()},
          interval=(f'Hodges-Lehmann paired shift against the same cell\'s '
                    f'scratch arm with a bias-corrected bootstrap 95% CI, '
                    f'{ctx.n_boot} resamples, seed {ctx.boot_seed}'),
@@ -1984,8 +2968,8 @@ def fig_diagnostics(ctx: Context) -> None:
         {'key': 'effective_rank', 'columns': ['effective_rank'],
          'ylabel': 'effective rank, trunk features', 'log': False,
          'dueling_only': False},
-        {'key': 'param_norm', 'columns': [c for c in ('param_norm_trunk',
-                                                      'param_norm_total')],
+        {'key': 'param_norm', 'columns': ['param_norm_trunk',
+                                          'param_norm_total'],
          'ylabel': 'parameter L2 norm', 'log': False,
          'dueling_only': False},
     ]
@@ -2004,13 +2988,20 @@ def fig_diagnostics(ctx: Context) -> None:
                 frames[(cell, cond)] = curve_rows(ctx, label)
                 labels_used.append(label)
 
+    # `sharey='row'`, not the previous no-sharing. A reader comparing curve
+    # heights across a row of four cell panels was comparing four independent y
+    # scales, and on the gradient row four independent log scales, which is a
+    # figure that invites the comparison it cannot support. One row is one
+    # signal, so one row is one scale.
     fig, axes = plt.subplots(len(rows), len(cells),
                              figsize=(FULL_WIDTH, 1.55 * len(rows) + 0.9),
-                             sharex='col', squeeze=False)
+                             sharex='col', sharey='row', squeeze=False)
     seeds: set[int] = set()
     n_min = None
+    log = MethodLog()
     meta: dict[str, Any] = {'rows': [r['key'] for r in rows],
-                            'gradient_columns': grad_cols, 'panels': {}}
+                            'gradient_columns': grad_cols, 'panels': {},
+                            'y_axis_shared': 'per row'}
     dash_by_col = {}
     drew_boundary = False
     for i, spec in enumerate(rows):
@@ -2023,10 +3014,11 @@ def fig_diagnostics(ctx: Context) -> None:
             ax = axes[i][j]
             drew = False
             if spec['dueling_only'] and not cell.startswith('dueling'):
-                # y is not shared across this row, so the empty panel's own
-                # scale means nothing and is hidden with the ticks.
-                _no_data(ax, 'no value/advantage streams here',
-                         hide_y=True)
+                # y IS shared across the row now, so the tick labels are not
+                # hidden: switching them off on a shared axis blanks the scale
+                # for the populated panels beside it, which is the trap
+                # `_no_data` documents.
+                _no_data(ax, 'no value/advantage streams here')
             else:
                 x0, x1, n_runs = _support(
                     [frames.get((cell, c), pd.DataFrame())
@@ -2046,6 +3038,7 @@ def fig_diagnostics(ctx: Context) -> None:
                             n_min = (mat.shape[0] if n_min is None
                                      else min(n_min, mat.shape[0]))
                             b = band(ctx, mat)
+                            log.add_method(b['method'])
                             if b['lo'] is not None:
                                 ax.fill_between(grid, b['lo'], b['hi'],
                                                 color=style['colour'],
@@ -2059,6 +3052,8 @@ def fig_diagnostics(ctx: Context) -> None:
                             meta['panels'].setdefault(spec['key'], {}) \
                                 .setdefault(cell, {})[f'{cond}:{col}'] = {
                                     'n': int(mat.shape[0]),
+                                    'seeds': sorted(int(s) for s in sds),
+                                    'band': b['method'],
                                     'final': float(b['mean'][-1])}
                     drew_boundary |= draw_boundary(ax, freeze_boundary(
                         ctx, frames.get((cell, 'transfer'), pd.DataFrame())))
@@ -2110,13 +3105,18 @@ def fig_diagnostics(ctx: Context) -> None:
                'say so rather than showing an empty axis.' + gap),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
-         refs=ctx.references(ctx.envs_for_labels(labels_used)),
+         refs=ctx.references(ctx.run_dirs_for_labels(labels_used)),
+         methods=log,
          interval=(f'shaded band = 95% percentile bootstrap over seeds, '
                    f'{ctx.n_boot} resamples, seed {ctx.boot_seed}; suppressed '
-                   f'where n < {stats.MIN_N_FOR_INFERENCE}'),
+                   f'per arm where n < {stats.MIN_N_FOR_INFERENCE}'),
          extra_lines=[
              'Estimation-only, no p-value: mechanism signals are not in the '
-             'confirmatory family (ANALYSIS_PLAN.md 1).'],
+             'confirmatory family (ANALYSIS_PLAN.md 1).',
+             'The y axis is shared across each row, so curve heights are '
+             'comparable between the cell panels of one signal. It is not '
+             'shared between rows, which measure different quantities, and the '
+             'gradient row is log-scaled.'],
          meta=meta)
 
 
@@ -2136,12 +3136,21 @@ def fig_performance_profiles(ctx: Context) -> None:
                    for lbl in ctx.arms[cell].values()]
 
     values: dict[tuple[str, str], np.ndarray] = {}
+    seeds_by_arm: dict[tuple[str, str], list[int]] = {}
+    # `dupes` used to be built here and then never read, so the forest recorded
+    # duplicated arm rows while this figure reported n=3 with no duplicate
+    # record at all: the same table, two different accounts of what it holds.
+    lost: dict[str, list[str]] = {'duplicated arm rows': []}
     for cell in cells:
         for cond, label in ctx.arms.get(cell, {}).items():
             dupes: list[str] = []
             s = _seed_series(ctx, label, endpoint, dupes)
+            if dupes:
+                lost['duplicated arm rows'].append(
+                    f"{cell}/{cond} {', '.join(sorted(set(dupes)))}")
             if not s.empty:
                 values[(cell, cond)] = s.to_numpy(float)
+                seeds_by_arm[(cell, cond)] = sorted(int(i) for i in s.index)
                 seeds.update(int(i) for i in s.index)
     if values:
         all_v = np.concatenate(list(values.values()))
@@ -2169,7 +3178,9 @@ def fig_performance_profiles(ctx: Context) -> None:
                     color=style['colour'], markersize=4.0,
                     markeredgewidth=0.8, clip_on=False)
             drew = True
-            rec[cond] = {'n': int(len(v)), 'min': float(np.min(v)),
+            rec[cond] = {'n': int(len(v)),
+                         'seeds': seeds_by_arm.get((cell, cond), []),
+                         'min': float(np.min(v)),
                          'median': float(np.median(v)),
                          'max': float(np.max(v)),
                          'fraction_above_0': float(np.mean(v > 0.0)),
@@ -2215,7 +3226,8 @@ def fig_performance_profiles(ctx: Context) -> None:
                'would conceal.'),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
-         refs=ctx.references(ctx.envs_for_labels(labels_used)),
+         refs=ctx.references(ctx.run_dirs_for_labels(labels_used)),
+         dropped={k: '; '.join(v) for k, v in lost.items()},
          interval=('none -- this is an empirical distribution function, drawn '
                    'without a confidence band because at these seed counts a '
                    'band would be wider than the distance between the arms and '
@@ -2227,6 +3239,76 @@ def fig_performance_profiles(ctx: Context) -> None:
 # ---------------------------------------------------------------------------
 # 15. Figure 9 -- Kaplan-Meier for the threshold-reaching time
 # ---------------------------------------------------------------------------
+def _km_arm(rows: pd.DataFrame, tcol: str, ccol: str,
+            lost: dict[str, list[str]], where: str
+            ) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Event times and event flags for one arm, with nothing imputed and
+    nothing dropped quietly.
+
+    Two `ANALYSIS_PLAN.md` §5 rules meet here, and the previous version broke
+    both in the same three lines.
+
+    **"Never impute the budget."** `e = ~_as_bool(rows[ccol])` mapped every
+    unrecognised token, NaN included, to False and therefore to an OBSERVED
+    EVENT. A missing censoring flag turned three runs that never reached the
+    threshold into 3/3 reached, with a Clopper-Pearson interval of [0.29, 1.00]
+    and a Kaplan-Meier median, silently. An unreadable flag is now treated as
+    censored, which is the direction that claims nothing (a censored
+    observation contributes time at risk and no event), and the count is
+    reported in the panel annotation, the caption and the provenance so that a
+    reader can see the measurement failed rather than reading an invented
+    event.
+
+    **"Never drop censored runs."** `dropna(subset=[tcol])` deleted them, which
+    conditions on the outcome and is the silent-seed-dropping defect again: a
+    whole scratch arm vanished from a panel with no annotation anywhere.
+    `aggregate.py` produces a missing time only when a censored run's own
+    `total_env_steps` is missing, so the run's `env_steps` is the censoring time
+    it should have carried, and using it is not imputing an event: the run is
+    still recorded as not having reached the threshold. Where even that is
+    unavailable the run cannot be placed on a time axis at all, so it is
+    excluded, counted, named on the panel and named in the caption. Excluded
+    loudly is the only honest option left; excluded quietly is the defect.
+    """
+    times = pd.to_numeric(rows[tcol], errors='coerce')
+    if ccol in rows.columns:
+        censored, known = _bool_tokens(rows[ccol])
+    else:
+        censored = np.zeros(len(rows), dtype=bool)
+        known = np.zeros(len(rows), dtype=bool)
+    events = ~censored
+    info = {'flag_unreadable': int((~known).sum()),
+            'time_recovered_from_env_steps': 0,
+            'excluded_no_time': 0, 'excluded_seeds': []}
+    if info['flag_unreadable']:
+        events = np.where(known, events, False)
+        lost['runs with an unreadable censoring flag, counted as censored'] \
+            .append(f"{where} x{info['flag_unreadable']}")
+
+    t = times.to_numpy(float)
+    need = ~np.isfinite(t)
+    if bool(need.any()) and 'env_steps' in rows.columns:
+        fallback = pd.to_numeric(rows['env_steps'], errors='coerce') \
+            .to_numpy(float)
+        usable = need & np.isfinite(fallback)
+        if bool(usable.any()):
+            t = np.where(usable, fallback, t)
+            events = np.where(usable, False, events)
+            info['time_recovered_from_env_steps'] = int(usable.sum())
+            lost['censored runs whose time came from env_steps'].append(
+                f'{where} x{int(usable.sum())}')
+        need = ~np.isfinite(t)
+    if bool(need.any()):
+        info['excluded_no_time'] = int(need.sum())
+        info['excluded_seeds'] = sorted(
+            int(s) for s in pd.to_numeric(rows.loc[need, 'seed'],
+                                          errors='coerce').dropna())
+        lost['runs with no usable time or censoring time, EXCLUDED'].append(
+            f"{where} seeds {_seed_list(info['excluded_seeds'])}")
+    keep = np.isfinite(t)
+    return t[keep], np.asarray(events, dtype=bool)[keep], info
+
+
 def fig_km_threshold(ctx: Context) -> None:
     cells = [c for c in CELL_ORDER if c in ctx.arms]
     levels = [(tag, value) for tag, value in stats.THRESHOLD_LEVELS
@@ -2240,6 +3322,10 @@ def fig_km_threshold(ctx: Context) -> None:
     seeds: set[int] = set()
     n_min = None
     meta: dict[str, Any] = {'levels': {}, 'logrank': {}}
+    lost: dict[str, list[str]] = {
+        'runs with an unreadable censoring flag, counted as censored': [],
+        'censored runs whose time came from env_steps': [],
+        'runs with no usable time or censoring time, EXCLUDED': []}
     labels_used = [lbl for cell in cells for lbl in
                    (ctx.arms[cell].get('scratch'),
                     ctx.arms[cell].get('transfer')) if lbl]
@@ -2250,23 +3336,34 @@ def fig_km_threshold(ctx: Context) -> None:
             ax = axes[i][j]
             drew = False
             arms_data = {}
+            panel_lost: list[str] = []
             for cond in ('scratch', 'transfer'):
                 label = ctx.arms.get(cell, {}).get(cond)
                 if not label:
                     continue
-                rows = arm_rows(ctx, label).dropna(subset=[tcol])
+                rows = arm_rows(ctx, label)
                 if rows.empty:
                     continue
-                t = rows[tcol].to_numpy(float)
-                e = ~_as_bool(rows[ccol]) if ccol in rows.columns else \
-                    np.ones(len(t), dtype=bool)
-                seeds.update(int(s) for s in rows['seed'].tolist())
+                t, e, info = _km_arm(rows, tcol, ccol, lost,
+                                     f'{tag}/{cell}/{cond}')
+                if info['excluded_no_time']:
+                    # Said on the panel, not only in the caption: an arm that
+                    # vanishes from a curve is exactly what "no censored run is
+                    # dropped" must not be able to hide.
+                    panel_lost.append(
+                        f"{CONDITION_CODE[cond]}: {info['excluded_no_time']} "
+                        f"run(s) had no usable time, excluded")
+                if len(t) == 0:
+                    continue
+                seeds.update(int(s) for s in
+                             pd.to_numeric(rows['seed'], errors='coerce')
+                             .dropna().tolist())
                 n_min = len(t) if n_min is None else min(n_min, len(t))
                 km = stats.kaplan_meier(t, e)
                 k = int(e.sum())
                 cp = stats.clopper_pearson(k, len(t))
                 arms_data[cond] = {'t': t, 'e': e, 'km': km, 'k': k,
-                                   'n': len(t), 'cp': cp}
+                                   'n': len(t), 'cp': cp, 'info': info}
                 style = CONDITION_STYLE[cond]
                 xs = [0.0] + [row['t'] for row in km['curve']]
                 ys = [0.0] + [1.0 - row['survival'] for row in km['curve']]
@@ -2291,12 +3388,20 @@ def fig_km_threshold(ctx: Context) -> None:
                     f"{CONDITION_STYLE[c]['name'].split(' ')[0]} "
                     f"{d['k']}/{d['n']} reached, 95% CI "
                     f"[{d['cp'][0]:.2f}, {d['cp'][1]:.2f}]"
+                    + (f" (+{d['info']['excluded_no_time']} with no time)"
+                       if d['info']['excluded_no_time'] else '')
+                    + (f" (!{d['info']['flag_unreadable']} flag unreadable)"
+                       if d['info']['flag_unreadable'] else '')
                     for c, d in arms_data.items())
+                if panel_lost:
+                    notes += chr(10) + chr(10).join(panel_lost)
                 ax.annotate(notes, xy=(0.03, 0.97), xycoords='axes fraction',
                             fontsize=5.4, color='#333333', va='top')
                 ax.set_ylim(-0.05, 1.05)
             else:
-                _no_data(ax, 'no threshold times for this cell')
+                _no_data(ax, 'no threshold times for this cell'
+                             + (chr(10) + chr(10).join(panel_lost)
+                                if panel_lost else ''))
             if 'scratch' in arms_data and 'transfer' in arms_data:
                 a, b = arms_data['scratch'], arms_data['transfer']
                 lr = stats.logrank_statistic(a['t'], a['e'], b['t'], b['e'])
@@ -2305,7 +3410,8 @@ def fig_km_threshold(ctx: Context) -> None:
                 c: {'events': d['k'], 'n': d['n'],
                     'p_reached': d['k'] / d['n'] if d['n'] else None,
                     'clopper_pearson': list(d['cp']),
-                    'km_median': d['km']['median']}
+                    'km_median': d['km']['median'],
+                    'censoring': d['info']}
                 for c, d in arms_data.items()}
             if i == 0:
                 ax.set_title(cell.replace('-', ' / '))
@@ -2323,6 +3429,10 @@ def fig_km_threshold(ctx: Context) -> None:
                           label='censored (budget reached first)'))
     fig.tight_layout(rect=(0, 0.10, 1, 1))
     _legend(fig, handles, ncol=3)
+
+    for key, entries in lost.items():
+        if entries:
+            print(f'{WARN} km_threshold, {key}: ' + '; '.join(entries))
 
     total_events = sum(
         rec.get(c, {}).get('events', 0)
@@ -2348,10 +3458,19 @@ def fig_km_threshold(ctx: Context) -> None:
                'the probability is below about 0.31. Thresholds are '
                'pre-declared at 0.25, 0.5 and 1.0 so a metric exists even when '
                f'no run reaches "solved"; {total_events} event(s) are observed '
-               'in total in this table.'),
+               'in total in this table. A run whose censoring flag will not '
+               'parse is counted as CENSORED, never as an event: the flag is '
+               'the only evidence that the threshold was reached, and reading '
+               'a missing flag as an event manufactures the outcome. A '
+               'censored run with no recorded time takes its own env-step '
+               'total as its censoring time, which is a time at risk and not '
+               'an imputed event; where even that is missing the run cannot be '
+               'placed on the axis, and it is excluded and named rather than '
+               'dropped quietly.'),
          seeds=sorted(seeds), n_min=n_min,
          protocol=ctx.protocol(ctx.run_dirs_for_labels(labels_used)),
-         refs=ctx.references(ctx.envs_for_labels(labels_used)),
+         refs=ctx.references(ctx.run_dirs_for_labels(labels_used)),
+         dropped={k: '; '.join(v) for k, v in lost.items()},
          interval=('Kaplan-Meier step estimate (stats.kaplan_meier); the '
                    'annotated interval is the exact Clopper-Pearson binomial '
                    'interval on P(reached), not a bootstrap'),
@@ -2448,6 +3567,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument('--boot-seed', type=int, default=stats.BOOT_SEED,
                         help=f'bootstrap seed (default {stats.BOOT_SEED}, the '
                              f'pre-registered value)')
+    parser.add_argument('--source-policy', default='valid',
+                        choices=list(SOURCE_POLICIES),
+                        help='which runs enter every figure (DESIGN.md 4.3). '
+                             '"valid" (default, the primary estimand) excludes '
+                             'every run whose source failed the normalised '
+                             'validity gate; "pooled" is the pre-declared '
+                             'secondary and keeps them, stamped on the canvas '
+                             'and stated in the caption. The same flag and the '
+                             'same meanings as stats.py, so a figure and the '
+                             'table beside it cannot disagree about which runs '
+                             'exist')
     parser.add_argument('--shift-metrics', default=None,
                         help='JSON mapping environment id -> measured '
                              'divergence, used as the x-axis of '
@@ -2462,6 +3592,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not formats:
         print(f'{WARN} --format left no output format')
         return 2
+    # Checked before the output directory is created, because the previous
+    # version raised matplotlib's own ValueError from inside `emit` after
+    # `os.makedirs` had already run, which leaves a half-written figure set
+    # behind and reports the problem as a traceback rather than as a message.
+    supported = sorted(plt.gcf().canvas.get_supported_filetypes())
+    plt.close('all')
+    unknown = [f for f in formats if f not in supported]
+    if unknown:
+        print(f'{WARN} --format {unknown}: not a supported output format. '
+              f'This matplotlib backend writes: {", ".join(supported)}.')
+        return 2
+    if int(args.n_boot) < 1:
+        # Zero resamples produced NaN band bounds, no band, and a caption that
+        # still claimed a "95% percentile bootstrap over seeds, 0 resamples".
+        # --grid-points and --smooth have floors; this one had none.
+        print(f'{WARN} --n-boot {args.n_boot}: at least 1 resample is '
+              f'required, and the pre-registered value is {stats.N_BOOT}. A '
+              f'bootstrap with no resamples produces no interval, and a '
+              f'caption describing an interval that was never computed is the '
+              f'defect this module exists to prevent.')
+        return 2
+    if int(args.n_boot) != stats.N_BOOT:
+        print(f'{WARN} --n-boot {args.n_boot} differs from the pre-registered '
+              f'{stats.N_BOOT} (ANALYSIS_PLAN.md 2). Every caption and every '
+              f'provenance record states the number actually used.')
 
     requested = list(FIGURES)
     if args.figures:
@@ -2486,7 +3641,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f'{WARN} no curve table at {args.curves}: the curve figures will '
               f'be skipped.')
 
-    per_seed, curves = load(args.per_seed, args.curves)
+    raw_per_seed, curves = load(args.per_seed, args.curves)
+    per_seed, analysis = analysis_set(raw_per_seed, args.source_policy)
 
     with plt.rc_context(RC):
         ctx = Context(
@@ -2498,6 +3654,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             smooth=max(int(args.smooth), 0),
             grid_points=max(int(args.grid_points), 8),
             argv=argv_list,
+            source_policy=args.source_policy, analysis=analysis,
+            curve_integrity=curve_integrity(curves),
             arms=resolve_arm_labels(), iface=interface_labels(),
             shifts=shift_labels(),
             prov=provenance.snapshot(['experiments/plots.py'] + argv_list),
@@ -2518,9 +3676,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plans = ctx.prov.get('plans') or {}
         table_plans = sorted(set(per_seed['plan_hash'].dropna().tolist())
                              if 'plan_hash' in per_seed.columns else [])
-        print(f'plots.py: {len(per_seed)} runs, '
+        print(f'plots.py: {len(raw_per_seed)} runs in the table, '
+              f'{len(per_seed)} in the analysis set, '
               f'{len(curves)} curve rows, out -> {args.outdir}/')
         print(f'  ANALYSIS_PLAN.md hash now: {plans.get("ANALYSIS_PLAN.md")}')
+        print_analysis_set(analysis)
+        if not len(per_seed):
+            print(f'{WARN} the analysis set is EMPTY. Every figure below is '
+                  f'drawn with no data and stamped '
+                  f'{stats.VALIDATION_STAMP}; nothing in this output is a '
+                  f'result of any kind. If that is unexpected, the removals '
+                  f'listed above say why.')
+        if ctx.curve_integrity.get('duplicate_rows'):
+            print(f'{WARN} the curve table has '
+                  f'{ctx.curve_integrity["duplicate_rows"]} duplicated '
+                  f'(run_dir, episode) row(s) across '
+                  f'{len(ctx.curve_integrity["runs_affected"])} run(s). '
+                  f'DESIGN.md 8.2 names this as the corruption two writers '
+                  f'into one directory produce. They are dropped '
+                  f'deterministically before any smoothing, but no window '
+                  f'statistic from this table is trustworthy.')
+        multi_seed = seeds_per_run(curves)
+        if multi_seed:
+            print(f'{WARN} {len(multi_seed)} run(s) in the curve table carry '
+                  f'more than one seed: {sorted(multi_seed)[:4]}. A run '
+                  f'directory names one run, so the seed set stated in every '
+                  f'curve caption is unreliable for this table.')
         if len(table_plans) > 1:
             print(f'{WARN} the runs in this table were produced under '
                   f'{len(table_plans)} different ANALYSIS_PLAN.md hashes '
@@ -2562,13 +3743,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f'  fields that differ between the colliding runs: '
                   f'{fields or "none -- identical configs, duplicated on disk"}')
             print('!' * 72)
-        if 'seed_block' in per_seed.columns:
-            tuned = per_seed[per_seed['seed_block'] == 'TUNE']
-            if len(tuned):
-                print(f'{WARN} {len(tuned)} run(s) are on TUNE seeds. No '
-                      f'reported estimate may draw on them (DESIGN.md 3.4); '
-                      f'audit.py is the enforcement point.')
-
         os.makedirs(args.outdir, exist_ok=True)
         for name in requested:
             FIGURES[name](ctx)

@@ -21,7 +21,9 @@ E1's transfer arm are the *same run*). The parallel axis here is the **run
 directory**: a worker takes a job by creating ``<run_dir>/.claim`` with
 ``O_CREAT|O_EXCL``, which the filesystem makes exclusive. Two workers cannot
 enter the same directory, so any ``--jobs`` value is safe and the sharding
-arithmetic that produced defect 1 does not exist.
+arithmetic that produced defect 1 does not exist. Exclusivity is only worth as
+much as the rule that decides when a claim may be taken away from its owner; see
+defect 5, which is where that rule was wrong.
 
 **Defect 3 -- dependencies were assumed rather than checked.** The old driver
 printed ``SKIP ... source missing`` and carried on with exit code 0, which is the
@@ -31,6 +33,37 @@ unsatisfied when the worker stops it is reported as **blocked** and the process
 exits non-zero. `DESIGN.md` §8.4 and `ANALYSIS_PLAN.md` §8 both forbid a run
 disappearing without a stated rule, and a runner that skips silently is how that
 happens by accident.
+
+**Defect 5 -- an exclusive claim was handed to a second worker mid-run.**
+The claim's timestamp was written once and never refreshed, and the reclaim rule
+was ``age > --stale-seconds`` alone: no check that the owner had actually died,
+and no requirement that the reclaiming worker belong to a different sweep. Any
+run longer than two hours was therefore taken over *while it was still
+training*. This fired in P0: a 14.4 h source run was reclaimed at 14.2 h by a
+worker in the same sweep, which then entered the same directory and began
+writing the same ``metrics.jsonl``. Only a Windows mandatory file lock stopped
+it, 1.1 s later; on POSIX both trainers would have written the same metrics,
+checkpoints and ``model.keras`` for the remaining eleven minutes, which is
+exactly the duplicated- and interleaved-episode corruption `DESIGN.md` §8.2(1)
+exists to prevent. Three changes close it, and they are independent on purpose:
+
+* the owner **heartbeats** its claim for as long as it is training, so an
+  un-refreshed claim means an absent owner rather than a long run;
+* a reclaim requires **evidence that the owner is gone**: its pid is checked on
+  this host, and a claim from another host is reclaimed only when it carries a
+  heartbeat field, so a claim written by a version that could not heartbeat is
+  never assumed dead;
+* ``release_claim`` and ``fail_claim`` **check ownership** before touching the
+  file. In P0 the original owner's successful completion deleted the
+  *interloper's* claim, because neither call ever compared the claim against
+  itself.
+
+The failure the collision then produced is kept apart from a real one too. A run
+that fails after taking a directory over is recorded as **contended**, and a
+contended failure defers its dependants instead of blocking them: in P0 a
+healthy source that finished eleven minutes later was recorded as having failed,
+and its transfer run was reported blocked, which under `DESIGN.md` §8.4 is a
+terminal, non-zero-exit verdict manufactured by the runner's own collision.
 
 **Defect 4 -- the reserve-seed rule was documented and never implemented.**
 `DESIGN.md` 4.3 pre-registers it: "source seeds are drawn in order from a
@@ -51,7 +84,33 @@ allocates the next unused RESERVE seed, enqueues that source, and re-points the
 dependent transfer runs at the replacement checkpoint; the phase repeats while
 newly trained sources keep failing. Phase 2 runs the target side against the
 assignment that survived. Exhausting the reserve is an error and stops the
-sweep. Every rejection is appended to ``runs/_jobs/source_replacements.jsonl``
+sweep, and so is a source that finished without producing the number the gate is
+defined on: an unscored or non-finite score is a **measurement failure**, never
+a pass and never a rejection. Reading ``nan >= 0.6`` as a rejection would spend a
+RESERVE seed on a broken evaluation and write ``NaN`` into the results table
+`DESIGN.md` 4.3 asks for; reading an absent score as a pass would train the whole
+target side against a source of unknown competence, which is the defect 4.3
+exists to prevent, reached with no refusal anywhere.
+
+One scope statement about the gate, because it decides whether the smoke
+test can run at all. `DESIGN.md` 4.3 defines validity on the normalised final
+score of a source trained to the design's budget, and it governs the sources of
+**reported** estimates. The pipeline-validation experiment is neither: it trains
+12 episodes (`registry.SMOKE_OVERRIDES`) and its catalogue entry says "not a
+result under any circumstances", so its sources score around zero and could not
+clear 0.6 at that budget however well the code worked. Applying the gate to them
+made the documented pre-launch smoke train 42 runs instead of 7, burn every
+RESERVE seed in both lineages and exit 3 without ever reaching phase 2, which is
+the half it exists to validate. So a selection made **entirely** of SMOKE-block
+experiments, at SMOKE-block seeds, is **not gated**; the fact is printed and
+stamped into the invocation record, and one reporting experiment anywhere in the
+selection brings the pre-registered gate back for the whole selection. What the
+smoke still refuses is a source that finished without a finite ``final_score``:
+that is a pipeline failure, and finding pipeline failures is what it is for. To
+exercise the 4.3 rejection-and-replacement path deliberately, give the smoke a
+gate it cannot meet: ``--experiments E0 --source-gate 0.9``.
+
+Every rejection is appended to ``runs/_jobs/source_replacements.jsonl``
 with the seed, the cell, the score and the replacement, because the design
 requires the rejected seeds to appear in the results table and a number that
 lives only in a terminal scrollback is not reportable.
@@ -108,25 +167,31 @@ Layout written under ``--out-root`` (default ``runs``)::
     _jobs/jobs.jsonl          one line per resolved job, with its full config
     _jobs/jobs-<id>-<tag>.jsonl  what one phase of one sweep was given to run
     _jobs/status.jsonl        append-only state transitions, all sweeps
+    _jobs/*.jsonl.lock        the cross-process lock for the file beside it;
+                              inert, and holds no data of its own
     _jobs/sweep-<id>.json     the invocation: argv, seeds, host, thread pinning
     _jobs/source_replacements.jsonl  every validity-gate rejection and its
                               replacement seed (DESIGN.md 4.3), append-only
-    _index/<experiment>.jsonl experiment -> member run_dirs
+    _index/<experiment>.jsonl experiment -> member run_dirs, with a
+                              ``.lock`` beside it for the same reason
     _logs/w<NN>-<id>[-<tag>].log  per-worker output
 """
 from __future__ import annotations
 
 import argparse
 import ast
+import ctypes
 import json
+import math
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Mapping, Optional, Sequence
+from typing import IO, Mapping, Optional, Sequence
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -135,7 +200,8 @@ for _path in (_ROOT, _HERE):
         sys.path.insert(0, _path)
 
 import registry                                             # noqa: E402
-from src.dqn.config import Config                           # noqa: E402
+from src.dqn.config import (BOOKKEEPING_FIELDS,             # noqa: E402
+                            TRANSFER_ONLY_FIELDS, Config)
 
 JOBS_SUBDIR = '_jobs'
 INDEX_SUBDIR = '_index'
@@ -148,9 +214,48 @@ STATUS_FILE = 'status.jsonl'
 # them; append-only, one JSON object per rejection, for the analysis layer.
 REPLACEMENTS_FILE = 'source_replacements.jsonl'
 CLAIM_NAME = '.claim'
+# A superseded claim used to be renamed aside and left there for ever; two such
+# files were still sitting in the P0 tree when the verification pass found them.
+# The prefix is kept, because the rename is what makes a reclaim race safe, but
+# the file is now removed as soon as the rename has decided that race.
+SUPERSEDED_PREFIX = CLAIM_NAME + '.superseded-'
+# The two other temporaries written beside a claim: a heartbeat refresh and a
+# failure mark, each renamed into place immediately. One left on disk is the
+# residue of a process killed inside that window. Neither was covered by the
+# purge, so a hard kill left one file per killed worker in the run directory for
+# ever, which is the litter the superseded prefix was cleaned up to remove.
+HEARTBEAT_PREFIX = CLAIM_NAME + '.hb-'
+FAILMARK_PREFIX = CLAIM_NAME + '.fail-'
+# How old such a temporary has to be before the purge will remove it. A fresh
+# one belongs to a rename in flight in another process, and deleting it under
+# that process turns a refresh into an error for no reason.
+CLAIM_TEMP_MIN_AGE_SECONDS = 300
 
 DEFAULT_STALE_SECONDS = 7_200
 DEFAULT_POLL_SECONDS = 15
+# The floor under the default compute ceiling on the RESERVE replacement rule
+# (``--max-source-replacements``). The rule itself is unbounded by design and
+# the ceiling is on one invocation, not on the rule; the default is one full
+# round of replacement across the plan's source lineages, and this is the
+# smallest that default may be, so a two-lineage smoke still has room to draw.
+DEFAULT_MIN_SOURCE_REPLACEMENTS = 4
+# How often a training worker refreshes its own claim. It has to sit far below
+# ``--stale-seconds``, or the heartbeat could not tell a slow run from a dead
+# one; at 60 s against a 7200 s default there are 120 refreshes inside one
+# staleness window, so a single missed write proves nothing while a run that has
+# genuinely stopped is unambiguous.
+HEARTBEAT_SECONDS = 60
+
+# Fields the runner itself owns. Overriding them does not do what it looks like:
+# `seed` is set per job by the registry, `experiment` and `label` are the names
+# the plan is printed under, `source_checkpoint` and `source_seed` are what the
+# validity gate assigns, and `out_root` would move the run directories out from
+# under ``--out-root`` while the job, status and index files stayed behind. All
+# six are bookkeeping or registry-assigned, so none of them changes a run digest
+# either: the runs would land in the catalogue's own directories wearing the
+# catalogue's identity.
+_RUNNER_OWNED_FIELDS = ('out_root', 'experiment', 'label', 'seed',
+                        'source_checkpoint', 'source_seed')
 
 # Conditions that actually read the source checkpoint's weights. The untrained
 # control builds its own random source of matched shape, so it needs the
@@ -159,10 +264,15 @@ DEFAULT_POLL_SECONDS = 15
 # disagreed about what a job depends on.
 _WEIGHT_READING = ('transfer', 'transfer_permuted')
 
-# SMOKE is (0,) and overlaps CONFIRM, so it is not a membership block: seed 0
-# belongs to CONFIRM and reporting it as SMOKE would make the per_seed.csv
-# `seed_block` column disagree with `DESIGN.md` §3.4's table.
-_BLOCK_ORDER = ('CONFIRM', 'REPLICATE', 'TUNE', 'C4SRC', 'RESERVE')
+# Every block `registry.SEED_BLOCKS` declares, so that `seed_block` can name the
+# block of any seed the design knows about. SMOKE used to be (0,), overlapping
+# CONFIRM, and was left out here for that reason; the registry has since moved it
+# to (999,) with the comment "Disjoint from CONFIRM on purpose. With SMOKE=(0,) a
+# pipeline-validation run was attributed to the confirmatory block, so a
+# seed-block audit could not tell a smoke run from a real one by its seed alone."
+# Leaving it out here defeated exactly that fix: every E0 run was written to
+# jobs.jsonl, status.jsonl and _index/E0.jsonl with seed_block 'UNKNOWN'.
+_BLOCK_ORDER = ('CONFIRM', 'REPLICATE', 'TUNE', 'C4SRC', 'RESERVE', 'SMOKE')
 
 
 # ---------------------------------------------------------------------------
@@ -179,19 +289,53 @@ def resolve_seed_spec(tokens: Sequence[str] | None) -> Optional[tuple[int, ...]]
     pre-registered pooled n=20 set of `ANALYSIS_PLAN.md` §6.5 rather than an
     error. The resolved integers are what reach the job manifest; no seed set is
     ever collapsed back into a string.
+
+    Every token is checked on its own and a bad one is named, because the
+    failure modes here are quiet rather than loud. ``--seeds 5-0`` is a reversed
+    range that contributes nothing and used to leave the rest of the
+    specification running as though it had been asked for in full; ``--seeds=-5``
+    parses as the seed -5, which belongs to no `DESIGN.md` §3.4 block and would
+    be written into every record as ``seed_block: UNKNOWN``. A ``ValueError``
+    raised here is turned into a refusal by `main`, not into a traceback.
     """
     if not tokens:
         return None
     out: list[int] = []
-    for tok in ' '.join(str(t) for t in tokens).replace(',', ' ').split():
+    raw = ' '.join(str(t) for t in tokens).replace(',', ' ').split()
+    if not raw:
+        raise ValueError(
+            f'--seeds {list(tokens)!r} is empty. Omit --seeds entirely to give '
+            f'each experiment the block it declares, or name a block '
+            f'({", ".join(registry.SEED_BLOCKS)}) or a range such as 0-9.')
+    for tok in raw:
         if tok in registry.SEED_BLOCKS:
-            out.extend(registry.SEED_BLOCKS[tok])
+            got = tuple(registry.SEED_BLOCKS[tok])
         else:
-            # `tok` is not None, so the block argument is unreachable; it exists
-            # only to satisfy the signature.
-            out.extend(registry.resolve_seeds(tok, 'CONFIRM'))
+            try:
+                # `tok` is not None, so the block argument is unreachable; it
+                # exists only to satisfy the signature.
+                got = tuple(registry.resolve_seeds(tok, 'CONFIRM'))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f'--seeds token {tok!r} is neither a block name '
+                    f'({", ".join(registry.SEED_BLOCKS)}) nor a seed or seed '
+                    f'range such as 0-9: {exc}') from None
+        if not got:
+            raise ValueError(
+                f'--seeds token {tok!r} names no seeds at all. A range is '
+                f'written low-high, so 5-0 is empty; a token that silently '
+                f'contributes nothing would leave the rest of the '
+                f'specification looking like the whole request.')
+        negative = sorted(sd for sd in got if sd < 0)
+        if negative:
+            raise ValueError(
+                f'--seeds token {tok!r} yields negative seed(s) {negative}. '
+                f'Seeds index the DESIGN.md 3.4 blocks and are non-negative; a '
+                f'leading minus is read as a sign, not as the start of a range '
+                f'(write --seeds 0-5, not --seeds=-5).')
+        out.extend(got)
     if not out:
-        raise ValueError(f'--seeds {tokens!r} resolved to no seeds')
+        raise ValueError(f'--seeds {list(tokens)!r} resolved to no seeds')
     return tuple(sorted(set(out)))
 
 
@@ -214,6 +358,25 @@ def check_seed_blocks(exp_ids: Sequence[str],
     that leak, so it is checked here rather than discovered in `audit.py` after
     the compute is spent.
 
+    All four of `DESIGN.md` §3.4's "never used for" rules are enforced, not one.
+    The earlier version checked only two, and gated the TUNE refusal on
+    ``family == 'confirmatory'``, which let ``--seeds TUNE`` through for every
+    *estimation* and *screen* experiment with nothing but a ``[warning]``: E2
+    supplies the three control contrasts, E8i is the C4 positive control with a
+    pre-registered pass criterion, and the screens emit BH q-values. §3.4 says
+    TUNE is never used for any confirmatory **or reported estimate**, and
+    `ANALYSIS_PLAN.md` §8 forbids "any estimate computed on TUNE seeds"; neither
+    is a statement about one family. The rule applied here is therefore the
+    block's, not the family's: **only an experiment that declares TUNE may run
+    on TUNE.**
+
+    RESERVE and C4SRC had no rule at all. ``--seeds RESERVE`` planned eighty
+    confirmatory jobs, and ``--seeds C4SRC`` silently *adopted* the four existing
+    P0 donor runs as members of a confirmatory scratch arm, because run identity
+    is the config digest and those directories already existed. A seed outside
+    every declared block is refused for the same reason: it would be recorded as
+    ``seed_block: UNKNOWN`` and no audit could classify it afterwards.
+
     Returns ``(fatal, warnings)``.
     """
     fatal: list[str] = []
@@ -222,12 +385,42 @@ def check_seed_blocks(exp_ids: Sequence[str],
         return fatal, warn
     requested = set(seeds)
     tune = set(registry.SEED_BLOCKS['TUNE'])
+    reserve = set(registry.SEED_BLOCKS['RESERVE'])
+    donor = set(registry.SEED_BLOCKS['C4SRC'])
+    smoke = set(registry.SEED_BLOCKS['SMOKE'])
     estimation = set(registry.SEED_BLOCKS['CONFIRM']) | set(
         registry.SEED_BLOCKS['REPLICATE'])
+
+    # Block-wide rules: they do not depend on which experiment asked, because
+    # DESIGN.md 3.4 states them about the block itself.
+    unknown = sorted(sd for sd in requested if seed_block(sd) == 'UNKNOWN')
+    if unknown:
+        fatal.append(
+            f'seeds {unknown} belong to no block DESIGN.md §3.4 declares. '
+            f'Every run records its block, and a run whose block is UNKNOWN '
+            f'cannot be checked for selection leakage by audit.py afterwards. '
+            f'Declared blocks: '
+            + ', '.join(f'{k} {min(v)}..{max(v)}'
+                        for k, v in registry.SEED_BLOCKS.items()) + '.')
+    if requested & reserve:
+        fatal.append(
+            f'the requested seeds include {sorted(requested & reserve)} from '
+            f'RESERVE. DESIGN.md §3.4 reserves that block for replacement '
+            f'sources drawn by the validity gate and for nothing else; the '
+            f'draw is made by the source phase (DESIGN.md 4.3) and recorded in '
+            f'{REPLACEMENTS_FILE}, never selected by hand. Selecting it here '
+            f'would put arbitrary runs in the block the gate draws from, so a '
+            f'later replacement could not tell a drawn seed from a scheduled '
+            f'one.')
+
+    #: Seeds a block-wide rule has already refused. The per-experiment loop adds
+    #: nothing for them, and a generic warning underneath a refusal reads as
+    #: though the request were merely unusual.
+    already_fatal = set(unknown) | (requested & reserve)
     for eid in exp_ids:
         exp = registry.EXPERIMENTS[eid]
         declared = set(registry.SEED_BLOCKS[exp.seed_block])
-        if requested == declared:
+        if requested == declared or requested <= already_fatal:
             continue
         if exp.seed_block == 'TUNE' and requested & estimation:
             fatal.append(
@@ -236,17 +429,42 @@ def check_seed_blocks(exp_ids: Sequence[str],
                 f'{sorted(requested & estimation)} from CONFIRM/REPLICATE. '
                 f'Selecting on seeds that later carry a reported estimate is '
                 f'DESIGN.md §11 defect 2. Run it on TUNE.')
-        elif exp.family == 'confirmatory' and requested & tune:
+            continue
+        if exp.seed_block != 'TUNE' and requested & tune:
             fatal.append(
-                f'{eid} ({exp.name}) is confirmatory and the requested seeds '
-                f'include {sorted(requested & tune)} from TUNE. '
-                f'ANALYSIS_PLAN.md §8 forbids an estimate computed on TUNE '
-                f'seeds.')
-        else:
+                f'{eid} ({exp.name}) declares {exp.seed_block} and is family '
+                f'{exp.family}, and the requested seeds include '
+                f'{sorted(requested & tune)} from TUNE. DESIGN.md §3.4 says '
+                f'TUNE is never used for any confirmatory or reported '
+                f'estimate, and ANALYSIS_PLAN.md §8 forbids any estimate '
+                f'computed on TUNE seeds: that covers estimation and screen '
+                f'experiments as much as confirmatory ones. Only E3-style '
+                f'selection experiments, which declare TUNE, may run on it.')
+            continue
+        if exp.seed_block != 'C4SRC' and requested & donor:
+            fatal.append(
+                f'{eid} ({exp.name}) is not a donor experiment and the '
+                f'requested seeds include {sorted(requested & donor)} from '
+                f'C4SRC. DESIGN.md §3.4 says C4SRC supplies positive-control '
+                f'source checkpoints and is never used for target-side '
+                f'estimation. The C4 donors are pulled in by the registry as '
+                f'source runs where E8i needs them; asking for them as target '
+                f'seeds adopts those existing run directories into this '
+                f'experiment instead, because run identity is the config '
+                f'digest.')
+            continue
+        if exp.seed_block != 'SMOKE' and requested & smoke:
             warn.append(
-                f'{eid} ({exp.name}) declares seed block {exp.seed_block} '
-                f'({min(declared)}..{max(declared)}); running it on '
-                f'{len(requested)} explicitly requested seeds instead.')
+                f'{eid} ({exp.name}) is being run on SMOKE seed(s) '
+                f'{sorted(requested & smoke)}. SMOKE is disjoint from every '
+                f'other block so nothing leaks, but nothing produced on it is '
+                f'a result either: it exists so a seed-block audit can tell a '
+                f'pipeline-validation run from a real one by its seed alone.')
+            continue
+        warn.append(
+            f'{eid} ({exp.name}) declares seed block {exp.seed_block} '
+            f'({min(declared)}..{max(declared)}); running it on '
+            f'{len(requested)} explicitly requested seeds instead.')
     return fatal, warn
 
 
@@ -259,6 +477,17 @@ def parse_overrides(items: Sequence[str] | None) -> dict:
     Values go through ``literal_eval`` so ``num_episodes=14``,
     ``hidden=(64,64)`` and ``prefix_checkpoints=[6]`` all mean what they look
     like; anything that will not evaluate is kept as a string.
+
+    Two classes are refused outright rather than warned about. The fields in
+    ``_RUNNER_OWNED_FIELDS`` are assigned by the runner or the registry, so an
+    override of them either does nothing (``seed``) or does something nobody
+    asked for (``out_root`` moves the run directories out from under
+    ``--out-root`` while ``_jobs/`` and ``_index/`` stay behind). And a budget of
+    fewer than one episode is refused because ``num_episodes=0`` made
+    ``is_complete`` read ``0 >= 0`` and certify an entire tree as finished:
+    sixteen runs with ``episodes_completed: 0`` and ``final_score: null``,
+    indexed as experiment members, and a re-run reporting "every job already has
+    a complete manifest" at exit 0.
     """
     out: dict = {}
     fields = {f.name for f in Config.__dataclass_fields__.values()}
@@ -269,10 +498,43 @@ def parse_overrides(items: Sequence[str] | None) -> dict:
         key = key.strip().replace('-', '_')
         if key not in fields:
             raise ValueError(f'--override {key!r} is not a Config field')
+        if key in _RUNNER_OWNED_FIELDS:
+            raise ValueError(
+                f'--override {key}= is refused: {key} is assigned by the '
+                f'runner or the registry, not by the command line. '
+                + {'out_root': 'Use --out-root, which moves the job, status '
+                               'and index files with the runs.',
+                   'seed': 'Use --seeds; the registry sets seed per job, so an '
+                           'override of it is silently ignored and the plan '
+                           'you get is the catalogue plan.',
+                   'source_checkpoint': 'The source is assigned by the '
+                                        'validity gate (DESIGN.md 4.3).',
+                   'source_seed': 'The source seed is assigned by the validity '
+                                  'gate (DESIGN.md 4.3) and recorded in '
+                                  f'{REPLACEMENTS_FILE}.',
+                   }.get(key, 'It names the plan rather than changing it, and '
+                              'it is bookkeeping, so the runs would keep the '
+                              'catalogue digest and the catalogue directory.'))
         try:
             out[key] = ast.literal_eval(raw)
         except (ValueError, SyntaxError):
             out[key] = raw
+    for key in ('num_episodes', 'max_steps'):
+        if key not in out:
+            continue
+        try:
+            value = int(out[key])
+        except (TypeError, ValueError):
+            raise ValueError(f'--override {key}={out[key]!r} is not a whole '
+                             f'number of {key.split("_")[-1]}') from None
+        if value < 1:
+            raise ValueError(
+                f'--override {key}={out[key]!r} is not a run. A budget below '
+                f'one is not a smaller experiment, it is a directory tree '
+                f'certified complete without training: at num_episodes=0 the '
+                f'completion test reads 0 >= 0 and every manifest passes with '
+                f'final_score null.')
+        out[key] = value
     return out
 
 
@@ -317,6 +579,12 @@ def job_record(job: 'registry.Job', experiments: Sequence[str]) -> dict:
         'source_replaced': job.source_replaced,
         'source_run_digest': None,
         'is_source': False,
+        # Filled in by `build_plan` on a source that the validity gate drew from
+        # RESERVE: the default seed it stands in for. Nothing else can say so.
+        # The source's own record shows a RESERVE seed in an ordinary arm, and
+        # `DESIGN.md` §3.4 gives RESERVE exactly one use, so a consumer that
+        # cannot see this field has to guess.
+        'source_replacement_for': None,
         'config': cfg.to_dict(),
     }
 
@@ -373,12 +641,28 @@ def build_plan(exp_ids: Sequence[str], seeds: Optional[tuple[int, ...]],
             continue
         src['is_source'] = True
         rec['source_run_digest'] = src['run_digest']
+        if rec.get('source_replaced'):
+            # Derived from the consumer because the source record cannot say
+            # it: its seed is a RESERVE seed sitting in a normal arm, and
+            # nothing in it distinguishes a seed the gate drew from a seed the
+            # plan scheduled.
+            src['source_replacement_for'] = rec.get('source_default_seed')
     return records, membership
 
 
 def write_jobs(path: str, records: Sequence[dict]) -> None:
+    """Publish the job list atomically, through a name only this process uses.
+
+    The temporary carries the pid because `claim_run`'s docstring contemplates a
+    second sweep started by hand on the same tree. On one fixed
+    ``jobs.jsonl.tmp`` those two parents collide: on Windows the second ``open``
+    raises PermissionError and takes that parent down with a traceback, or one
+    of them publishes the other's half-written file. With a name per process
+    each writes a complete file and the later ``os.replace`` wins, which is a
+    result rather than a crash.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.tmp'
+    tmp = f'{path}.tmp-{os.getpid()}'
     with open(tmp, 'w', encoding='utf-8') as fh:
         for rec in records:
             fh.write(json.dumps(rec, sort_keys=True, default=str) + '\n')
@@ -396,59 +680,140 @@ def read_jobs(path: str) -> list[dict]:
 
 
 def write_index(out_root: str, membership: dict[str, list[str]],
-                records: Sequence[dict]) -> list[str]:
+                records: Sequence[dict],
+                rejected_dirs: Sequence[str] = ()) -> list[str]:
     """``_index/<experiment>.jsonl``: which runs belong to which experiment.
 
     Written by the parent only, and *merged* with whatever is already there. A
     later invocation on a different seed set must not erase the earlier members,
     or `audit.py` would see an incomplete arm and refuse a complete one --
     reproducing by accident the silent seed-dropping of `DESIGN.md` §1.
+
+    Merging is also why the rows have to carry their own provenance rather than
+    relying on the index being pruned. A RESERVE replacement source is written
+    here as an ordinary member of whatever arm it belongs to, and for E8 and E9
+    the runs that *act* as sources declare ``role='target'`` (their sources come
+    from a ``scratch-*`` arm), so an eleventh seed drawn from RESERVE was
+    indistinguishable in ``arm`` from the ten genuine CONFIRM members of an arm
+    that feeds a reported estimate. `DESIGN.md` §3.4 gives RESERVE exactly one
+    use, so a consumer must be able to see that use in the row: hence
+    ``is_source``, ``source_replacement_for``, ``source_replaced`` and
+    ``source_rejected``.
+
+    ``rejected_dirs`` are the run directories the validity gate has rejected,
+    from the DESIGN.md 4.3 ledger. They are *marked*, not removed: this runner
+    does not delete evidence, and a rejected source is part of what §4.3 requires
+    the results table to report. Marking is applied to rows already on disk too,
+    so an index written before a rejection is corrected by the next invocation.
+
+    The read-merge-write runs under the same cross-process lock the status log
+    uses, and publishes through a pid-qualified temporary. Unlocked, two parents
+    on one tree interleave: both read the old file, each merges its own members
+    into what it read, and whichever replaces second publishes an index missing
+    the other's rows, which is the silent member loss the merge exists to
+    prevent.
     """
+    rejected = {str(d) for d in rejected_dirs}
     by_dir = {r['run_dir']: r for r in records}
     index_dir = os.path.join(out_root, INDEX_SUBDIR)
     os.makedirs(index_dir, exist_ok=True)
     written = []
     for eid, dirs in membership.items():
         path = os.path.join(index_dir, f'{eid}.jsonl')
-        merged: dict[str, dict] = {}
-        if os.path.exists(path):
-            for line in open(path, encoding='utf-8'):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                merged[row.get('run_dir', '')] = row
-        for run_dir in dirs:
-            rec = by_dir.get(run_dir, {})
-            merged[run_dir] = {
-                'experiment': eid,
-                'run_dir': run_dir,
-                'run_digest': rec.get('run_digest'),
-                'arm': rec.get('arm'),
-                'label': rec.get('label'),
-                'role': rec.get('role'),
-                'arm_id': rec.get('arm_id'),
-                'condition': rec.get('condition'),
-                'seed': rec.get('seed'),
-                'seed_block': rec.get('seed_block'),
-                'depends_on': rec.get('depends_on'),
-            }
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            for key in sorted(merged):
-                fh.write(json.dumps(merged[key], sort_keys=True,
-                                    default=str) + '\n')
-        os.replace(tmp, path)
+        # The lock file sits beside the index as `<experiment>.jsonl.lock`,
+        # holds no data, and does not match the `*.jsonl` any consumer globs.
+        with _AppendLock(path):
+            merged = _merge_index(path, dirs, by_dir, rejected, eid)
+            tmp = f'{path}.tmp-{os.getpid()}'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                for key in sorted(merged):
+                    fh.write(json.dumps(merged[key], sort_keys=True,
+                                        default=str) + '\n')
+            os.replace(tmp, path)
         written.append(path)
     return written
+
+
+def _merge_index(path: str, dirs: Sequence[str], by_dir: Mapping[str, dict],
+                 rejected: set[str], eid: str) -> dict[str, dict]:
+    """The rows already on disk, corrected, plus this plan's own.
+
+    Split out of `write_index` only so the locked region is one short block:
+    the lock is not reentrant (see `_AppendLock`), so nothing in here may append
+    a status record.
+    """
+    merged: dict[str, dict] = {}
+    if os.path.exists(path):
+        for line in open(path, encoding='utf-8'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get('run_dir') in rejected:
+                row['source_rejected'] = True
+            merged[row.get('run_dir', '')] = row
+    for run_dir in dirs:
+        rec = by_dir.get(run_dir, {})
+        merged[run_dir] = {
+            'experiment': eid,
+            'run_dir': run_dir,
+            'run_digest': rec.get('run_digest'),
+            'arm': rec.get('arm'),
+            'label': rec.get('label'),
+            'role': rec.get('role'),
+            'arm_id': rec.get('arm_id'),
+            'condition': rec.get('condition'),
+            'seed': rec.get('seed'),
+            'seed_block': rec.get('seed_block'),
+            'depends_on': rec.get('depends_on'),
+            # Membership of phase 1, computed from the dependency edges
+            # rather than from `role`, which is wrong for exactly the arms
+            # where it matters (see `build_plan`).
+            'is_source': bool(rec.get('is_source')),
+            'source_replacement_for': rec.get('source_replacement_for'),
+            'source_seed': rec.get('source_seed'),
+            'source_default_seed': rec.get('source_default_seed'),
+            'source_replaced': bool(rec.get('source_replaced')),
+            'source_rejected': run_dir in rejected,
+        }
+    return merged
 
 
 # ---------------------------------------------------------------------------
 # Completion, claims, status
 # ---------------------------------------------------------------------------
+def _remove_quietly(path: str) -> bool:
+    """Delete a file we no longer need; tidying up is never a failure."""
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def _json_safe(obj):
+    """Replace non-finite floats with None, recursively.
+
+    ``json.dumps(float('nan'))`` emits a bare ``NaN``, which is not valid strict
+    JSON: Python reads it back, nothing else has to. The status log and the
+    DESIGN.md 4.3 rejection ledger are both read by the analysis layer and by
+    whatever a reviewer points at them, so a record that only Python can parse
+    is a record that is not reportable. A non-finite number is written as null
+    and the state that produced it is carried in its own field, never inferred
+    from the number.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def manifest_result(run_dir: str) -> Optional[dict]:
     path = os.path.join(run_dir, 'manifest.json')
     try:
@@ -458,26 +823,468 @@ def manifest_result(run_dir: str) -> Optional[dict]:
         return None
 
 
+def _as_int(value: object) -> Optional[int]:
+    """``int(value)`` or None. A manifest field is data, not a promise.
+
+    ``int(result.get('episodes_completed') or 0)`` raised an uncaught
+    ValueError on any manifest whose count was not a number, and `is_complete`
+    is called from `print_plan`, `worker_main`, `summarise` and
+    `lineage_conflicts`, so one malformed manifest anywhere in the tree aborted
+    the whole planner with a traceback instead of a refusal.
+    """
+    try:
+        return int(value)                       # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def completion_state(rec: dict) -> tuple[str, str]:
+    """What this run's own manifest says about it: state and reason.
+
+    Four states, and the fourth is the one that used to be missing:
+
+    * ``unrun``    -- no manifest at all.
+    * ``partial``  -- a manifest short of the budget; resume it.
+    * ``complete`` -- the budget reached and the run's own integrity check
+      clean.
+    * ``unsound``  -- a manifest that cannot be read as evidence of a sound run.
+
+    An unsound manifest is neither complete nor quietly resumable, and naming it
+    separately is the point. `DESIGN.md` §8.2(1) exists because a crash between
+    checkpoints duplicates metric rows and silently corrupts every window
+    statistic downstream; ``train.py`` detects exactly that and records it in
+    ``result.metrics_integrity``, printing "[WARNING] metrics integrity". The
+    completion test never read it, so a manifest reporting
+    ``unique_episodes >= num_episodes`` alongside ``contiguous: false`` was
+    accepted as complete, skipped, and counted under "complete now". This runner
+    is the only layer that could re-run such a directory, so it is the layer
+    that has to refuse to call it finished.
+
+    The integrity verdict is consulted only once the episode budget is reached.
+    Below it the check's own "expected N episodes, found M" problem would fire
+    on every interrupted run, and an interrupted run is a resume, not a defect.
+    """
+    result = manifest_result(rec['run_dir'])
+    if result is None:
+        return 'unrun', 'no manifest'
+    want = _as_int(rec.get('num_episodes'))
+    if want is None or want < 1:
+        return 'unsound', (
+            f'the job asks for {rec.get("num_episodes")!r} episodes. A budget '
+            f'below one is not a smaller run: at num_episodes=0 the completion '
+            f'test reads 0 >= 0 and certifies the whole tree as finished '
+            f'without training anything')
+    raw = result.get('episodes_completed')
+    got = 0 if raw is None else _as_int(raw)
+    if got is None:
+        return 'unsound', (f'manifest result.episodes_completed is {raw!r}, '
+                           f'which is not a count of episodes')
+    if got < want:
+        return 'partial', f'{got}/{want} episodes'
+    integrity = result.get('metrics_integrity')
+    if isinstance(integrity, dict):
+        problems = [str(p) for p in (integrity.get('problems') or [])]
+        if integrity.get('contiguous') is False or problems:
+            return 'unsound', (
+                f'the run reports {got}/{want} episodes but its own metrics '
+                f'integrity check failed (DESIGN.md 8.2(1)): '
+                + ('; '.join(problems) or 'contiguous: false'))
+    return 'complete', f'{got}/{want} episodes'
+
+
 def is_complete(rec: dict) -> bool:
     """A run is complete when its own manifest says so, and only then.
 
     Not "the directory exists", and not "a checkpoint is present". The audit
     found a completed directory being resumed under a different configuration,
     which trained zero episodes and then wrote a manifest whose config never
-    described its metrics.
+    described its metrics. An *unsound* manifest is not complete either; see
+    `completion_state`, and `unsound_runs` for what is done about it.
     """
-    result = manifest_result(rec['run_dir'])
-    if result is None:
-        return False
-    return int(result.get('episodes_completed') or 0) >= int(rec['num_episodes'])
+    return completion_state(rec)[0] == 'complete'
 
 
+def unsound_runs(records: Sequence[dict]) -> list[dict]:
+    """Runs whose manifest is neither trustworthy nor safely resumable.
+
+    Reported and refused rather than repaired, for the same reason
+    `lineage_conflicts` is: this runner does not delete data, and a directory
+    holding duplicated or non-contiguous episode rows is evidence of something.
+    Re-entering it would not help either, because ``train.py`` resumes and a run
+    already at its budget trains nothing, so the sweep would spin.
+    """
+    out: list[dict] = []
+    for rec in records:
+        state, why = completion_state(rec)
+        if state != 'unsound':
+            continue
+        out.append({'run_dir': rec['run_dir'], 'job_id': rec['job_id'],
+                    'arm': rec['arm'], 'seed': rec['seed'],
+                    'experiment': rec['experiment'], 'reason': why})
+    return out
+
+
+def print_unsound_runs(rows: Sequence[dict]) -> None:
+    """Name every directory whose manifest cannot be read as a finished run."""
+    if not rows:
+        return
+    print('\n' + '=' * 72)
+    print(f'[ERROR] {len(rows)} run(s) have a manifest that is not evidence of '
+          f'a sound run')
+    print('=' * 72)
+    for row in rows:
+        print(f'\n  {row["job_id"]}  {row["experiment"]}/{row["arm"]} '
+              f'seed {row["seed"]}')
+        print(f'    directory: {row["run_dir"]}')
+        print(f'    reason:    {row["reason"]}')
+    print('\n  Neither counted as complete nor resumed. DESIGN.md 8.2(1) '
+          'exists because duplicated')
+    print('  metric rows silently corrupt every window statistic downstream, '
+          'and train.py already')
+    print('  reports the condition; ignoring it here is what made it '
+          'invisible. Move or delete')
+    print('  the directories above and re-run: this runner will not delete '
+          'data.')
+
+
+# ---------------------------------------------------------------------------
+# Claims: who owns a run directory, and when that may be taken away
+# ---------------------------------------------------------------------------
 def read_claim(path: str) -> Optional[dict]:
+    """The claim on a run directory.
+
+    None when there is none; ``{}`` when one is present but unreadable.
+
+    The distinction is load-bearing and used to be lost. The old version
+    returned ``{}`` for every failure including "no such file", so
+    `_reclaim_reason`'s ``if claim is None`` guard was dead code and
+    `dependency_state`'s ``if claim:`` read an empty or torn claim as *no claim
+    at all*. `claim_run` creates the file with ``os.open`` and writes the
+    payload in a separate ``os.write``, so there is a window, however short, in
+    which the file exists and is empty; a reader inside it would classify an
+    actively claimed dependency as unclaimed and, if that job was not in its own
+    remaining list, declare the consumer **blocked**, which is a terminal,
+    non-zero-exit verdict.
+    """
     try:
         with open(path, encoding='utf-8') as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
         return {}
+    try:
+        claim = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return claim if isinstance(claim, dict) else {}
+
+
+def claim_owner(sweep_id: str, worker: str) -> dict:
+    """This process's identity, as written into a claim and checked back out.
+
+    Four fields, all four compared. A pid alone is not an identity across hosts,
+    and a sweep id alone is not one across workers.
+    """
+    return {'pid': os.getpid(), 'host': socket.gethostname(),
+            'sweep': sweep_id, 'worker': worker}
+
+
+def _is_owner(claim: Optional[Mapping], owner: Mapping) -> bool:
+    if not claim:
+        return False
+    return all(claim.get(key) == owner[key]
+               for key in ('pid', 'host', 'sweep', 'worker'))
+
+
+#: Loaded once. `_pid_alive` is called on every contested claim, and a deferred
+#: worker re-checks every ``--poll-seconds``, so re-binding the library per call
+#: turned a liveness question into a measurable cost on a large job list.
+_KERNEL32 = None
+
+
+def _win_kernel32():
+    global _KERNEL32
+    if _KERNEL32 is None:
+        lib = ctypes.WinDLL('kernel32', use_last_error=True)
+        lib.OpenProcess.restype = ctypes.c_void_p
+        lib.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int,
+                                    ctypes.c_ulong)
+        lib.CloseHandle.argtypes = (ctypes.c_void_p,)
+        lib.GetExitCodeProcess.argtypes = (ctypes.c_void_p,
+                                           ctypes.POINTER(ctypes.c_ulong))
+        _KERNEL32 = lib
+    return _KERNEL32
+
+
+def _pid_alive(pid: object) -> Optional[bool]:
+    """True, False, or **None** when this process cannot tell.
+
+    None is a real answer and is treated as one downstream: "I do not know" must
+    never collapse into "it is dead", because assuming death is what let a live
+    trainer's directory be taken away from it while it was still writing.
+
+    Pid reuse is the residual risk and it is left as a refusal rather than
+    papered over: if a dead worker's pid has been recycled by an unrelated
+    process, this reports alive and the directory is never reclaimed
+    automatically. ``--force-claim`` is then the operator's deliberate gesture,
+    which is the safe direction for the error to point, and `_held_note` says so
+    out loud once a live owner has stopped refreshing its own claim: that
+    combination is the signature of a recycled pid, and left silent it reads as
+    an ordinary wait.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if pid == os.getpid():
+        return True
+    if os.name == 'nt':
+        try:
+            kernel32 = _win_kernel32()
+            # PROCESS_QUERY_LIMITED_INFORMATION: the narrowest right that
+            # answers the question, and the one that still works when the
+            # target process belongs to another user.
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                code = ctypes.c_ulong(0)
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                kernel32.CloseHandle(handle)
+                if not ok:
+                    return None
+                return code.value == 259            # STILL_ACTIVE
+            err = ctypes.get_last_error()
+            if err == 87:                           # ERROR_INVALID_PARAMETER
+                return False                        # no such process
+            if err == 5:                            # ERROR_ACCESS_DENIED
+                return True                         # it exists
+            return None
+        except (OSError, AttributeError, ValueError):
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                                 # exists, not ours to signal
+    except OSError:
+        return None
+    return True
+
+
+def _owner_liveness(claim: Mapping) -> tuple[Optional[bool], str]:
+    """Is the process that wrote this claim still running, and how do we know?"""
+    pid = claim.get('pid')
+    host = claim.get('host')
+    if host and host != socket.gethostname():
+        return None, (f'owner {pid}@{host} is on another host, so its '
+                      f'liveness cannot be checked from here')
+    alive = _pid_alive(pid)
+    if alive is True:
+        return True, f'owner pid {pid} is still running on this host'
+    if alive is False:
+        return False, f'owner pid {pid} is gone from this host'
+    return None, f'owner pid {pid!r} cannot be checked on this host'
+
+
+def _claim_payload(run_dir: str, owner: Mapping) -> dict:
+    now = time.time()
+    stamp = time.strftime('%Y-%m-%dT%H:%M:%S')
+    return {'pid': owner['pid'], 'host': owner['host'],
+            'sweep': owner['sweep'], 'worker': owner['worker'],
+            'run_dir': run_dir, 'state': 'running',
+            'time': stamp, 'epoch': now,
+            'heartbeat': now, 'heartbeat_t': stamp,
+            'heartbeat_seconds': HEARTBEAT_SECONDS}
+
+
+def heartbeat_claim(run_dir: str, owner: Mapping) -> tuple[str, str]:
+    """Refresh this process's own claim. Returns ``(status, detail)``.
+
+    ``status`` is ``refreshed``, ``lost`` (the claim is gone or now belongs to
+    somebody else, which is not retryable) or ``error`` (a write that failed and
+    may succeed next time).
+
+    Without this the claim's timestamp was written once, at the start, and the
+    reclaim rule read its age as "how long since anything happened here". For a
+    run longer than ``--stale-seconds`` that reading is simply wrong, and in P0
+    it took a 14.4 h source run away from its owner at 14.2 h. With a refresh
+    every `HEARTBEAT_SECONDS` the age means what the rule needs it to mean: how
+    long since the owner was last demonstrably alive.
+
+    The refresh is a rename, not a truncate-and-rewrite, so no reader ever sees
+    a half-written claim.
+    """
+    path = os.path.join(run_dir, CLAIM_NAME)
+    claim = read_claim(path)
+    if claim is None:
+        return 'lost', 'the claim file is gone'
+    if not _is_owner(claim, owner):
+        return 'lost', (f'the claim now belongs to {claim.get("worker")}/'
+                        f'{claim.get("pid")}@{claim.get("host")} in sweep '
+                        f'{claim.get("sweep")}')
+    claim.update(heartbeat=time.time(),
+                 heartbeat_t=time.strftime('%Y-%m-%dT%H:%M:%S'),
+                 heartbeat_seconds=HEARTBEAT_SECONDS)
+    tmp = f'{path}.hb-{os.getpid()}'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(_json_safe(claim), fh, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _remove_quietly(tmp)
+        return 'error', f'could not refresh the claim: {exc}'
+    return 'refreshed', 'refreshed'
+
+
+class ClaimHeartbeat:
+    """Keep a claim fresh for as long as its run is training.
+
+    A daemon thread rather than anything cleverer, because the alternative is to
+    interleave the refresh with ``train()``, which is one opaque blocking call.
+    The thread only touches its own claim file and only through
+    `heartbeat_claim`, which re-checks ownership on every pass, so the worst it
+    can do when the directory has changed hands is notice and stop.
+
+    Losing the claim mid-run should now be impossible without
+    ``--force-claim``, but it is detected anyway and recorded: `lost_reason` is
+    what the worker reports afterwards, because a run that finished without
+    owning its directory is not something to report as an ordinary success.
+    """
+
+    def __init__(self, run_dir: str, owner: Mapping,
+                 interval: int = HEARTBEAT_SECONDS) -> None:
+        self.run_dir = run_dir
+        self.owner = dict(owner)
+        self.interval = max(1, int(interval))
+        self.lost_reason: Optional[str] = None
+        self.beats = 0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval):
+            status, detail = heartbeat_claim(self.run_dir, self.owner)
+            if status == 'refreshed':
+                self.beats += 1
+                continue
+            if status == 'lost':
+                self.lost_reason = detail
+                return
+            # 'error': transient, so keep trying. The claim keeps its previous
+            # timestamp meanwhile, which is the conservative direction: it ages
+            # towards being reclaimable rather than away from it.
+
+    def __enter__(self) -> 'ClaimHeartbeat':
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True,
+            name='claim-heartbeat-' + os.path.basename(self.run_dir))
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+
+def _held_note(path: str) -> str:
+    """Why a claim could not be taken, in terms an operator can act on."""
+    held = read_claim(path)
+    if not held:
+        return ('held by a claim this process cannot read; --force-claim takes '
+                'it over deliberately')
+    alive, _evidence = _owner_liveness(held)
+    liveness = {True: 'alive', False: 'gone', None: 'unknown'}[alive]
+    age: Optional[float] = None
+    try:
+        age = time.time() - os.path.getmtime(path)
+        touched = f'{age:.0f}s ago'
+    except OSError:
+        touched = 'at an unreadable time'
+    note = (f'held by {held.get("worker")}/{held.get("pid")}@'
+            f'{held.get("host")} (sweep {held.get("sweep")}, owner {liveness}, '
+            f'last touched {touched})')
+    # A live pid that has stopped refreshing its own claim is the signature of
+    # pid reuse, and pid reuse is the one way a crashed worker's directory
+    # becomes permanently unreclaimable: `_pid_alive` can only answer whether a
+    # pid exists, Windows recycles pids aggressively, and an unrelated process
+    # holding the dead worker's number reports alive for ever. Refusing is the
+    # right direction, but refusing in silence is not: the sweep then waits out
+    # --max-wait-seconds on a run nothing is training and the operator has no
+    # way to tell that from an ordinary long run.
+    interval = _as_int(held.get('heartbeat_seconds')) or HEARTBEAT_SECONDS
+    if alive is True and age is not None and age > max(10 * interval, 600):
+        note += (f'. NOTE: that owner is alive but has not refreshed this claim '
+                 f'for {age / 60:.0f} min, far beyond its own {interval}s '
+                 f'heartbeat. Either it is wedged, or it died and its pid has '
+                 f'been reused by an unrelated process, in which case nothing '
+                 f'is training here and only --force-claim gets past it')
+    return note
+
+
+def live_claim_holder(run_dir: str) -> Optional[str]:
+    """Who is demonstrably alive inside `run_dir`, or None.
+
+    'Demonstrably' means `_owner_liveness` answering True, which is the same
+    evidence `_reclaim_reason` demands before it will take a directory away from
+    anybody. Unknown liveness is not alive: a claim from another host cannot be
+    checked from here, and reading that as an owner would let an unreachable
+    claim suppress a verdict that ought to be reported.
+
+    It exists so that "another worker is training this" and "nobody will ever
+    build this" stop being the same answer. `DESIGN.md` §8.4 makes **blocked** a
+    terminal verdict, and a job whose directory is held by a live owner has not
+    earned one.
+    """
+    claim = read_claim(os.path.join(run_dir, CLAIM_NAME))
+    if not claim:
+        return None
+    alive, evidence = _owner_liveness(claim)
+    if alive is not True:
+        return None
+    return (f'{claim.get("worker")}/{claim.get("pid")}@{claim.get("host")} in '
+            f'sweep {claim.get("sweep")} ({evidence})')
+
+
+def purge_claim_litter(*run_dirs: str) -> int:
+    """Remove the claim temporaries an interrupted process leaves behind.
+
+    Three names, all of them beside a live ``.claim``, none of them read by
+    anything: ``.claim.superseded-*`` from a reclaim, ``.claim.hb-*`` from a
+    heartbeat refresh and ``.claim.fail-*`` from a failure mark. Each is created
+    and then renamed or removed by the call that wrote it, so one still on disk
+    is the residue of a process killed inside that window. Nothing read them and
+    nothing deleted them; two superseded files were still sitting in the P0 tree
+    when the verification pass found them, and the other two prefixes were not
+    covered at all, so a hard kill left a file per killed worker for ever.
+
+    The heartbeat and failure temporaries are removed only once they are older
+    than `CLAIM_TEMP_MIN_AGE_SECONDS`, because a fresh one is a rename in flight
+    in another process and deleting it under that process turns a refresh into
+    an error for nothing. A superseded file has no such window: the rename that
+    creates it has already decided the reclaim race, and its own writer removes
+    it in the next statement.
+    """
+    removed = 0
+    now = time.time()
+    for run_dir in run_dirs:
+        try:
+            names = os.listdir(run_dir)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(run_dir, name)
+            if name.startswith(SUPERSEDED_PREFIX):
+                removed += int(_remove_quietly(path))
+                continue
+            if not name.startswith((HEARTBEAT_PREFIX, FAILMARK_PREFIX)):
+                continue
+            try:
+                age = now - os.path.getmtime(path)
+            except OSError:
+                continue
+            if age >= CLAIM_TEMP_MIN_AGE_SECONDS:
+                removed += int(_remove_quietly(path))
+    return removed
 
 
 def _reclaim_reason(path: str, stale_seconds: int, sweep_id: str,
@@ -486,33 +1293,79 @@ def _reclaim_reason(path: str, stale_seconds: int, sweep_id: str,
 
     Three grounds, all of which leave a ``reclaimed`` record in the status log:
 
-    * **stale** -- no manifest and the claim has not been touched for
-      ``stale_seconds`` (default 2 h). This is the crashed-worker case; a Colab
-      or Kaggle session that dies mid-run leaves exactly this.
-    * **failed** -- the claim records a failure from an *earlier* sweep. The
-      failure is already recorded in ``status.jsonl``, and ``--resume`` is a
-      request to try again, so holding the directory would turn one crash into a
-      permanently unrunnable job.
-    * **forced** -- ``--force`` with a claim from another sweep.
+    * **stale** -- the claim has not been heartbeaten for ``stale_seconds``
+      (default 2 h) **and there is evidence the owner is gone**. This is the
+      crashed-worker case; a Colab or Kaggle session that dies mid-run leaves
+      exactly this.
+    * **failed** -- the claim records a *plain* failure from an *earlier*
+      sweep. The failure is already recorded in ``status.jsonl``, and
+      ``--resume`` is a request to try again, so holding the directory would
+      turn one crash into a permanently unrunnable job. A **contended** failure
+      does not qualify and falls through to the stale ground, which does require
+      evidence of death: a worker that failed after taking a directory over says
+      nothing about whoever it took it from, who may still be training in there,
+      and this ground has neither an age wait nor a liveness test. Requiring
+      liveness on this ground instead would be wrong in the other direction: a
+      worker that fails one job carries straight on with the next, so its pid is
+      alive while the directory it failed in is idle, and a second sweep started
+      by hand could then never retry it.
+    * **forced** -- ``--force-claim`` with a claim from another sweep.
 
     A claim written by *this* sweep is never reclaimed on the failed ground: a
     deterministic failure would otherwise be retried forever inside one
     invocation.
+
+    The evidence requirement on the stale ground is the fix for the defect that
+    fired in P0. Age alone is not evidence: with the timestamp written once at
+    the start, every run longer than ``--stale-seconds`` looked abandoned, and
+    the branch did not even require the reclaiming worker to belong to a
+    different sweep. What counts as evidence now:
+
+    * the owner's pid is **gone from this host** -- conclusive;
+    * the owner is on **another host**, so its pid cannot be checked here, *and*
+      the claim carries a ``heartbeat`` field, meaning it was written by a
+      version that would have refreshed it had it been alive;
+    * anything else, including a claim from before heartbeating existed and a
+      pid that is still running: **not reclaimed**. ``--force-claim`` is the
+      deliberate gesture, and it is recorded.
     """
     claim = read_claim(path)
     if claim is None:
         return None
+    if not claim:
+        # Present but unreadable: nothing in it identifies an owner, so nothing
+        # in it can be evidence that the owner is dead.
+        return '--force-claim over an unreadable claim' if force else None
     try:
-        age = time.time() - os.path.getmtime(path)
+        touched = os.path.getmtime(path)
     except OSError:
-        return None
+        # The recorded heartbeat is the fallback, not a second opinion. Taking
+        # the later of the two would let a claim written on a host whose clock
+        # runs fast become permanently unreclaimable, and --force would be the
+        # only way out of an ordinary crash.
+        try:
+            touched = float(claim.get('heartbeat') or claim.get('epoch') or 0)
+        except (TypeError, ValueError):
+            return None
+    age = time.time() - touched
     other_sweep = claim.get('sweep') != sweep_id
-    if age > stale_seconds:
-        return f'stale ({age / 3600:.1f} h > {stale_seconds / 3600:.1f} h)'
-    if claim.get('state') == 'failed' and other_sweep:
-        return f'failed in sweep {claim.get("sweep")}'
     if force and other_sweep:
-        return f'--force over sweep {claim.get("sweep")}'
+        return f'--force-claim over sweep {claim.get("sweep")}'
+    if (claim.get('state') == 'failed' and other_sweep
+            and not claim.get('contended')):
+        return f'failed in sweep {claim.get("sweep")}'
+    if age <= stale_seconds:
+        return None
+    alive, evidence = _owner_liveness(claim)
+    if alive is True:
+        return None
+    stale = f'stale ({age / 3600:.1f} h > {stale_seconds / 3600:.1f} h)'
+    if alive is False:
+        return f'{stale}; {evidence}'
+    if claim.get('heartbeat') is not None:
+        return (f'{stale}; {evidence}, and the claim has gone unheartbeaten '
+                f'for longer than its own {claim.get("heartbeat_seconds")}s '
+                f'refresh interval')
     return None
 
 
@@ -524,18 +1377,18 @@ def claim_run(run_dir: str, sweep_id: str, worker: str, stale_seconds: int,
     lock file, no registry of live workers and no scheduler cleverness is needed,
     and the guarantee holds across independent invocations on the same tree --
     including a second sweep started by hand while the first is still running.
+    What that guarantee is worth depends entirely on `_reclaim_reason`, which is
+    the only thing that can hand an owned directory to somebody else.
 
-    Returns ``(acquired, note)``; ``note`` is 'claimed', a reclaim reason, or
-    'held by <pid>@<host>'.
+    Returns ``(acquired, note)``; ``note`` is 'claimed', a reclaim reason naming
+    the previous owner, or a description of who holds it and whether that owner
+    is still alive.
     """
+    owner = claim_owner(sweep_id, worker)
     os.makedirs(run_dir, exist_ok=True)
     path = os.path.join(run_dir, CLAIM_NAME)
-    payload = json.dumps({
-        'pid': os.getpid(), 'host': socket.gethostname(),
-        'time': time.strftime('%Y-%m-%dT%H:%M:%S'), 'epoch': time.time(),
-        'sweep': sweep_id, 'worker': worker, 'run_dir': run_dir,
-        'state': 'running',
-    }, sort_keys=True).encode('utf-8')
+    payload = json.dumps(_claim_payload(run_dir, owner),
+                         sort_keys=True).encode('utf-8')
 
     note = 'claimed'
     for attempt in (0, 1):
@@ -543,85 +1396,299 @@ def claim_run(run_dir: str, sweep_id: str, worker: str, stale_seconds: int,
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             if attempt:
-                return False, note
+                # The reclaim succeeded and somebody else claimed the directory
+                # in the gap. Saying 'reclaimed' here would report an ownership
+                # this process does not have.
+                return False, (f'lost the directory to another worker '
+                               f'immediately after {note}')
             reason = _reclaim_reason(path, stale_seconds, sweep_id, force)
             if reason is None:
-                held = read_claim(path) or {}
-                return False, (f'held by {held.get("pid")}@{held.get("host")} '
-                               f'(sweep {held.get("sweep")})')
+                return False, _held_note(path)
+            held = read_claim(path) or {}
+            superseded = (f'{path}.superseded-{int(time.time() * 1000)}-'
+                          f'{os.getpid()}')
             try:
                 # Rename rather than unlink: the rename is atomic, so if two
                 # workers judge the same claim stale only one of them can move
                 # it out of the way and the loser sees ENOENT.
-                os.replace(path, f'{path}.superseded-{int(time.time())}-'
-                                 f'{os.getpid()}')
+                os.replace(path, superseded)
             except OSError:
                 return False, 'lost the reclaim race'
-            note = f'reclaimed: {reason}'
+            # The rename has decided the race, and the previous owner travels
+            # into the note and from there into status.jsonl, so the file has
+            # nothing left to say. Keeping it only left litter.
+            _remove_quietly(superseded)
+            note = (f'reclaimed: {reason}; previous owner '
+                    f'{held.get("worker")}/{held.get("pid")}@'
+                    f'{held.get("host")} in sweep {held.get("sweep")}')
             continue
         try:
             os.write(fd, payload)
         finally:
             os.close(fd)
+        purge_claim_litter(run_dir)
         return True, note
     return False, note
 
 
 def claim_failed_here(run_dir: str, sweep_id: str) -> bool:
-    """Did this sweep already fail this run?
+    """Did this sweep already fail this run, in a way that is settled?
 
     Needed so that a *second* worker reaching a job another worker has already
     failed drops it silently instead of announcing it as blocked. Without this
     the later, weaker record ('held by pid 26500') overwrote the earlier, real
     one ('failed: refusing to resume ...') and the summary reported a failure as
     a blockage, with no log path to read.
+
+    A **contended** failure does not count. That is a worker that failed after
+    taking the directory over from somebody else, so the directory may well
+    still be in competent hands; treating it as settled would drop a job that is
+    about to finish.
     """
     claim = read_claim(os.path.join(run_dir, CLAIM_NAME)) or {}
-    return claim.get('state') == 'failed' and claim.get('sweep') == sweep_id
+    return (claim.get('state') == 'failed'
+            and claim.get('sweep') == sweep_id
+            and not claim.get('contended'))
 
 
-def release_claim(run_dir: str) -> None:
-    """Drop the claim on success. The manifest is now the durable evidence."""
-    try:
-        os.remove(os.path.join(run_dir, CLAIM_NAME))
-    except OSError:
-        pass
+def release_claim(run_dir: str, owner: Mapping) -> tuple[bool, str]:
+    """Drop *this process's* claim on success. The manifest is now the evidence.
 
-
-def fail_claim(run_dir: str, error: str) -> None:
-    """Leave the claim in place, marked failed, so nothing silently re-enters."""
-    path = os.path.join(run_dir, CLAIM_NAME)
-    claim = read_claim(path) or {}
-    claim.update(state='failed', error=error[:2000],
-                 failed_at=time.strftime('%Y-%m-%dT%H:%M:%S'))
-    try:
-        with open(path, 'w', encoding='utf-8') as fh:
-            json.dump(claim, fh, sort_keys=True)
-    except OSError:
-        pass
-
-
-def append_status(path: str, record: dict) -> None:
-    """Append one state transition.
-
-    A single ``os.write`` of a single short line into a descriptor opened
-    ``O_APPEND``: the append offset is taken by the kernel, so concurrent
-    workers interleave records rather than overwriting each other. Every record
-    is self-contained JSON, so a torn line -- which is possible, and not
-    pretended otherwise -- is detectable by the reader instead of corrupting its
-    neighbours.
+    The ownership test is the whole point of the signature change. Without it
+    this removed ``<run_dir>/.claim`` whoever had written it, and in P0 that is
+    exactly what happened: the original owner finished eleven minutes after a
+    second worker had reclaimed its directory, and its release deleted the
+    *second* worker's claim, because its own had already been renamed away. A
+    worker that no longer owns the directory says so and leaves the file alone.
     """
-    line = (json.dumps(record, sort_keys=True, default=str) + '\n').encode('utf-8')
+    path = os.path.join(run_dir, CLAIM_NAME)
+    claim = read_claim(path)
+    if claim is None:
+        return False, 'no claim to release'
+    if not _is_owner(claim, owner):
+        return False, (f'not released: the claim now belongs to '
+                       f'{claim.get("worker")}/{claim.get("pid")}@'
+                       f'{claim.get("host")} in sweep {claim.get("sweep")}')
+    try:
+        os.remove(path)
+    except OSError as exc:
+        return False, f'could not remove the claim: {exc}'
+    return True, 'released'
+
+
+def fail_claim(run_dir: str, error: str, owner: Mapping,
+               contended: bool = False) -> tuple[bool, str]:
+    """Mark *this process's* claim failed, so nothing silently re-enters it.
+
+    ``contended`` records that this worker took the directory over from somebody
+    else rather than claiming it fresh, and it is the difference between a
+    failed run and a failed reclaim. `dependency_state` blocks a consumer on the
+    first and defers it on the second. In P0 a ``PermissionError`` raised by two
+    trainers colliding over one ``metrics.jsonl`` was written here as a plain
+    failure, and the consumer of a source that was healthy and eleven minutes
+    from finishing was reported **blocked**, which under `DESIGN.md` §8.4 is a
+    terminal, non-zero-exit verdict.
+    """
+    path = os.path.join(run_dir, CLAIM_NAME)
+    claim = read_claim(path)
+    if claim is None:
+        return False, 'no claim to mark failed'
+    if not _is_owner(claim, owner):
+        return False, (f'not marked failed: the claim now belongs to '
+                       f'{claim.get("worker")}/{claim.get("pid")}@'
+                       f'{claim.get("host")} in sweep {claim.get("sweep")}')
+    claim.update(state='failed', error=str(error)[:2000],
+                 contended=bool(contended),
+                 failed_at=time.strftime('%Y-%m-%dT%H:%M:%S'))
+    tmp = f'{path}.fail-{os.getpid()}'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(_json_safe(claim), fh, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _remove_quietly(tmp)
+        return False, f'could not mark the claim failed: {exc}'
+    return True, 'marked failed'
+
+
+#: How long an appender waits for the cross-process lock before giving up and
+#: writing anyway. Every record here is a few hundred bytes, so the holder is
+#: never inside the lock for long; a wait this size is contention, not deadlock.
+_APPEND_LOCK_SECONDS = 20.0
+
+
+class _AppendLock:
+    """Serialise appends to one file across processes.
+
+    ``O_APPEND`` is **not** the guarantee this file used to claim it was. On
+    POSIX the kernel takes the offset and a short write is atomic, but on
+    Windows the CRT implements append as seek-to-end then write, and the two are
+    not one operation: two workers can take the same offset and one record
+    overwrites the other. Measured on this tree: six processes writing 200
+    records each into one ``status.jsonl`` lost **127 of 1200**, and every call
+    reported success, because losing the race is not an error anybody sees.
+
+    That is not a cosmetic loss. `summarise` reads ``status.jsonl`` for the
+    error and the log path of every failure, and a dropped ``failed`` record
+    makes a run report as "not finished" with neither; the DESIGN.md 4.3
+    rejection ledger goes through the same function, and a dropped row is a
+    rejected source seed missing from the results table §4.3 requires it to
+    appear in.
+
+    A sidecar ``<file>.lock`` holds a one-byte range lock: ``msvcrt.locking`` on
+    Windows, ``fcntl.flock`` elsewhere. Acquiring it is best effort. If it
+    cannot be taken within `_APPEND_LOCK_SECONDS` the write still happens, and
+    says so on stderr, because a status record that might be lost is worth more
+    than a runner that stops to wait for one. Every path that gives up on the
+    lock says so; the one that could not open the lock file at all used to
+    degrade in silence, which is the loss this class exists to prevent with the
+    single signal that would have revealed it suppressed.
+
+    **Not reentrant, and not cheaply made so.** ``msvcrt.locking`` and
+    ``fcntl.flock`` are both per descriptor and this opens a fresh one on each
+    acquisition, so taking the lock on a file this process already holds blocks
+    against itself for the full `_APPEND_LOCK_SECONDS` and then writes
+    unserialised anyway. No path nests today. Writing a status record from
+    inside a locked region would be one, so do not add it: log after the block,
+    not within it.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path + '.lock'
+        self.fd: Optional[int] = None
+        self.held = False
+
+    def __enter__(self) -> '_AppendLock':
+        try:
+            self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR)
+        except OSError as exc:
+            # The same degradation as the timeout below, and it is announced for
+            # the same reason: appending unserialised is the right fallback,
+            # doing it quietly is not. An antivirus sharing violation, a full or
+            # read-only _jobs directory and a path-length failure all land here.
+            print(f'[WARNING] could not open the append lock {self.path} '
+                  f'({exc}); appending unserialised, so a concurrent record '
+                  f'may be lost', file=sys.stderr, flush=True)
+            return self
+        deadline = time.time() + _APPEND_LOCK_SECONDS
+        delay = 0.002
+        while True:
+            try:
+                if os.name == 'nt':
+                    import msvcrt                       # noqa: PLC0415
+                    msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl                        # noqa: PLC0415
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.held = True
+                return self
+            except (OSError, ImportError):
+                if time.time() >= deadline:
+                    print(f'[WARNING] could not take the append lock on '
+                          f'{self.path} within {_APPEND_LOCK_SECONDS:.0f}s; '
+                          f'appending unserialised, so a concurrent record may '
+                          f'be lost', file=sys.stderr, flush=True)
+                    return self
+                time.sleep(delay)
+                delay = min(0.05, delay * 1.6)
+
+    def __exit__(self, *_exc) -> None:
+        if self.fd is None:
+            return
+        try:
+            if self.held:
+                if os.name == 'nt':
+                    import msvcrt                       # noqa: PLC0415
+                    os.lseek(self.fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl                        # noqa: PLC0415
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+        except (OSError, ImportError):
+            pass
+        finally:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+            self.held = False
+
+
+def append_status(path: str, record: dict) -> bool:
+    """Append one state transition. Returns whether it was actually written.
+
+    One ``os.write`` of one short self-contained JSON line, taken under the
+    cross-process lock of `_AppendLock` because ``O_APPEND`` alone does not
+    serialise appenders on Windows: see that class for the measurement. A torn
+    line is still possible if the lock could not be taken, and is still
+    detectable by the reader rather than corrupting its neighbours.
+
+    Three things it no longer does. It no longer returns as though it had
+    succeeded when every attempt failed: the retries were silent, so
+    `append_replacements` reported "wrote N source-validity rejection(s)" with
+    nothing on disk, and a dropped ``failed`` record made a run report as "not
+    finished" with no error and no log path. It no longer discovers a missing
+    parent directory one 1.05 s retry cycle at a time; the directory is created
+    once, up front, which is what a fixture with no ``_jobs/`` needed and did
+    not get. And it no longer loses roughly one record in ten under four
+    concurrent workers. And a short write no longer passes for a whole record:
+    the byte count is checked and the remainder written under the same lock.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            dropped = json.dumps(_json_safe(record), sort_keys=True,
+                                 default=str)
+            print(f'[ERROR] cannot create {parent} for '
+                  f'{os.path.basename(path)}: {exc}. The record below is '
+                  f'lost, not queued:\n  {dropped}',
+                  file=sys.stderr, flush=True)
+            return False
+    line = (json.dumps(_json_safe(record), sort_keys=True, default=str)
+            + '\n').encode('utf-8')
+    # O_BINARY keeps the descriptor out of the CRT's text mode. Without it
+    # Windows rewrites the buffer on the way through, which is why every record
+    # in the P0 log ends CRLF from a buffer that ends LF: the write is then not
+    # the single unmodified syscall this docstring describes, and the byte count
+    # it returns cannot be compared against the buffer at all.
+    flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, 'O_BINARY', 0)
+    last: Optional[OSError] = None
     for attempt in range(6):
         try:
-            fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY)
-            try:
-                os.write(fd, line)
-            finally:
-                os.close(fd)
-            return
-        except OSError:
+            with _AppendLock(path):
+                fd = os.open(path, flags)
+                try:
+                    written = 0
+                    while written < len(line):
+                        # The byte count used to be discarded. A short write
+                        # then left a truncated record that `read_status` skips
+                        # in silence: the same lost record the lock was added to
+                        # prevent, with no error anywhere. The remainder goes
+                        # out under the same lock, so it lands against the rest
+                        # of its own record; a write that accepts nothing is not
+                        # progress and is raised into the retry, which appends
+                        # the whole line afresh and leaves the torn prefix for
+                        # the reader to skip.
+                        n = os.write(fd, line[written:])
+                        if n <= 0:
+                            raise OSError(
+                                f'os.write accepted {n} of '
+                                f'{len(line) - written} remaining byte(s)')
+                        written += n
+                finally:
+                    os.close(fd)
+            return True
+        except OSError as exc:
+            last = exc
             time.sleep(0.05 * (attempt + 1))
+    print(f'[ERROR] could not append to {path} after 6 attempts ({last}). The '
+          f'record below is lost; the sweep summary reads this file, so treat '
+          f'its counts as incomplete:\n  {line.decode("utf-8").strip()}',
+          file=sys.stderr, flush=True)
+    return False
 
 
 def read_status(path: str, sweep_id: str | None = None) -> list[dict]:
@@ -646,15 +1713,34 @@ def read_status(path: str, sweep_id: str | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
-def dependency_state(rec: dict, pending: set[str], sweep_id: str,
-                     stale_seconds: int) -> tuple[str, str]:
+def dependency_state(rec: dict, pending: set[str],
+                     sweep_id: str) -> tuple[str, str]:
     """Classify a job's dependency as ready / wait / blocked.
 
     'blocked' is reserved for the cases where waiting cannot help: the source
     failed in this sweep, or it is not in the job list at all so nobody will
-    ever build it. Everything else waits, because the stale-claim rule makes
-    waiting self-healing -- a dead worker's claim expires and the waiting worker
-    takes the job over itself.
+    ever build it. Everything else waits, because the claim rule makes waiting
+    self-healing -- a dead worker's claim is taken over by the waiting worker
+    once there is evidence its owner is gone.
+
+    Two things no longer produce a 'blocked' verdict, because in P0 neither of
+    them meant what it was read to mean.
+
+    * A **contended** failure. `fail_claim` records whether the worker had taken
+      the directory over from somebody else; a failure that follows a reclaim
+      may be the collision rather than the run. In P0 a ``PermissionError`` from
+      two trainers colliding over one ``metrics.jsonl`` was read here as "source
+      run failed in this sweep" and the consumer of a healthy source that
+      finished eleven minutes later was reported blocked, which is terminal and
+      exits non-zero.
+    * A claim that exists but **cannot be read**. `claim_run` creates the file
+      and writes the payload in two steps, so an empty claim means a claim being
+      made, not the absence of one. The old ``if claim:`` read it as absence and
+      could send a consumer straight to 'blocked'.
+
+    ``stale_seconds`` used to be a parameter here and was never read: a dead
+    argument advertising a staleness check on dependencies that does not exist.
+    It is gone. Waiting is what handles a stale dependency.
     """
     dep = rec.get('depends_on')
     if not dep:
@@ -667,8 +1753,16 @@ def dependency_state(rec: dict, pending: set[str], sweep_id: str,
         return 'ready', ''
 
     claim = read_claim(os.path.join(dep, CLAIM_NAME))
-    if claim:
+    if claim is not None:
+        if not claim:
+            return 'wait', (f'source run is claimed but the claim is not yet '
+                            f'readable, so it is being written now: {dep}')
         if claim.get('state') == 'failed' and claim.get('sweep') == sweep_id:
+            if claim.get('contended'):
+                return 'wait', (
+                    f'source run failed after a contested claim, so the '
+                    f'failure may be the collision rather than the run; '
+                    f'waiting for whoever owns it now: {dep}')
             return 'blocked', f'source run failed in this sweep: {dep}'
         return 'wait', f'source run in progress: {dep}'
     if dep in pending:
@@ -697,13 +1791,25 @@ def source_score(run_dir: str) -> tuple[str, Optional[float]]:
     on a multiplicative fraction of the registered threshold, which at Acrobot's
     -100 would demand -60 and so be harder than solving the task.
 
-    Three states, kept apart on purpose:
+    Four states, kept apart on purpose:
 
-    * ``unrun``    -- no manifest. Nothing is known; the run is still to do.
-    * ``unscored`` -- a manifest with no ``final_score``. The run finished
+    * ``unrun``      -- no manifest. Nothing is known; the run is still to do.
+    * ``unscored``   -- a manifest with no ``final_score``. The run finished
       without producing the number the gate is defined on, so the gate cannot be
       applied. That is reported, never read as a pass.
-    * ``scored``   -- the score.
+    * ``unmeasured`` -- a ``final_score`` that is present but is not a finite
+      number: NaN from a degenerate evaluation, an infinity, or something that
+      is not a number at all. This state exists because ``float('nan') >= 0.6``
+      is ``False`` in Python, so leaving such a value to the comparison
+      classified a **measurement failure** as a source-quality *rejection*: it
+      consumed a RESERVE seed and wrote ``"score": NaN`` into the ledger
+      `DESIGN.md` 4.3 requires the results table to be built from.
+    * ``scored``     -- the score.
+
+    Only ``scored`` reaches the gate. The other three are refusals, because a
+    source with no validity verdict is exactly the thing 4.3 forbids transfer
+    from, and `float()` raising on a string here would have aborted the planner
+    rather than reported the manifest.
     """
     result = manifest_result(run_dir)
     if result is None:
@@ -711,7 +1817,13 @@ def source_score(run_dir: str) -> tuple[str, Optional[float]]:
     score = result.get('final_score')
     if score is None:
         return 'unscored', None
-    return 'scored', float(score)
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return 'unmeasured', None
+    if not math.isfinite(value):
+        return 'unmeasured', None
+    return 'scored', value
 
 
 @dataclass
@@ -744,15 +1856,128 @@ class SourceSlot:
         return self.seed != self.default_seed
 
     def verdict(self, gate: float) -> str:
-        """One of 'valid', 'rejected', 'unrun', 'unscored'."""
+        """One of 'valid', 'rejected', 'unrun', 'unscored', 'unmeasured'.
+
+        The comparison is reached only from a finite score. Everything else
+        returns the state it is in, and the caller refuses rather than resolving
+        it: an ungated state is neither a pass (which would be transfer from a
+        source of unknown competence, `DESIGN.md` 4.3's central defect) nor a
+        rejection (which would spend a RESERVE seed on a broken evaluation and
+        report a measurement failure to the results table as a source-quality
+        verdict).
+        """
         if self.state != 'scored':
             return self.state
+        if self.score is None or not math.isfinite(self.score):
+            return 'unmeasured'
         return 'valid' if self.score >= gate else 'rejected'
+
+    def gated(self, gate: float) -> bool:
+        """Did the DESIGN.md 4.3 gate actually return a verdict on this slot?"""
+        return self.verdict(gate) in ('valid', 'rejected')
 
     def describe(self) -> str:
         return (f'{self.arm} s{self.seed:02d} ({self.cell} on {self.env})'
                 + (f' [replaces s{self.default_seed:02d}]' if self.replaced
                    else ''))
+
+
+#: The slot states that are not a gate verdict. `DESIGN.md` 4.3 defines
+#: validity on the normalised final score, so a slot in any of these has no
+#: verdict at all: not valid, not rejected, and not something phase 2 may run
+#: against.
+UNGATED_STATES = ('unrun', 'unscored', 'unmeasured')
+
+#: The gate value that means "no gate was applied to this selection". Not a
+#: threshold anybody chose: every finite score clears it, so no slot is ever
+#: rejected under it and no RESERVE seed is ever drawn. `main` resolves the gate
+#: to this only for a selection made entirely of SMOKE-block pipeline
+#: validation at SMOKE-block seeds, which reports nothing and trains 12
+#: episodes; `DESIGN.md` 4.3 defines validity on the normalised final score of a
+#: source trained to the design's budget, and 12 episodes is not that budget.
+#: The states that are measurement failures, `UNGATED_STATES`, still refuse
+#: under it, because those say the pipeline is broken rather than the source.
+GATE_NOT_APPLIED = -math.inf
+
+
+def gate_text(gate: float) -> str:
+    """The gate as a printed phrase, so that no line ever prints '-inf'.
+
+    `GATE_NOT_APPLIED` renders through ``:.3f`` as ``-inf``, which reads like a
+    number somebody typed rather than the absence of a threshold.
+    """
+    if math.isfinite(gate):
+        return f'normalised final score >= {gate:.3f}'
+    return 'NOT APPLIED (SMOKE-block pipeline validation selection)'
+
+
+def ungated_sources(slots: Sequence[SourceSlot], gate: float) -> list[dict]:
+    """Sources phase 1 finished without producing a validity verdict for.
+
+    Reached only after the source phase has run, where it means what the earlier
+    version never noticed: a source run that completed and did not produce
+    ``result.final_score``. That slot is not in phase 1's ``due`` list, because
+    its manifest reports its episodes done; it is not 'rejected', so no RESERVE
+    seed is drawn and no ledger row is written; and it is not 'valid', so
+    nothing licenses the transfer runs that depend on it. The whole target side
+    was trained against it and `main` returned 0.
+    """
+    rows: list[dict] = []
+    for slot in slots:
+        state = slot.verdict(gate)
+        if state not in UNGATED_STATES:
+            continue
+        rows.append({
+            'state': state, 'lineage': slot.lineage, 'source_arm': slot.arm,
+            'cell': slot.cell, 'source_env': slot.env,
+            'experiment': slot.experiment, 'seed': slot.seed,
+            'default_seed': slot.default_seed, 'run_dir': slot.run_dir,
+            'run_digest': slot.run_digest,
+            'consumers': sorted(set(slot.consumers)),
+            'describe': slot.describe(),
+            'reason': {
+                'unrun': 'the source run has no manifest',
+                'unscored': ('the source run finished but its manifest carries '
+                             'no result.final_score, which is the quantity '
+                             'DESIGN.md 4.3 defines validity on'),
+                'unmeasured': ('the source run reported a final_score that is '
+                               'not a finite number, so the evaluation failed '
+                               'rather than the source'),
+            }[state]})
+    return rows
+
+
+def print_ungated_sources(rows: Sequence[dict], gate: float) -> None:
+    """Name every source that phase 2 would otherwise be run against blind."""
+    if not rows:
+        return
+    print('\n' + '=' * 72)
+    print(f'[ERROR] {len(rows)} source slot(s) have no validity verdict '
+          f'(DESIGN.md 4.3)')
+    print('=' * 72)
+    print(f'  Gate: {gate_text(gate)}. These slots were never gated at')
+    print('  all, so they are neither valid nor rejected: no RESERVE seed is '
+          'drawn for them,')
+    print('  because a measurement failure is not a source-quality verdict and '
+          'spending a')
+    print('  replacement seed on one would put a number in the results table '
+          'that does not')
+    print('  mean what the column says.')
+    for row in rows:
+        print(f'\n  {row["state"].upper():10s} {row["describe"]}')
+        print(f'    reason:    {row["reason"]}')
+        print(f'    directory: {row["run_dir"]}')
+        print(f'    {len(row["consumers"])} dependent run(s) would be trained '
+              f'against it')
+    print('\n  Phase 2 is not started. Transfer from a source whose competence '
+          'was never')
+    print('  established is the published study\'s central defect and the '
+          'reason DESIGN.md 4.3')
+    print('  exists. Find out why the source produced no score (the worker log '
+          'names the run),')
+    print('  fix it, and re-run; or pass --allow-invalid-sources to proceed '
+          'deliberately, which')
+    print('  is stamped into the invocation record.')
 
 
 def source_slots(records: Sequence[dict]) -> list[SourceSlot]:
@@ -817,9 +2042,14 @@ def append_replacements(path: str, rows: Sequence[dict]) -> int:
     """
     known = {_replacement_key(r) for r in read_replacements(path)}
     fresh = [r for r in rows if _replacement_key(r) not in known]
-    for row in fresh:
-        append_status(path, row)
-    return len(fresh)
+    written = sum(1 for row in fresh if append_status(path, row))
+    if written != len(fresh):
+        print(f'[ERROR] {len(fresh) - written} of {len(fresh)} '
+              f'source-validity rejection(s) could not be written to {path}. '
+              f'DESIGN.md 4.3 requires the rejected seeds in the results '
+              f'table, and a rejection that exists only in this scrollback is '
+              f'not reportable.', file=sys.stderr, flush=True)
+    return written
 
 
 def resolve_source_assignment(
@@ -924,7 +2154,14 @@ def resolve_source_assignment(
                 'rejected_seed_block': seed_block(slot.seed),
                 'rejected_run_dir': slot.run_dir,
                 'rejected_run_digest': slot.run_digest,
+                # Only a finite score reaches this row: `SourceSlot.verdict`
+                # never returns 'rejected' for a non-finite one, and
+                # `append_status` writes any that slipped through as null
+                # rather than as the bare NaN token json.dumps emits, which no
+                # strict JSON reader accepts. `score_state` says which state
+                # produced the number so the table never has to infer it.
                 'score': slot.score,
+                'score_state': slot.state,
                 'default_seed': slot.default_seed,
                 'replacement_seed': nxt,
                 'consumers': sorted(set(slot.consumers)),
@@ -1059,14 +2296,27 @@ def print_source_phase(slots: Sequence[SourceSlot], records: Sequence[dict],
     for sl in slots:
         v = sl.verdict(gate)
         tally[v] = tally.get(v, 0) + 1
-    drawn = {int(r['replacement_seed']) for r in ledger
-             if r.get('replacement_seed') is not None}
-    drawn |= {int(r['replacement_seed']) for r in new_rejections
-              if r.get('replacement_seed') is not None}
+    # Per lineage, not pooled. The reserve pool is applied *per lineage* (see
+    # the `used` set in `resolve_source_assignment`), so counting the union of
+    # replacement seeds across lineages answered a question nobody asked: two
+    # lineages that both drew seed 400 reported "1 drawn, 19 unused" after two
+    # allocations, and 80 allocations across 4 lineages reported "20 drawn, 0
+    # unused". This line is the operator's only running view of how close
+    # RESERVE is to exhausting, and it understated consumption by up to a factor
+    # of the lineage count.
+    drawn: dict[str, set[int]] = {}
+    for row in list(ledger) + list(new_rejections):
+        seed = row.get('replacement_seed')
+        if seed is None:
+            continue
+        drawn.setdefault(str(row.get('lineage')), set()).add(int(seed))
+    allocations = sum(len(seeds) for seeds in drawn.values())
+    deepest = max(drawn.items(), key=lambda kv: (len(kv[1]), kv[0])) \
+        if drawn else None
 
     print('\ntwo-phase structure (DESIGN.md 4.3, source validity):')
-    print(f'  gate:      normalised final score >= {gate:.3f} on the source '
-          f'environment')
+    print(f'  gate:      {gate_text(gate)}'
+          + (' on the source environment' if math.isfinite(gate) else ''))
     print(f'  phase 1    {len(sources)} source run(s) over {len(lineages)} '
           f'lineage(s); {sum(1 for r in sources if is_complete(r))} complete, '
           f'{sum(1 for r in sources if not is_complete(r))} to run')
@@ -1076,9 +2326,14 @@ def print_source_phase(slots: Sequence[SourceSlot], records: Sequence[dict],
         v = sl.verdict(gate)
         if v == 'valid':
             continue
-        detail = (f'score {sl.score:.3f} < {gate:.3f}' if v == 'rejected'
-                  else ('no manifest yet' if v == 'unrun'
-                        else 'manifest carries no final_score'))
+        detail = {
+            'rejected': (f'score {sl.score:.3f} < {gate:.3f}'
+                         if sl.score is not None else 'below the gate'),
+            'unrun': 'no manifest yet',
+            'unscored': 'manifest carries no final_score: NOT a pass',
+            'unmeasured': ('final_score is not a finite number, so the '
+                           'evaluation failed rather than the source'),
+        }.get(v, v)
         print(f'               {v.upper():8s} {sl.describe()}  {detail}')
     for row in new_rejections:
         print(f'               -> RESERVE seed {row["replacement_seed"]} for '
@@ -1086,8 +2341,25 @@ def print_source_phase(slots: Sequence[SourceSlot], records: Sequence[dict],
               f'{row["score"]:.3f}); {len(row["consumers"])} dependent run(s) '
               f're-pointed')
     print(f'             RESERVE: {len(reserve)} seed(s) {reserve[0]}-'
-          f'{reserve[-1]}; {len(drawn)} drawn, {len(reserve) - len(drawn)} '
-          f'unused')
+          f'{reserve[-1]}, available to EACH lineage; {allocations} '
+          f'allocation(s) across {len(drawn)} lineage(s)')
+    if deepest is not None:
+        # Named by the arm rather than the lineage key: the key is a digest, and
+        # an operator watching the reserve drain needs to know which cell it is.
+        lineage_arm = {sl.lineage: sl.arm for sl in slots}
+        print(f'               deepest: {lineage_arm.get(deepest[0], deepest[0])}'
+              f' has drawn {len(deepest[1])} of {len(reserve)} '
+              f'({len(reserve) - len(deepest[1])} left before that lineage '
+              f'exhausts)')
+    ungated = [sl for sl in slots if not sl.gated(gate)
+               and sl.verdict(gate) != 'unrun']
+    if ungated:
+        print(f'             [REFUSAL] {len(ungated)} slot(s) have no validity '
+              f'verdict at all. DESIGN.md 4.3 is')
+        print('             defined on the normalised final score; a slot '
+              'without one is neither')
+        print('             valid nor rejected, so no RESERVE seed is drawn '
+              'and phase 2 does not start.')
     print(f'  phase 2    {len(records) - len(sources)} run(s) outside phase 1; '
           f'{len(consumers)} depend on a phase-1 source, {len(repointed)} of '
           f'them on a replacement')
@@ -1127,6 +2399,14 @@ def worker_main(args: argparse.Namespace) -> int:
     start at N different points and contend less. Rotation is safe because the
     list is in dependency order only as a hint: readiness is checked against the
     filesystem, never against position.
+
+    "Nothing left that this worker can do" has two endings and they are not the
+    same fact. **Blocked** is `DESIGN.md` §8.4's terminal verdict and is
+    reserved for jobs waiting cannot help: a source that failed in this sweep,
+    or a dependency nobody will ever build. A job held by an owner that is
+    demonstrably alive is the other ending: the worker stops waiting, says so,
+    and exits 0, because every worker reads the whole job list and whoever holds
+    the claim is the worker that will finish it.
     """
     records = read_jobs(args.jobs_file)
     if not records:
@@ -1134,6 +2414,16 @@ def worker_main(args: argparse.Namespace) -> int:
         return 0
     status_path = os.path.join(os.path.dirname(args.jobs_file), STATUS_FILE)
     worker = f'w{args.worker_id:02d}'
+    # The identity every claim this worker writes carries, and the identity
+    # `release_claim` and `fail_claim` check before touching a claim file. In P0
+    # neither call checked, so a worker's successful completion deleted another
+    # worker's claim.
+    owner = claim_owner(args.sweep_id, worker)
+    # Two unrelated powers, deliberately not one flag. `--force` re-enters a
+    # directory whose manifest is already complete; `--force-claim` takes a
+    # directory away from a claim another sweep holds, including one whose owner
+    # is demonstrably alive, which is the P0 corruption made deliberate. See
+    # `build_parser`.
     max_wait = args.max_wait_seconds or (args.stale_seconds + 300)
 
     def log(state: str, rec: dict, **extra) -> None:
@@ -1147,10 +2437,13 @@ def worker_main(args: argparse.Namespace) -> int:
 
     offset = args.worker_id % len(records)
     remaining = records[offset:] + records[:offset]
-    all_dirs = {r['run_dir'] for r in records}
     deferral_reason: dict[str, str] = {}
     failures: list[str] = []
     blocked: list[str] = []
+    # Jobs this worker stopped waiting for because somebody else is visibly
+    # training them. Counted apart from `blocked` on purpose: one is a terminal
+    # verdict and the other is the ordinary tail of a parallel stage.
+    waiting: list[str] = []
     ran = skipped = 0
     idle_seconds = 0.0
 
@@ -1179,8 +2472,7 @@ def worker_main(args: argparse.Namespace) -> int:
                 progressed = True
                 continue
 
-            state, why = dependency_state(rec, pending, args.sweep_id,
-                                          args.stale_seconds)
+            state, why = dependency_state(rec, pending, args.sweep_id)
             if state == 'blocked':
                 log('blocked', rec, reason=why)
                 blocked.append(rec['job_id'])
@@ -1196,14 +2488,19 @@ def worker_main(args: argparse.Namespace) -> int:
                 continue
 
             acquired, note = claim_run(run_dir, args.sweep_id, worker,
-                                       args.stale_seconds, args.force)
+                                       args.stale_seconds, args.force_claim)
             if not acquired:
                 if deferral_reason.get(run_dir) != note:
                     log('deferred', rec, reason=note)
                     deferral_reason[run_dir] = note
                 deferred.append(rec)
                 continue
-            if note != 'claimed':
+            # Whether this directory was taken over from somebody else. It
+            # travels into `fail_claim`, where it is the difference between a
+            # failed run and a failed reclaim, and `dependency_state` refuses to
+            # block a consumer on the second.
+            contended = note != 'claimed'
+            if contended:
                 log('reclaimed', rec, reason=note)
                 print(f'{worker}: reclaimed {rec["job_id"]} -- {note}',
                       flush=True)
@@ -1213,29 +2510,59 @@ def worker_main(args: argparse.Namespace) -> int:
                   f'{rec["arm"]} seed {rec["seed"]} ({rec["seed_block"]}) '
                   f'on {rec["env"]} ===', flush=True)
             t0 = time.time()
+            # The heartbeat runs for exactly as long as the training call. It is
+            # what makes the claim's age mean "how long since the owner was last
+            # alive" rather than "how long ago this run started", which is the
+            # reading that took a 14.4 h run away from its owner at 14.2 h in P0.
             try:
-                manifest = run_one(rec['config'])
+                with ClaimHeartbeat(run_dir, owner) as beat:
+                    manifest = run_one(rec['config'])
             except BaseException as exc:                   # noqa: BLE001
                 traceback.print_exc()
-                fail_claim(run_dir, f'{type(exc).__name__}: {exc}')
+                marked, why_mark = fail_claim(
+                    run_dir, f'{type(exc).__name__}: {exc}', owner,
+                    contended=contended)
                 log('failed', rec, error=f'{type(exc).__name__}: {exc}',
-                    wall_time_s=round(time.time() - t0, 1))
+                    wall_time_s=round(time.time() - t0, 1),
+                    contended=contended, claim_marked=marked,
+                    claim_note=why_mark)
                 failures.append(rec['job_id'])
                 print(f'{worker}: FAILED {rec["job_id"]}: '
-                      f'{type(exc).__name__}: {exc}', flush=True)
+                      f'{type(exc).__name__}: {exc}'
+                      + ('  (after a contested claim: the failure may be the '
+                         'collision, not the run)' if contended else ''),
+                      flush=True)
+                if not marked:
+                    print(f'{worker}: claim not marked failed -- {why_mark}',
+                          flush=True)
                 if isinstance(exc, KeyboardInterrupt):
                     return 130
             else:
-                release_claim(run_dir)
+                if beat.lost_reason:
+                    # Should be unreachable without --force now that a live
+                    # claim is not reclaimable, but a run that finished without
+                    # owning its directory is not an ordinary success and is not
+                    # reported as one.
+                    log('claim_lost', rec, reason=beat.lost_reason,
+                        wall_time_s=round(time.time() - t0, 1))
+                    print(f'{worker}: WARNING {rec["job_id"]} finished but lost '
+                          f'its claim while training -- {beat.lost_reason}',
+                          flush=True)
+                released, why_release = release_claim(run_dir, owner)
                 result = manifest.get('result') or {}
                 log('done', rec, wall_time_s=round(time.time() - t0, 1),
                     episodes_completed=result.get('episodes_completed'),
                     final_score=result.get('final_score'),
-                    auc_score=result.get('auc_score'))
+                    auc_score=result.get('auc_score'),
+                    heartbeats=beat.beats, claim_released=released,
+                    claim_note=why_release)
                 ran += 1
                 print(f'{worker}: done {rec["job_id"]} in '
                       f'{time.time() - t0:.0f}s  final_score='
                       f'{result.get("final_score")}', flush=True)
+                if not released:
+                    print(f'{worker}: claim not released -- {why_release}',
+                          flush=True)
             progressed = True
 
         remaining = deferred
@@ -1245,18 +2572,59 @@ def worker_main(args: argparse.Namespace) -> int:
             idle_seconds = 0.0
             continue
         if idle_seconds >= max_wait:
+            # **blocked** is terminal under `DESIGN.md` §8.4: the sweep says
+            # this run will never happen and exits non-zero. Running out of
+            # patience is not that. When the directory a job needs is held by an
+            # owner this host can see running, the job is *waiting*, and on a
+            # six-worker campaign whose runs take hours that is the predictable
+            # end of every stage: the last few claims stay with the workers
+            # still training, and everybody else runs out of things they may
+            # start. Recording those as blocked made five of six workers exit 1
+            # with a terminal verdict on runs that were training normally, which
+            # is the runner-manufactured false verdict the contended-failure
+            # rule was written to remove. The liveness evidence is the same
+            # evidence `_reclaim_reason` requires, so the two agree by
+            # construction: what may not be reclaimed may not be declared dead.
+            stopped: list[dict] = []
             for rec in remaining:
                 why = (f'still waiting after {idle_seconds:.0f}s: '
                        f'{deferral_reason.get(rec["run_dir"], "unknown")}')
+                where, holder = 'this run', live_claim_holder(rec['run_dir'])
+                dep = rec.get('depends_on')
+                if holder is None and dep:
+                    holder = live_claim_holder(dep)
+                    where = f'its source run {dep}'
+                if holder is not None:
+                    log('waiting', rec, reason=f'{why}; {where} is held by a '
+                                               f'live owner: {holder}')
+                    waiting.append(rec['job_id'])
+                    stopped.append(rec)
+                    print(f'{worker}: waiting {rec["job_id"]} -- {where} is '
+                          f'held by {holder}; leaving it to that worker',
+                          flush=True)
+                    continue
                 log('blocked', rec, reason=why)
                 blocked.append(rec['job_id'])
                 print(f'{worker}: BLOCKED {rec["job_id"]} -- {why}', flush=True)
+            if stopped:
+                print(f'{worker}: {len(stopped)} job(s) left in another '
+                      f'worker\'s hands after {idle_seconds:.0f}s. Not '
+                      f'blocked: their owners are alive, so this is contention '
+                      f'and not a verdict. Whoever holds them finishes them, '
+                      f'or they are reported unfinished by the parent, which '
+                      f'reads the manifests on disk.', flush=True)
             break
         time.sleep(args.poll_seconds)
         idle_seconds += args.poll_seconds
 
     print(f'\n{worker}: ran {ran}, skipped {skipped}, failed '
-          f'{len(failures)}, blocked {len(blocked)}', flush=True)
+          f'{len(failures)}, blocked {len(blocked)}, left with a live owner '
+          f'{len(waiting)}', flush=True)
+    # A job left with a live owner is not this worker's failure and does not
+    # make it one. The parent decides the sweep from the manifests on disk, so
+    # an unfinished run is still reported unfinished and still exits non-zero
+    # there; what it is not is a terminal BLOCKED record against a run that is
+    # training normally.
     return 1 if (failures or blocked) else 0
 
 
@@ -1265,7 +2633,7 @@ def worker_main(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 def spawn_workers(args: argparse.Namespace, jobs_path: str,
                   n_jobs: int, tag: str = ''
-                  ) -> list[tuple[subprocess.Popen, str, str]]:
+                  ) -> list[tuple[subprocess.Popen, str, str, IO[str]]]:
     """Launch worker interpreters with pinned threads and a fixed hash seed.
 
     Left unpinned, every TensorFlow process claims all cores and they thrash,
@@ -1286,6 +2654,9 @@ def spawn_workers(args: argparse.Namespace, jobs_path: str,
     log_dir = os.path.join(args.out_root, LOGS_SUBDIR)
     os.makedirs(log_dir, exist_ok=True)
 
+    # The log handle travels with the process so `run_stage` can close it. It
+    # used to be opened here and dropped, leaking one descriptor per worker per
+    # phase for the life of the parent: every phase-1 stage plus phase 2.
     procs = []
     for i in range(n_jobs):
         cmd = [sys.executable, os.path.abspath(__file__),
@@ -1296,6 +2667,8 @@ def spawn_workers(args: argparse.Namespace, jobs_path: str,
                '--max-wait-seconds', str(args.max_wait_seconds)]
         if args.force:
             cmd.append('--force')
+        if args.force_claim:
+            cmd.append('--force-claim')
         # The tag separates the phases' logs. Without it the source phase's
         # workers and the target phase's would overwrite each other's log and
         # the failure that stopped a source would be unreadable by the time
@@ -1305,7 +2678,7 @@ def spawn_workers(args: argparse.Namespace, jobs_path: str,
         fh = open(path, 'w', encoding='utf-8')
         proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
                                 env=env, cwd=_ROOT)
-        procs.append((proc, path, f'w{i:02d}'))
+        procs.append((proc, path, f'w{i:02d}', fh))
         print(f'  worker w{i:02d}  pid {proc.pid}  {threads} threads  -> {path}')
     return procs
 
@@ -1316,7 +2689,7 @@ def wait_for_workers(procs, status_path: str, sweep_id: str,
     codes: dict[str, int] = {}
     last = time.time()
     while len(codes) < len(procs):
-        for proc, _path, name in procs:
+        for proc, _path, name, _fh in procs:
             if name in codes:
                 continue
             code = proc.poll()
@@ -1354,11 +2727,18 @@ def run_stage(args: argparse.Namespace, records: Sequence[dict], tag: str,
     print(f'\nlaunching {n_jobs} worker(s) for {len(records)} job(s) '
           f'[{tag}] -> {path}')
     procs = spawn_workers(args, path, n_jobs, tag)
-    log_paths = {name: log for _proc, log, name in procs}
+    log_paths = {name: log for _proc, log, name, _fh in procs}
     started = time.time()
-    codes = wait_for_workers(procs, status_path, args.sweep_id,
-                             args.progress_seconds)
-    for _proc, log, name in procs:
+    try:
+        codes = wait_for_workers(procs, status_path, args.sweep_id,
+                                 args.progress_seconds)
+    finally:
+        for _proc, _log, _name, fh in procs:
+            try:
+                fh.close()
+            except OSError:
+                pass
+    for _proc, log, name, _fh in procs:
         print(f'  {name}: exit {codes.get(name)}  {log}')
     print(f'  [{tag}] workers finished in {(time.time() - started) / 60:.1f} min')
     return codes, log_paths
@@ -1373,6 +2753,22 @@ def summarise(records: Sequence[dict], status_path: str, sweep_id: str,
     which error, which log to read. A pending job with no terminal record is
     reported as unfinished rather than assumed fine, because "the runner exited
     0 and an arm is missing runs" is the failure this file exists to prevent.
+
+    "Disk is the authority" now includes the run's own integrity verdict. A
+    manifest reporting its full episode budget alongside ``contiguous: false``
+    used to be counted under "complete now"; it is its own category here, and it
+    makes the exit code non-zero.
+
+    It also reports what happened to the *claims*. ``reclaimed``, ``claim_lost``
+    and a **contended** failure are the three records that say a run directory
+    changed hands, and none of them reached this summary: a failure caused by a
+    collision printed exactly as a failure of the run, and a directory taken
+    over mid-flight and then finished printed as an ordinary success. That is
+    the distinction the contended-failure rule exists to make, so an operator
+    who can only see the summary could not make it. None of the three changes
+    the exit code on its own: the manifests decide that, and a directory two
+    trainers really did write is caught by the metrics integrity check as an
+    unsound manifest, which is non-zero already.
     """
     status = read_status(status_path, sweep_id)
     events: dict[str, list[dict]] = {}
@@ -1385,13 +2781,22 @@ def summarise(records: Sequence[dict], status_path: str, sweep_id: str,
         return hits[-1] if hits else None
 
     done, skipped, elsewhere, failed, blocked, unfinished = [], [], [], [], [], []
+    unsound: list[tuple[dict, str]] = []
     for rec in records:
         # Severity, not recency. Several workers may report on one run, and the
         # last record is not the most informative one: a worker that merely
         # found the directory held must not overwrite the worker that recorded
         # the exception and the log to read it in.
         run_dir = rec['run_dir']
-        if is_complete(rec):
+        state, why = completion_state(rec)
+        if state == 'unsound':
+            # Named rather than folded into 'not finished'. A run that reached
+            # its budget and then failed its own metrics integrity check is a
+            # different fact from a run that never started, and
+            # 'not finished (last state: done)' is how that fact used to read.
+            unsound.append((rec, why))
+            continue
+        if state == 'complete':
             if latest(run_dir, 'done'):
                 done.append((rec, 'done'))
             elif latest(run_dir, 'skipped'):
@@ -1420,7 +2825,20 @@ def summarise(records: Sequence[dict], status_path: str, sweep_id: str,
              if elsewhere else '') + ')')
     print(f'  failed             {len(failed):4d}')
     print(f'  blocked            {len(blocked):4d}')
+    print(f'  unsound manifest   {len(unsound):4d}')
     print(f'  not finished       {len(unfinished):4d}')
+
+    # The claim history, from the whole status log rather than per job: a
+    # directory can be reclaimed by one worker and finished by another, so these
+    # are facts about the sweep, not about a single record's latest state.
+    reclaimed = [ev for ev in status if ev.get('state') == 'reclaimed']
+    claim_lost = [ev for ev in status if ev.get('state') == 'claim_lost']
+    contended = [ev for _rec, ev in failed if ev.get('contended')]
+    waited = [ev for ev in status if ev.get('state') == 'waiting']
+    if reclaimed or claim_lost or contended or waited:
+        print(f'  claim events       {len(reclaimed)} reclaimed, '
+              f'{len(claim_lost)} lost mid-run, {len(contended)} contended '
+              f'failure(s), {len(waited)} left with a live owner')
 
     if failed:
         print('\nFailures -- read the worker log, then fix the cause; the run '
@@ -1432,11 +2850,44 @@ def summarise(records: Sequence[dict], status_path: str, sweep_id: str,
             print(f'    error: {ev.get("error")}')
             print(f'    log:   {log_paths.get(ev.get("worker"), "?")}')
             print(f'    run:   {rec["run_dir"]}')
+            if ev.get('contended'):
+                # Printed here rather than counted only, because this is the one
+                # place an operator reads a failure. Without it a collision and
+                # a real failure were character for character the same block.
+                print('    CONTENDED: this worker took the directory over from '
+                      'another before it')
+                print('    failed, so the failure may be the collision rather '
+                      'than the run. Its')
+                print('    dependants were deferred, not blocked. A reclaim '
+                      'over a live owner needs')
+                print('    --force-claim, so check whether that was passed '
+                      'before reading the error.')
     if blocked:
         print('\nBlocked -- reported, never skipped silently (DESIGN.md §8.4):')
         for rec, ev in blocked:
             print(f'  {rec["job_id"]}  {rec["experiment"]}/{rec["arm"]} '
                   f'seed {rec["seed"]}: {ev.get("reason")}')
+    if reclaimed or claim_lost:
+        print('\nClaim events -- a run directory that changed hands. Two '
+              'trainers in one directory is')
+        print('the P0 corruption (DESIGN.md 8.2(1)); the metrics integrity '
+              'check is what catches it,')
+        print('and these lines say where to look:')
+        for ev in reclaimed:
+            print(f'  reclaimed   {ev.get("job_id")}  by {ev.get("worker")}: '
+                  f'{ev.get("reason")}')
+        for ev in claim_lost:
+            print(f'  lost mid-run {ev.get("job_id")}  {ev.get("worker")} '
+                  f'finished without owning its directory: {ev.get("reason")}')
+    if unsound:
+        print('\nUnsound manifest -- the budget was reached but the run failed '
+              'its own metrics integrity check, so it is neither complete nor '
+              'safely resumable (DESIGN.md 8.2(1)):')
+        for rec, why in unsound:
+            print(f'  {rec["job_id"]}  {rec["experiment"]}/{rec["arm"]} '
+                  f'seed {rec["seed"]}')
+            print(f'    reason: {why}')
+            print(f'    run:    {rec["run_dir"]}')
     if unfinished:
         print('\nNot finished -- no terminal record and no complete manifest. '
               'Re-run with --resume:')
@@ -1446,7 +2897,7 @@ def summarise(records: Sequence[dict], status_path: str, sweep_id: str,
         if len(unfinished) > 20:
             print(f'  ... and {len(unfinished) - 20} more')
 
-    ok = not (failed or blocked or unfinished)
+    ok = not (failed or blocked or unfinished or unsound)
     print('\n' + ('all jobs complete. Next: experiments/aggregate.py'
                   if ok else 'sweep incomplete -- see above.'))
     print('=' * 72)
@@ -1456,7 +2907,13 @@ def summarise(records: Sequence[dict], status_path: str, sweep_id: str,
 def print_plan(records: Sequence[dict], exp_ids: Sequence[str],
                membership: dict[str, list[str]], seeds, n_jobs: int,
                verbose: bool) -> None:
-    """The plan, before anything is written or launched (`DESIGN.md` §8.5)."""
+    """What will run, before anything is written or launched.
+
+    Run count, seed blocks, membership and worker geometry. Deliberately *not*
+    the cost model: measured throughput, projected wall clock per ``--jobs`` and
+    disk are `DESIGN.md` §8.5's requirement and `plan.py` is what satisfies it.
+    This docstring used to cite §8.5 for output that never included any of them.
+    """
     complete = [r for r in records if is_complete(r)]
     pending = [r for r in records if not is_complete(r)]
     seed_set = sorted({r['seed'] for r in records})
@@ -1491,13 +2948,65 @@ def print_plan(records: Sequence[dict], exp_ids: Sequence[str],
               f'{len(dirs):4d} runs  {done:4d} complete')
 
     # n is counted on the target side only: a source run is an input to an arm,
-    # not an observation of it.
-    target_seeds = sorted({r['seed'] for r in records if r['role'] != 'source'})
-    if len(target_seeds) < 3:
-        print(f'\n[NOTE] {len(target_seeds)} seed(s) per arm. Under '
-              f'ANALYSIS_PLAN.md §9 nothing produced at n<3 is a result: '
-              f'stats.py emits no test and no interval, and report.py stamps '
-              f'every page PIPELINE VALIDATION - NOT A RESULT.')
+    # not an observation of it. Two exclusions, and they are not the same test.
+    #
+    # `role == 'source'` is the run that exists only to be transferred from.
+    # `is_source` is *not* usable here even though it is the right test for
+    # membership of phase 1: in E8 and E9 a `scratch-*` run is simultaneously an
+    # observation of its own arm and the source for the shift arms, so excluding
+    # every phase-1 member would delete a real seed from a real arm.
+    #
+    # A RESERVE seed is excluded whatever its role. `DESIGN.md` §3.4 gives that
+    # block exactly one use, replacement sources drawn by the validity gate, and
+    # `check_seed_blocks` refuses it as a hand-picked selection, so a RESERVE
+    # seed in a plan is a draw and never an observation. This is what the
+    # earlier `role != 'source'` test got wrong: E8's shift arms draw their
+    # source from a `scratch-*` arm whose declared role is 'target', so a
+    # replacement counted as an extra target seed and suppressed the n<3 note on
+    # arms that had two.
+    #
+    # And per arm, not pooled. The union of seeds across arms cannot detect an
+    # arm missing a seed, which is the incomplete-arm condition `DESIGN.md` §8.4
+    # exists to catch; printing it as "N seed(s) per arm" said something the
+    # number did not support.
+    per_arm: dict[tuple[str, str], set[int]] = {}
+    for r in records:
+        if r.get('role') == 'source' or r.get('seed_block') == 'RESERVE':
+            continue
+        for eid in (r.get('experiments') or [r['experiment']]):
+            per_arm.setdefault((eid, r['arm']), set()).add(r['seed'])
+    if per_arm:
+        sizes = {key: len(seeds) for key, seeds in per_arm.items()}
+        smallest = min(sizes.values())
+        largest = max(sizes.values())
+        print(f'target arms: {len(per_arm)} arm(s) outside phase 1; seeds per '
+              f'arm min {smallest}, max {largest}')
+        # Short *within its own experiment*, not against the whole selection.
+        # Experiments declare different blocks: E0 runs one SMOKE seed and E3
+        # five TUNE seeds by design, so comparing every arm against the largest
+        # arm anywhere in the plan flagged both of them as incomplete on a
+        # `--experiments all` selection and buried the real case. DESIGN.md
+        # §8.4's incomplete arm is an arm missing a seed its siblings have.
+        per_exp_max: dict[str, int] = {}
+        for (eid, _arm), size in sizes.items():
+            per_exp_max[eid] = max(per_exp_max.get(eid, 0), size)
+        thin = sorted(k for k, v in sizes.items() if v < per_exp_max[k[0]])
+        if thin:
+            print(f'             [WARNING] {len(thin)} arm(s) hold fewer seeds '
+                  f'than the other arms of the same experiment, which is '
+                  f'DESIGN.md §8.4\'s incomplete-arm condition:')
+            for eid, arm in thin[:8]:
+                print(f'               {eid} {arm}: {sizes[(eid, arm)]} of '
+                      f'{per_exp_max[eid]} seed(s), '
+                      f'{sorted(per_arm[(eid, arm)])}')
+            if len(thin) > 8:
+                print(f'               ... and {len(thin) - 8} more')
+        if smallest < 3:
+            print(f'\n[NOTE] the smallest target arm holds {smallest} seed(s). '
+                  f'Under ANALYSIS_PLAN.md §9 nothing produced at n<3 is a '
+                  f'result: stats.py emits no test and no interval, and '
+                  f'report.py stamps every page PIPELINE VALIDATION - NOT A '
+                  f'RESULT.')
 
     if verbose:
         print('\njobs, in dependency order:')
@@ -1542,17 +3051,36 @@ def build_parser() -> argparse.ArgumentParser:
                         'the invocation file so the intent is in the provenance')
     p.add_argument('--force', action='store_true',
                    help='re-enter run directories that already have a complete '
-                        'manifest, and reclaim claims held by other sweeps. '
-                        'This does NOT retrain: train.py resumes from the '
-                        'checkpoint, so a complete run re-enters at its last '
-                        'episode and trains nothing. Deleting a run directory '
-                        'is the only way to retrain it, and this runner will '
-                        'not delete data')
+                        'manifest. This does NOT retrain: train.py resumes from '
+                        'the checkpoint, so a complete run re-enters at its '
+                        'last episode and trains nothing. Deleting a run '
+                        'directory is the only way to retrain it, and this '
+                        'runner will not delete data. It does NOT touch claims '
+                        'either: see --force-claim')
+    p.add_argument('--force-claim', action='store_true',
+                   help='take a run directory away from a claim another sweep '
+                        'holds, including one whose owner is demonstrably alive '
+                        'and one this process cannot read. That is the P0 '
+                        'corruption made deliberate: two trainers in one '
+                        'directory writing one metrics.jsonl, and this runner '
+                        'cannot interrupt the first one. It used to be the '
+                        'second half of --force, which meant the flag an '
+                        'operator reaches for at 3am to re-enter finished '
+                        'directories also handed live directories to a second '
+                        'worker. Reach for it when a crashed worker\'s pid has '
+                        'been reused (the deferral note says so) and never to '
+                        'get past a wait')
     p.add_argument('--verbose', action='store_true',
                    help='list every job in the plan')
     p.add_argument('--stale-seconds', type=int, default=DEFAULT_STALE_SECONDS,
-                   help='a claim older than this, with no manifest, may be '
-                        'reclaimed (default 7200)')
+                   help='a claim that has gone this long without a heartbeat '
+                        'may be reclaimed, and only then with evidence its '
+                        'owner is gone: the pid is checked on this host, and a '
+                        'claim from another host must carry a heartbeat field. '
+                        'A live run refreshes its claim every '
+                        f'{HEARTBEAT_SECONDS}s, so age means "how long since '
+                        'the owner was last alive", not "how long this run has '
+                        'been going" (default 7200)')
     p.add_argument('--poll-seconds', type=int, default=DEFAULT_POLL_SECONDS,
                    help='worker wait between passes when only deferred jobs '
                         'remain')
@@ -1561,24 +3089,56 @@ def build_parser() -> argparse.ArgumentParser:
                         'report it blocked; 0 means stale-seconds + 300')
     p.add_argument('--progress-seconds', type=int, default=60,
                    help='parent progress tally cadence; 0 to disable')
+    p.add_argument('--max-source-replacements', type=int, default=None,
+                   metavar='N',
+                   help='compute ceiling: how many RESERVE replacement source '
+                        'runs THIS INVOCATION may commit to training before it '
+                        'stops and refuses. Default: one full round of '
+                        'replacement across the plan\'s source lineages, and '
+                        'never fewer than '
+                        f'{DEFAULT_MIN_SOURCE_REPLACEMENTS}. DESIGN.md 4.3 '
+                        'draws replacements until every cell has its full '
+                        'complement and puts no bound on that; this bounds one '
+                        'command, not the rule. Unbounded, the source phase can '
+                        'commit hundreds of hours of source training unattended '
+                        'on the exact command the campaign uses, and a stage '
+                        'that rejects everything it trains is usually one '
+                        'systematic fault rather than N unlucky seeds: P0 was '
+                        'exactly that. The ledger is durable and the assignment '
+                        'is derived from it, so re-running after the refusal '
+                        'continues from where it stopped and retrains nothing')
     p.add_argument('--allow-factor-overrides', action='store_true',
                    help='permit --override on a field the registry classes as '
                         'an experimental factor rather than a budget setting. '
-                        'The runs then carry a note saying so and their '
-                        'configuration digests differ, so they cannot be '
-                        'mistaken for catalogue runs')
+                        'The runs carry a note saying so. Whether their '
+                        'configuration digests differ depends on the field and '
+                        'is NOT guaranteed: src/dqn/config.py excludes '
+                        'BOOKKEEPING_FIELDS from every digest and '
+                        'TRANSFER_ONLY_FIELDS from a scratch run\'s, so such an '
+                        'override writes into the catalogue directories under '
+                        'the catalogue identity. The exact effect per field is '
+                        'printed at launch')
     p.add_argument('--allow-seed-block-override', action='store_true',
                    help='proceed despite a seed-block violation. Stamped into '
                         'the invocation record; audit.py will still refuse the '
                         'affected estimates')
     p.add_argument('--allow-invalid-sources', action='store_true',
-                   help='proceed into the target phase even though a cell has '
-                        'no valid source and RESERVE is exhausted. The cell is '
-                        'then transfer-from-a-source-that-never-learned, which '
-                        'is the published study\'s central defect; the '
+                   help='proceed into the target phase even though a cell '
+                        'has no valid source: either RESERVE is exhausted, or a '
+                        'source finished without producing the normalised final '
+                        'score DESIGN.md 4.3 defines validity on. The cell is '
+                        'then transfer-from-a-source-of-unknown-competence, '
+                        'which is the published study\'s central defect; the '
                         'override is stamped into the invocation record and '
                         'into every rejection row so the affected cells are '
                         'identifiable in the results table')
+    p.add_argument('--allow-nondesign-gate', action='store_true',
+                   help='permit --source-gate to differ from the '
+                        'pre-registered DESIGN.md 4.3 value while a reporting '
+                        'experiment is selected. Without it the combination is '
+                        'refused rather than warned about: the help for '
+                        '--source-gate has always said a confirmatory run must '
+                        'use the design value, and nothing enforced it')
     p.add_argument('--source-gate', type=float, default=None,
                    metavar='SCORE',
                    help='override the source-validity gate. A TESTING '
@@ -1628,8 +3188,15 @@ def main(argv=None) -> int:
     # any run digest.
     args.out_root = os.path.abspath(args.out_root)
     exp_ids = _select_experiments(args)
-    seeds = resolve_seed_spec(args.seeds)
-    overrides = parse_overrides(args.override)
+    # A malformed selection is a refusal, not a traceback. `--seeds ''`,
+    # `--seeds abc` and `--override num_episodes=0` all used to surface as raw
+    # ValueErrors from three different modules.
+    try:
+        seeds = resolve_seed_spec(args.seeds)
+        overrides = parse_overrides(args.override)
+    except ValueError as exc:
+        print(f'[REFUSED] {exc}')
+        return 2
 
     fatal, warnings = check_seed_blocks(exp_ids, seeds)
     for msg in warnings:
@@ -1648,18 +3215,122 @@ def main(argv=None) -> int:
     if factor_overrides:
         print(f'[warning] --override touches experimental factors '
               f'{factor_overrides}, not just the budget. These runs are not the '
-              f'catalogue arms they are labelled as; their digests differ and '
-              f'their manifests carry a note recording it.')
+              f'catalogue arms they are labelled as, and their manifests carry '
+              f'a note recording it.')
+    # Which overrides actually move a run's identity, stated per field rather
+    # than asserted for all of them. The old blanket claim ("their digests
+    # differ, so they cannot be mistaken for catalogue runs") was false for
+    # every bookkeeping field: `--override log_diagnostics=False` is in
+    # SCALING_FIELDS so it raised no factor warning, is bookkeeping so the
+    # digest was unchanged, and wrote a run with no DESIGN.md 5.5 mechanism
+    # instrumentation into the catalogue directory under the catalogue digest.
+    bookkeeping_overrides = sorted(set(overrides) & set(BOOKKEEPING_FIELDS))
+    if bookkeeping_overrides:
+        print(f'[warning] --override {bookkeeping_overrides} are bookkeeping '
+              f'fields (src/dqn/config.py, BOOKKEEPING_FIELDS). They are '
+              f'outside every run digest, so these runs keep the catalogue '
+              f'identity and write into the catalogue run directories: nothing '
+              f'but the manifest note distinguishes them. '
+              + ('log_diagnostics in particular removes the DESIGN.md 5.5 '
+                 'mechanism instrumentation while the digest still claims a '
+                 'catalogue run. ' if 'log_diagnostics' in overrides else '')
+              + 'Making the digest cover them belongs in src/dqn/config.py, '
+                'which this file does not own.')
+    transfer_only_overrides = sorted(set(overrides) & set(TRANSFER_ONLY_FIELDS))
+    if transfer_only_overrides:
+        print(f'[warning] --override {transfer_only_overrides} change the '
+              f'digest of transfer runs only: a scratch run excludes the '
+              f'transfer-only fields from its digest (src/dqn/config.py), so '
+              f'the scratch arms keep their catalogue directories while their '
+              f'transfer counterparts move to new ones.')
 
-    gate = (registry.SOURCE_VALIDITY_GATE if args.source_gate is None
-            else float(args.source_gate))
-    gate_overridden = abs(gate - registry.SOURCE_VALIDITY_GATE) > 1e-12
-    if gate_overridden:
+    # Experiments whose output is reported. Everything except the SMOKE-block
+    # pipeline-validation experiment: DESIGN.md 3.4 and ANALYSIS_PLAN.md 8 speak
+    # about reported estimates, and estimation and screen experiments report as
+    # surely as confirmatory ones do.
+    reporting = [eid for eid in exp_ids
+                 if registry.EXPERIMENTS[eid].seed_block != 'SMOKE']
+    # The one selection DESIGN.md 4.3's gate does not govern, stated as a
+    # property of the whole selection rather than as an exemption any experiment
+    # carries. Two conditions, both necessary: every experiment selected
+    # declares the SMOKE block, so nothing here reports an estimate; and every
+    # seed asked for is a SMOKE seed, so a smoke arm cannot be re-pointed at
+    # CONFIRM seeds and inherit the scope statement with it. A reporting
+    # experiment cannot acquire this by accident: it would have to be moved into
+    # the SMOKE block in registry.py, which is the declaration that it validates
+    # the pipeline rather than measuring anything, and it would have to be
+    # selected alone.
+    smoke_only = bool(exp_ids) and not reporting and (
+        seeds is None or set(seeds) <= set(registry.SEED_BLOCKS['SMOKE']))
+    if args.source_gate is not None:
+        gate = float(args.source_gate)
+    elif smoke_only:
+        gate = GATE_NOT_APPLIED
+    else:
+        gate = registry.SOURCE_VALIDITY_GATE
+    gate_applied = math.isfinite(gate)
+    # "The design value" means the pre-registered number *actually applied*. A
+    # gate that is not applied is not it either, so every rejection row and the
+    # invocation record say gate_is_design_value=false under both.
+    gate_overridden = not (
+        gate_applied
+        and abs(gate - registry.SOURCE_VALIDITY_GATE) <= 1e-12)
+    if not gate_applied:
+        print('\n' + '=' * 72)
+        print('[gate not applied] DESIGN.md 4.3 does not govern this selection')
+        print('=' * 72)
+        print(f'  Selected: {exp_ids}, every one a SMOKE-block pipeline '
+              f'validation.')
+        print('  4.3 defines validity on the normalised final score of a '
+              'source trained to the')
+        print('  design\'s budget, and it governs the sources of REPORTED '
+              'estimates. This budget')
+        print('  is 12 episodes (registry.SMOKE_OVERRIDES) and this selection '
+              'reports nothing:')
+        print('  the catalogue says of it, in as many words, "not a result '
+              'under any')
+        print('  circumstances". Its sources score around zero, so gating them '
+              'at '
+              f'{registry.SOURCE_VALIDITY_GATE:.3f}')
+        print('  rejected every one, drew a RESERVE seed for every one, and '
+              'exhausted the block')
+        print('  without ever reaching phase 2, which is the half the smoke '
+              'exists to validate.')
+        print('  NOT APPLIED means: no source is rejected on its score, no '
+              'RESERVE seed is drawn,')
+        print('  and no row is written to the 4.3 ledger. It does NOT mean the '
+              'source phase is')
+        print('  skipped, and it does not admit a broken one: a source that '
+              'finishes without a')
+        print('  finite final_score is still refused, because that is a '
+              'pipeline failure and')
+        print('  finding pipeline failures is what this run is for.')
+        print('  One reporting experiment anywhere in the selection brings the '
+              'pre-registered')
+        print('  gate back for the whole selection. To exercise the 4.3 '
+              'rejection-and-replacement')
+        print('  path deliberately, give the smoke a gate it cannot meet: '
+              '--source-gate 0.9.')
+    elif gate_overridden:
         print(f'[warning] --source-gate {gate:g} replaces the pre-registered '
               f'{registry.SOURCE_VALIDITY_GATE:g} of DESIGN.md 4.3. This is a '
               f'testing instrument. Every rejection recorded under it carries '
               f'gate_is_design_value=false, and no run made under it is a '
               f'confirmatory result.')
+    if gate_overridden:
+        if reporting and not args.allow_nondesign_gate:
+            print(f'[REFUSED] {reporting} report estimates, and DESIGN.md 4.3 '
+                  f'fixes the gate at {registry.SOURCE_VALIDITY_GATE:g}. Under '
+                  f'a loosened gate a source that the design rejects is '
+                  f'admitted with no rejection row anywhere, so the only '
+                  f'record of the choice would be the invocation file. Pass '
+                  f'--allow-nondesign-gate to proceed deliberately, or select '
+                  f'only the smoke experiment, or run against a scratch '
+                  f'--out-root.')
+            return 2
+        if reporting:
+            print('[override] proceeding with a non-design source gate on a '
+                  'reporting selection, as requested.')
 
     jobs_dir = os.path.join(args.out_root, JOBS_SUBDIR)
     ledger_path = os.path.join(jobs_dir, REPLACEMENTS_FILE)
@@ -1674,20 +3345,84 @@ def main(argv=None) -> int:
         gate, ledger, gate_overridden, args.sweep_id)
     records, membership = resolved['records'], resolved['membership']
 
+    # The compute ceiling on the RESERVE replacement rule, for THIS invocation.
+    # `committed` counts replacement source runs this command has taken on: the
+    # draws it makes now from scores already on disk, plus every draw a later
+    # source stage makes. Draws replayed from the ledger are not counted, since
+    # an earlier invocation committed to those and re-deriving them costs
+    # nothing.
+    lineages = {sl.lineage for sl in resolved['slots']}
+    committed = len(resolved['new_rejections'])
+    max_replacements = (max(DEFAULT_MIN_SOURCE_REPLACEMENTS, len(lineages))
+                        if args.max_source_replacements is None
+                        else int(args.max_source_replacements))
+    if max_replacements < 0:
+        print('[REFUSED] --max-source-replacements is a count of source runs '
+              'and cannot be negative.')
+        return 2
+
     print(f'sweep {args.sweep_id}')
+    # A budget below one episode makes the completion test read `0 >= 0` and
+    # certify every directory it touches as finished. `parse_overrides` refuses
+    # it on the command line; this catches it wherever else it could come from.
+    bad_budget = [r for r in records
+                  if (_as_int(r.get('num_episodes')) or 0) < 1]
+    if bad_budget:
+        print(f'[REFUSED] {len(bad_budget)} job(s) ask for fewer than one '
+              f'episode, e.g. {bad_budget[0]["job_id"]} at '
+              f'num_episodes={bad_budget[0].get("num_episodes")!r}. A run of '
+              f'zero episodes is not a smaller experiment: it is a directory '
+              f'certified complete without training, indexed as an experiment '
+              f'member, with final_score null.')
+        return 2
     print_plan(records, exp_ids, membership, seeds, args.jobs, args.verbose)
     print_source_phase(resolved['slots'], records, gate, ledger,
                        resolved['new_rejections'], resolved['exhausted'])
+    # What the reserve rule could cost, before it starts costing it. The rule is
+    # unbounded by design ("drawn in order from RESERVE until the cell has its
+    # full complement"), and unbounded on this plan means the number below,
+    # committed unattended by the same command that trains the campaign.
+    print(f'  ceiling:   {max_replacements} replacement source run(s) may be '
+          f'committed by this')
+    print(f'             invocation (--max-source-replacements); {committed} '
+          f'drawn so far.')
+    print(f'             Unbounded, {len(lineages)} lineage(s) x '
+          f'{len(registry.RESERVE_ORDER)} RESERVE seed(s) = '
+          f'{len(lineages) * len(registry.RESERVE_ORDER)} further source '
+          f'run(s)')
+    print('             could be committed before the sweep refuses. The '
+          'ceiling stops the')
+    print('             command, not the rule: the ledger is durable, so '
+          're-running with a')
+    print('             higher one continues from where it stopped and '
+          'retrains nothing.')
     if args.dry_run:
         # Checked here only for the dry run. In a live sweep the phase-1 loop
         # can still move the assignment, so the check that decides anything is
         # the one after phase 1; printing both would show the same block twice.
         print_lineage_conflicts(lineage_conflicts(records))
+        print_unsound_runs(unsound_runs(records))
+        print_ungated_sources(
+            [row for row in ungated_sources(resolved['slots'], gate)
+             if row['state'] != 'unrun'], gate)
         if resolved['new_rejections']:
             print(f'\n--dry-run: {len(resolved["new_rejections"])} '
                   f'rejection(s) would be appended to {ledger_path}.')
         print('\n--dry-run: nothing written, nothing launched.')
         return 0
+
+    unsound = unsound_runs(records)
+    if unsound:
+        print_unsound_runs(unsound)
+        return 6
+
+    # Litter from a reclaim, in the directories this plan touches. Nothing ever
+    # removed these: two were still in the P0 tree when the verification pass
+    # went looking for them.
+    litter = purge_claim_litter(*[r['run_dir'] for r in records])
+    if litter:
+        print(f'\nremoved {litter} claim temporary file(s) left behind by an '
+              f'earlier reclaim, heartbeat or hard kill')
 
     os.makedirs(jobs_dir, exist_ok=True)
     jobs_path = os.path.join(jobs_dir, JOBS_FILE)
@@ -1701,7 +3436,15 @@ def main(argv=None) -> int:
         that have since been rejected would describe a sweep nobody ran.
         """
         write_jobs(jobs_path, recs)
-        write_index(args.out_root, memb, recs)
+        # The rejected directories travel into the index so that a RESERVE
+        # replacement is not indistinguishable, in `arm`, from the genuine
+        # CONFIRM members of the arm it shares a label with. The index is
+        # merged and never pruned by design (see `write_index`), so the marking
+        # is how a rejection reaches a consumer that groups by (experiment, arm).
+        write_index(args.out_root, memb, recs,
+                    rejected_dirs=[row.get('rejected_run_dir')
+                                   for row in read_replacements(ledger_path)
+                                   if row.get('rejected_run_dir')])
 
     publish(records, membership)
     print(f'\nwrote {jobs_path} ({len(records)} jobs)')
@@ -1714,7 +3457,15 @@ def main(argv=None) -> int:
     if args.force:
         print('\n[--force] complete manifests will be re-entered. train.py '
               'resumes from the checkpoint, so a finished run trains nothing; '
-              'delete its directory if you mean to retrain it.')
+              'delete its directory if you mean to retrain it. Claims are not '
+              'affected: that is --force-claim.')
+    if args.force_claim:
+        print('\n[--force-claim] claims held by other sweeps will be taken '
+              'over, including claims whose owner is demonstrably alive. This '
+              'runner cannot interrupt a running train(), so the owner keeps '
+              'writing: two trainers in one metrics.jsonl is the P0 corruption '
+              'DESIGN.md 8.2(1) exists to prevent. Every takeover is recorded '
+              'as a reclaim and is named in the summary.')
 
     pending = [r for r in records if args.force or not is_complete(r)]
     n_jobs = max(1, min(args.jobs, len(pending))) if pending else 0
@@ -1730,12 +3481,32 @@ def main(argv=None) -> int:
         'workers': n_jobs,
         'threads_per_worker': max(1, (os.cpu_count() or 4) // max(1, n_jobs or 1)),
         'resume': bool(args.resume), 'force': bool(args.force),
+        'force_claim': bool(args.force_claim),
         'stale_seconds': args.stale_seconds,
         'seed_block_override': bool(args.allow_seed_block_override and fatal),
+        # The non-fatal block departures too. A run on a block the experiment
+        # does not declare is a fact about the provenance whether or not it was
+        # refused, and recording only the overridden refusals left the rest
+        # invisible.
+        'seed_block_warnings': list(warnings),
+        'bookkeeping_overrides': bookkeeping_overrides,
+        'transfer_only_overrides': transfer_only_overrides,
+        'source_gate_override_allowed': bool(args.allow_nondesign_gate),
         # The reserve rule's provenance: the gate actually applied, whether it
         # is the pre-registered one, and the assignment this sweep ran under.
         'source_gate': gate,
         'source_gate_is_design_value': not gate_overridden,
+        # Whether a gate was applied at all, and why not. A non-finite gate is
+        # written to this file as null (`_json_safe`), so the boolean is what
+        # says which of "no gate" and "unreadable value" produced the null.
+        'source_gate_applied': gate_applied,
+        'source_gate_scope': (
+            'DESIGN.md 4.3' if gate_applied else
+            'not applied: every experiment selected is a SMOKE-block pipeline '
+            'validation at SMOKE-block seeds, which reports no estimate and '
+            'trains a budget the gate is not defined on'),
+        'max_source_replacements': max_replacements,
+        'source_replacements_committed_at_launch': committed,
         'source_replacements_recorded': n_recorded,
         'source_assignment': {f'{arm}@s{seed}': int(rep) for (arm, seed), rep
                               in sorted(resolved['assignment'].items())},
@@ -1744,7 +3515,11 @@ def main(argv=None) -> int:
     }
     with open(os.path.join(jobs_dir, f'sweep-{args.sweep_id}.json'), 'w',
               encoding='utf-8') as fh:
-        json.dump(invocation, fh, indent=2, sort_keys=True, default=str)
+        # Through `_json_safe` for the same reason the status log is: a
+        # non-finite number is written by json.dumps as a bare `-Infinity`,
+        # which Python reads back and no strict JSON reader will.
+        json.dump(_json_safe(invocation), fh, indent=2, sort_keys=True,
+                  default=str)
     append_status(status_path, {**{k: invocation[k] for k in
                                   ('sweep', 'argv', 'experiments', 'seeds',
                                    'jobs_total', 'jobs_pending', 'workers')},
@@ -1759,14 +3534,63 @@ def main(argv=None) -> int:
     # empty. Deleting a source's directory is still the way to retrain it.
     stage = 0
     stalled: list[dict] = []
+    # Kept across the loop so that a stall can still say which log to read.
+    # `summarise` was called with an empty map in exactly that situation, so it
+    # printed 'log: ?' in the one case where its docstring promises the log.
+    stage_logs: dict[str, str] = {}
     while True:
         due = [r for r in records if r['is_source'] and not is_complete(r)]
         if not due:
             break
+        if committed > max_replacements:
+            # Refused before the stage runs, so the ceiling costs nothing to
+            # observe. It is not a change to DESIGN.md 4.3, which draws until
+            # every cell has its full complement: it is a bound on how much one
+            # unattended command may commit to without being asked again.
+            print('\n' + '=' * 72)
+            print(f'[REFUSED] the RESERVE replacement rule has committed '
+                  f'{committed} new source run(s) in this')
+            print(f'          invocation, past the {max_replacements} this '
+                  f'command allows')
+            print('=' * 72)
+            print('  Every rejection is recorded in ' + ledger_path + ', and '
+                  'the assignment is')
+            print('  derived from it, so nothing is lost and nothing will be '
+                  'retrained.')
+            print('  DESIGN.md 4.3 draws replacements until every cell has its '
+                  'full complement and')
+            print('  puts no bound on that. This bound is on ONE INVOCATION. '
+                  'It exists because the')
+            print('  loop is otherwise free to commit hundreds of source-run '
+                  'hours unattended on')
+            print('  the exact command the campaign uses, and because a source '
+                  'stage that rejects')
+            print('  everything it trains is usually one systematic fault and '
+                  'not N unlucky')
+            print('  seeds: in P0 a single exploration-schedule defect failed '
+                  'all four sources at')
+            print('  once, and spending the reserve on it would have bought '
+                  'nothing.')
+            print('  Read the rejections above. If they are genuine, re-run '
+                  'with a higher')
+            print('  --max-source-replacements and the sweep carries on from '
+                  'here.')
+            append_status(status_path, {
+                'sweep': args.sweep_id, 'state': 'sweep_end',
+                'ts': round(time.time(), 3),
+                't': time.strftime('%Y-%m-%dT%H:%M:%S'), 'exit_code': 7,
+                'reason': f'{committed} replacement source run(s) committed, '
+                          f'past the --max-source-replacements ceiling of '
+                          f'{max_replacements}',
+                'source_replacements_committed': committed,
+                'max_source_replacements': max_replacements})
+            return 7
         stage += 1
         print(f'\n{"=" * 72}\nphase 1, source stage {stage}: {len(due)} '
-              f'source run(s) to train, then gate at {gate:.3f}\n{"=" * 72}')
-        run_stage(args, due, f'src{stage}', status_path)
+              f'source run(s) to train, then gate: {gate_text(gate)}\n'
+              f'({committed} of at most {max_replacements} replacement source '
+              f'run(s) committed so far)\n{"=" * 72}')
+        _codes, stage_logs = run_stage(args, due, f'src{stage}', status_path)
 
         ledger = read_replacements(ledger_path)
         resolved = resolve_source_assignment(
@@ -1779,6 +3603,7 @@ def main(argv=None) -> int:
             ledger_path,
             list(resolved['new_rejections']) + list(resolved['exhausted']))
         n_recorded += n_new
+        committed += len(resolved['new_rejections'])
         print_source_phase(resolved['slots'], records, gate, ledger,
                            resolved['new_rejections'], resolved['exhausted'])
         if n_new:
@@ -1798,7 +3623,7 @@ def main(argv=None) -> int:
 
     # ---- refusals between the phases -----------------------------------
     if stalled:
-        return summarise(records, status_path, args.sweep_id, {}) or 1
+        return summarise(records, status_path, args.sweep_id, stage_logs) or 1
 
     if resolved['exhausted']:
         print('\n' + '=' * 72)
@@ -1830,6 +3655,26 @@ def main(argv=None) -> int:
             return 3
         print('\n[override] proceeding with invalid sources, as requested. '
               'Recorded in the invocation file.')
+
+    # Every source that phase 1 left without a validity verdict. Not
+    # 'rejected', so no RESERVE seed was drawn and no ledger row written; not
+    # 'valid', so nothing licenses the transfer runs beneath it. The earlier
+    # version had no state between those two and let the whole target side run
+    # against it, returning 0.
+    ungated = ungated_sources(resolved['slots'], gate)
+    if ungated:
+        print_ungated_sources(ungated, gate)
+        if not args.allow_invalid_sources:
+            append_status(status_path, {
+                'sweep': args.sweep_id, 'state': 'sweep_end',
+                'ts': round(time.time(), 3),
+                't': time.strftime('%Y-%m-%dT%H:%M:%S'), 'exit_code': 5,
+                'reason': f'{len(ungated)} source slot(s) have no '
+                          f'DESIGN.md 4.3 validity verdict',
+                'ungated_sources': [row['describe'] for row in ungated]})
+            return 5
+        print('\n[override] proceeding against sources with no validity '
+              'verdict, as requested. Recorded in the invocation file.')
 
     conflicts = lineage_conflicts(records)
     if conflicts:
@@ -1874,7 +3719,9 @@ def main(argv=None) -> int:
                                 'ts': round(time.time(), 3),
                                 't': time.strftime('%Y-%m-%dT%H:%M:%S'),
                                 'exit_code': code,
-                                'source_replacements': n_recorded})
+                                'source_replacements': n_recorded,
+                                'source_replacements_committed': committed,
+                                'ungated_sources_allowed': len(ungated)})
     return code
 
 

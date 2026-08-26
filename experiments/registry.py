@@ -576,11 +576,16 @@ EXPERIMENTS: dict[str, Experiment] = {
                  'control C4',
         arms=_cell_arms(_e8i), review_refs=('C1', 'C14')),
     'E9': Experiment(
-        'E9', 'envpairs', tier=3, family='estimation',
+        'E9', 'envpairs', tier=1, family='estimation',
         question='RQ5 -- additional source->target pairs and the reverse '
                  'direction; the only answer to C1, which six of eight '
                  'reviewers raised',
-        arms=_cell_arms(_e9), review_refs=('C1', 'ICANN#5 Q8')),
+        arms=_cell_arms(_e9), review_refs=('C1', 'ICANN#5 Q8'),
+        notes='promoted from tier 3 to tier 1 on 2026-08-26. Leaving the '
+              'only answer to the most-raised reviewer objection in the '
+              'tier most likely to be cut was an internal contradiction, '
+              'and the measured cost is 20.2 h at --jobs 6 for 240 runs at '
+              'ten seeds, which is small beside the 82.8 h of tier 1'),
     'E13': Experiment(
         'E13', 'plasticity', tier=3, family='estimation',
         question='RQ4 -- whether the plasticity-loss account explains the '
@@ -628,11 +633,15 @@ class Job:
     being a pure function of the target seed. Until the reserve rule, a
     consumer's source was always at the consumer's own seed (or the fixed
     `C4SRC` mapping), so "which source" needed no recording. A rejected source
-    is replaced from `RESERVE`, and from then on the pair
-    (`source_default_seed`, `source_seed`) is the only thing that says whether a
-    replacement is in force -- `source_checkpoint` is a path and is deliberately
-    excluded from the run digest (`src/dqn/config.py`), so the run directory
-    will not say it.
+    is replaced from `RESERVE`, and the pair (`source_default_seed`,
+    `source_seed`) is what says whether a replacement is in force.
+    `source_checkpoint` cannot say it: it is a path, and paths are deliberately
+    excluded from the run digest (`src/dqn/config.py`).
+
+    The assigned seed also reaches the `Config`, so a replacement run does get a
+    directory of its own (`source_seed_is_recorded`). The *default* it stands in
+    for does not, and exists only here and in the job record `sweep.py` writes
+    from it, which is why both fields are carried rather than one.
     """
 
     experiment: str
@@ -744,6 +753,39 @@ def source_lineage(cfg: Config) -> str:
     digest's guarantee that no identity-bearing field is missed.
     """
     return dataclasses.replace(cfg, seed=_LINEAGE_SEED).run_digest()
+
+
+def source_seed_is_recorded(seed: int, src_seed: int,
+                            default_src_seed: int) -> bool:
+    """Whether a job's source seed belongs in its `Config`, hence in its digest.
+
+    `src/dqn/config.py` defaults `source_seed` to `seed` when it is not given,
+    and keys the run digest on it only when it *differs* from `seed`. Two
+    consequences follow, and they pull in opposite directions.
+
+    * A `RESERVE` replacement (``src_seed != default_src_seed``) **must** be
+      recorded. Left out, the replacement trains from a different source and
+      still hashes to the rejected run's directory, and `aggregate.py` copies
+      `source_seed = seed` into `per_seed.csv` for a run whose source is a
+      reserve seed. `DESIGN.md` 4.3 requires the opposite: a rejected source and
+      the seed that replaced it have to be legible in the results table. This is
+      the case fix B4 put `source_seed` in the digest for.
+    * An arm whose *canonical* source already sits at another seed, which today
+      is E8i's `iface-transfer-*` drawing on the `C4SRC` donors, must **not** be
+      recorded, because the digest cannot tell "canonical for this arm" from "a
+      deviation from it" and would re-identify every such run already on disk.
+      Their true source seed is still carried on the `Job`, written by
+      `sweep.py` into the job record, and recoverable from the checkpoint path,
+      which is the fallback `aggregate.py` applies when the field is absent.
+
+    So: record unless the draw is canonical *and* lands outside the run's own
+    seed. Closing the second case properly needs `Config` to carry the arm's
+    default source seed as a bookkeeping field, so that the digest can key on a
+    deviation from *that* rather than from `seed`; until it does, recording it
+    here would move existing run directories, which is a worse defect than the
+    one it fixes.
+    """
+    return src_seed != default_src_seed or src_seed == seed
 
 
 def source_arm_labels(exp: Experiment) -> frozenset[str]:
@@ -864,9 +906,36 @@ def jobs(experiment: str, seeds: str | Iterable[int] | None = None,
                 default_src_seed = block[seed % len(block)]
             src_seed = int(replacements.get((arm.source_from, default_src_seed),
                                             default_src_seed))
+            if src_seed != default_src_seed and src_seed == seed:
+                # A replacement whose seed is the consumer's own seed is
+                # not representable: the digest omits `source_seed` exactly
+                # there, so the replacement would wear the canonical
+                # lineage's identity and write into its directory. Refuse
+                # the assignment rather than produce an ambiguous run.
+                # `DESIGN.md` 4.3 draws replacements from RESERVE, which
+                # never collides with a consumer seed, so this can only
+                # arise from a hand-built `source_seeds` map or a ledger
+                # written by something other than the validity gate.
+                raise ValueError(
+                    f'{experiment}:{arm.label} at seed {seed} is assigned a '
+                    f'replacement source at seed {src_seed}, which is its '
+                    f'own seed. src/dqn/config.py keys the run digest on '
+                    f'source_seed only where it differs from seed, so this '
+                    f'run would be indistinguishable from the canonical '
+                    f'lineage it replaces and would write into that run '
+                    f'directory. Replacements come from RESERVE '
+                    f'({RESERVE_ORDER[0]}+), per DESIGN.md 4.3.')
             src_job = build(arm.source_from, src_seed)
             kwargs['source_checkpoint'] = os.path.join(src_job.cfg.run_dir(),
                                                        'model.keras')
+            # Which source this run actually loaded, written into the
+            # configuration and so into the manifest and the run digest.
+            # `Config.__post_init__` forbids the field on a scratch run, so
+            # it is offered only to a condition that draws on a source.
+            if (kwargs.get('condition', 'scratch') != 'scratch'
+                    and source_seed_is_recorded(seed, src_seed,
+                                                default_src_seed)):
+                kwargs['source_seed'] = src_seed
             dep = src_job.key()
             src_arm = arm.source_from
             src_lineage = source_lineage(src_job.cfg)
@@ -925,7 +994,27 @@ def all_jobs(experiments: Iterable[str], seeds=None, out_root: str = 'runs',
     for name in experiments:
         for job in jobs(name, seeds, out_root, overrides,
                         allow_factor_overrides, source_seeds):
-            if job.key() in seen:
+            prior = seen.get(job.key())
+            if prior is not None:
+                # De-duplication is only sound while the two jobs really
+                # are the same run. A shared directory with a different
+                # source is the failure this catalogue exists to prevent:
+                # one of the two would be dropped here and the surviving
+                # run would be reported under both arms' lineages. Refuse
+                # rather than pick, because there is no right pick.
+                if (prior.cfg.source_checkpoint
+                        != job.cfg.source_checkpoint
+                        or prior.source_seed != job.source_seed):
+                    raise ValueError(
+                        f'{prior.experiment}:{prior.arm} and '
+                        f'{job.experiment}:{job.arm} resolve to the same '
+                        f'run directory {job.key()!r} but draw on '
+                        f'different sources (seeds {prior.source_seed} and '
+                        f'{job.source_seed}; checkpoints '
+                        f'{prior.cfg.source_checkpoint!r} and '
+                        f'{job.cfg.source_checkpoint!r}). One run cannot be '
+                        f'both, and the run digest does not separate them, '
+                        f'so de-duplicating would silently drop one arm.')
                 continue
             seen[job.key()] = job
             ordered.append(job)
@@ -952,6 +1041,7 @@ def summary() -> list[dict]:
 __all__ = ['Arm', 'Experiment', 'Job', 'EXPERIMENTS', 'SEED_BLOCKS', 'CELLS',
            'SCALING_FIELDS', 'ENV_PAIRS', 'SOURCE_VALIDITY_GATE',
            'RESERVE_ORDER', 'source_lineage', 'source_arm_labels',
+           'source_seed_is_recorded',
            'load_source_replacements', 'REPLACEMENTS_RELPATH',
            'TIERS', 'PROTOCOL', 'COMMON', 'CORE_INVARIANTS', 'jobs',
            'all_jobs', 'resolve_seeds', 'summary', 'SMOKE_OVERRIDES',

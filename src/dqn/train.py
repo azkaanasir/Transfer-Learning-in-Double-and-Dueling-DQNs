@@ -705,7 +705,7 @@ class Trainer:
             'wall_time_s': round(time.time() - started, 1),
         }
         if not df.empty:
-            result.update(_curve_summaries(df, cfg))
+            result.update(_curve_summaries(df, cfg, result['env_steps']))
         self.manifest['result'] = result
 
         with open(os.path.join(self.dir, 'manifest.json'), 'w',
@@ -715,12 +715,24 @@ class Trainer:
             print(f'[WARNING] metrics integrity: {integrity["problems"]}')
 
 
-def _curve_summaries(df, cfg: Config) -> dict:
-    """AUC over env steps, convergence slope, and the dispersion metrics.
+def _curve_summaries(df, cfg: Config, total_env_steps: int) -> dict:
+    """AUC per env step, convergence slope, and the dispersion metrics.
 
     AUC is integrated over **env steps** rather than episodes because episode
     length is performance-dependent, so an episode-indexed area silently weights
     arms differently.
+
+    The divisor is the run's **total** env steps, which is what `DESIGN.md`
+    5.2 and `ANALYSIS_PLAN.md` 1 define P2 to be: "divided by total env
+    steps", "per step". Dividing by the span between the first and the last
+    evaluation instead would report the mean score over whatever window
+    happened to carry evaluations, so a run that stopped early, or one whose
+    unevaluated tail is long because its episodes are long, would be credited
+    for budget it never spent under evaluation. Under the specified divisor
+    the steps before the first evaluation and after the last one contribute
+    no area; `auc_env_step_coverage` records what fraction of the budget the
+    curve actually spans, so the size of that omission is auditable rather
+    than assumed (0.965 to 0.996 on the n=1 pilot tree).
     """
     ev = df.dropna(subset=['eval_score']) if 'eval_score' in df else df.iloc[0:0]
     out: dict = {}
@@ -728,7 +740,11 @@ def _curve_summaries(df, cfg: Config) -> dict:
         x = ev['env_steps'].to_numpy(dtype=float)
         y = ev['eval_score'].to_numpy(dtype=float)
         span = x[-1] - x[0]
-        out['auc_score'] = float(np.trapezoid(y, x) / span) if span > 0 else None
+        total = float(total_env_steps or 0)
+        out['auc_score'] = (float(np.trapezoid(y, x) / total)
+                            if span > 0 and total > 0 else None)
+        out['auc_env_step_coverage'] = (float(span / total)
+                                        if total > 0 else None)
         tail = ev[ev['episode'] >= max(0, cfg.num_episodes - 200)]
         if len(tail) >= 3:
             slope, _ = np.polyfit(tail['episode'].to_numpy(dtype=float),

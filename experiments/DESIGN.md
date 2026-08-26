@@ -156,6 +156,27 @@ Everything unlisted is an **invariant** and is machine-checked (§8.4).
 
 ### 3.1 Transferred-parameter fraction must be matched, not assumed
 
+> **Guardrail, added 2026-08-26.** `matched` and `trunk` resolve to the *same*
+> layer tuple for the mlp, `('trunk_fc1', 'trunk_fc2')`, and to different tuples
+> for the dueling net, which additionally carries `value_fc`, `value_out` and
+> `adv_fc` under `matched`. That is correct: an mlp has no value or advantage
+> stream, so "everything except the output-mismatched layers" **is** the trunk.
+> Two consequences, both binding.
+>
+> *Scientific.* The `matched` versus `trunk` contrast is a real contrast for
+> dueling and is **zero by construction** for the mlp. No claim may compare the
+> two across architectures, because that sets a measured quantity against a
+> definitional one. Confirmed on the pilot: `transfer-mlp-vanilla` and
+> `transfer-trunk-mlp-vanilla` are bit-identical on `final_score`, `auc_score`
+> and `env_steps`, as are the `-double` pair, while both dueling pairs differ.
+>
+> *Operational.* The two mlp arms differ only as strings, so they take different
+> digests and are trained twice for the same trajectory. At ten seeds that is
+> **20 of E1's 160 runs**, about 11.7 h of a 90.6 h campaign. The digest keys on
+> the transfer-set *name* rather than the resolved layer tuple; keying on the
+> tuple would collapse them automatically, but it would also move every existing
+> digest and orphan the pilot tree, so it is recorded here rather than done.
+
 Revision 1 held `transfer_layers = (trunk_fc1, trunk_fc2)` fixed across
 architectures and called that "the same protocol". It is not. Measured on the
 actual networks at 8-dim observations and 4 actions:
@@ -254,6 +275,28 @@ Both are honoured, in a declared order:
   it holds under **both** policies. Where they disagree, that disagreement is
   the finding, and it is reported as one.
 
+**How the secondary policy is actually executed, settled 2026-08-26.** Until
+this date it was not executed at all. Only `E3` varied `lr` anywhere in the
+catalogue and every other experiment ran at 5e-4 alone, so the arbitration
+above was **unsatisfiable** and the primary confirmatory conclusion of RQ2
+could not have been asserted. That is a design defect, found before launch and
+recorded rather than discovered in review.
+
+It is resolved by running the secondary policy rather than by weakening the
+arbitration. `E1` and `E2`, which are the arm set this section names, are
+replicated at each cell's own `E3`-selected configuration, at the same
+`CONFIRM` seeds. Three consequences:
+
+* The tuned stage is **sequentially dependent** on `E3`. It cannot be
+  enumerated before a selection exists, and the runner refuses to try.
+* `lr` is a trajectory field, so a cell whose `E3` selection happens to be
+  5e-4 yields digests identical to its common-policy arms and **shares** those
+  run directories rather than duplicating them. The quoted cost is therefore an
+  upper bound.
+* Under the secondary policy `lr` is invariant *within* a cell across
+  {scratch, transfer, C2, C3} and deliberately varies *across* cells, and
+  `audit.py` must enforce invariance at that scope rather than globally.
+
 ### 3.4 Seed blocks are disjoint by construction
 
 Revision 1 selected hyperparameters on seeds 0–4 and then ran confirmatory arms
@@ -343,6 +386,32 @@ Acrobot's registered threshold of −100, "0.6 x threshold" is −60, which is
 So validity is defined on the normalised score of §5.1:
 
 > A source is **valid** when its normalised final score >= 0.6.
+
+**Scope of that gate, made explicit 2026-08-26.** It governs the sources of
+**reported estimates**, and it presumes a source trained to the design's episode
+budget. It therefore does **not** apply to a selection made entirely of
+`SMOKE`-block experiments at `SMOKE`-block seeds. This is a scope statement, not
+an exemption, and it was forced by a real failure: the smoke experiment `E0`
+trains 12 episodes, so its sources score -0.583, -0.026, -0.132 and 0.025 and can
+never clear 0.600. Applying a competence gate to a twelve-episode run is a
+category error, and the consequence was concrete: the documented pre-launch smoke
+drew replacement after replacement until `RESERVE` was exhausted, trained 42 runs
+instead of 7, exited 3, and never reached the target-side phase it exists to
+validate.
+
+Four conditions keep this narrow, and `sweep.py` enforces all four:
+
+* the exemption applies only when **every** experiment in the selection is
+  `SMOKE`-block **and** every seed is a `SMOKE` seed. One reporting experiment
+  anywhere restores the 0.600 gate for the whole selection;
+* `E0` pointed at `CONFIRM` seeds does **not** inherit it;
+* an unscored or non-finite source is still refused, so the smoke still fails on
+  a broken pipeline rather than passing vacuously;
+* the unapplied gate is announced on stderr and stamped into the invocation
+  record, so no run can quietly claim to have been gated when it was not.
+
+Nothing a `SMOKE` run produces may enter a reported estimate under any
+circumstances (`registry.py`, `E0`), which is what makes the narrowing safe.
 
 Revision 1 called the all-seeds analysis "intent-to-treat". That framing is
 wrong: source competence is known *before* the target run begins, so it is not
@@ -514,6 +583,15 @@ rather than in protocol as well.
 Run counts are for the `CONFIRM` block (n=10) and include the scratch
 counterfactual each delta requires, which revision 1 omitted.
 
+Every row was checked against `registry.all_jobs` on 2026-08-26. Thirteen of
+the fourteen matched exactly. **`E9` did not**: this table said 360 and the
+registry produces 240 (4 cells x 3 pairs x {scratch, transfer} x 10 seeds), so
+the table overstated it by half. Revision 4 recorded that this table is
+generated from `registry.py` "so it cannot drift"; it had drifted, and the
+honest statement is that it is generated *and must be regenerated when the
+registry changes*, which is a discipline rather than a guarantee. `plan.py` is
+the authority for any count that decides compute.
+
 | ID | Name | Tier | Family | Design | Runs |
 |---|---|---|---|---|---|
 | `E0` | `smoke` | - | estimation | tiny end-to-end validation of every code path, one seed | 7 |
@@ -521,13 +599,13 @@ counterfactual each delta requires, which revision 1 omitted.
 | `E2` | `controls` | 1 | estimation | 4 cells x {C2 untrained, C2 at K=0, C3 permuted, C3b spectrum-matched} plus their source and scratch prerequisites | 240 |
 | `E3` | `hpsens` | 1 | screen | 4 cells x lr{1e-4,3e-4,5e-4,1e-3} x update{hard,soft}, LunarLander scratch, on `TUNE` | 160 |
 | `E8i` | `interfaceonly` | 1 | estimation | 4 cells x padded/extended LunarLander x {scratch, transfer}; doubles as control C4, sources from `C4SRC` | 120 |
+| `E9` | `envpairs` | 1 | estimation | 4 cells x {Acrobot->LL, CartPole->Acrobot, LL->CartPole}, each with its own scratch denominator | 240 |
 | `E4` | `freezedur` | 2 | screen | 4 cells x `freeze_updates` in {0, 5k, 10k, 20k, 50k, never} | 320 |
 | `E5` | `layerset` | 2 | screen | 4 cells x transfer sets {fc1, fc2, trunk, matched, described} | 280 |
 | `E6` | `streamfreeze` | 2 | screen | dueling cells x freeze {none, trunk, value, adv, heads} | 140 |
 | `E7` | `aggregation` | 2 | screen | dueling cells x {mean, max, naive} x {scratch, transfer} | 180 |
 | `E8` | `shiftaxis` | 2 | estimation | 4 cells x {wind 2 levels, gravity 3 levels} x {scratch, transfer}, protocol-matched to E1 | 440 |
 | `E11` | `valuerecal` | 2 | estimation | dueling cells x V-output recalibration {center, center_scale} | 80 |
-| `E9` | `envpairs` | 3 | estimation | 4 cells x {Acrobot->LL, CartPole->Acrobot, LL->CartPole}, each with its own scratch denominator | 360 |
 | `E12` | `capacity` | 3 | screen | 4 cells x hidden {64, 256} x {source, scratch, transfer} | 240 |
 | `E13` | `plasticity` | 3 | estimation | 4 cells x {head reset at unfreeze, shrink-and-perturb} -- the plasticity rival explanation | 160 |
 
@@ -562,11 +640,46 @@ demand as the comparison.
 **Pre-registered external-validity check.** RQ1's scratch comparison across three
 of these four cells has already been run at n=100 on these environments
 (Obando-Ceron & Castro, ICML 2021, adding Rainbow components to DQN one at a
-time). Our scratch ordering on LunarLander must agree with theirs in *direction*.
-It is declared here, before running, that a disagreement is a finding about our
-hyperparameter regime rather than about transfer, and that it would be reported
-as such with E3 as the diagnostic. RQ1 is therefore a **sanity check, not a novel
+time; their Figure 1, four classic-control tasks, 100 independent runs per
+configuration, 95% confidence bands). Our scratch ordering on LunarLander must
+agree with theirs in *direction*. RQ1 is therefore a **sanity check, not a novel
 result**, and the write-up says so.
+
+Three conditions on that check, all fixed here rather than at analysis time.
+
+*Endpoint.* The comparison is made on **AUC score**, not final score. Their
+Figure 1 plots return against training iteration, so an area statistic is the
+closer analogue of what they actually show. And naming the endpoint closes a
+researcher degree of freedom that the n=1 pilot proved is real: the two
+candidate endpoints order the cells *differently*, and three of the four change
+rank between them. On the four `scratch-*` arms at `CONFIRM` seed 0 on plain
+LunarLander:
+
+| Endpoint | Ordering |
+|---|---|
+| `final_score` | dueling/vanilla 1.1787 > mlp/double 1.1735 > dueling/double 1.1618 > mlp/vanilla 1.1479 |
+| `auc_score` | dueling/vanilla 0.9640 > mlp/vanilla 0.9384 > mlp/double 0.8981 > dueling/double 0.8646 |
+
+`mlp/vanilla` is fourth on one and second on the other; `dueling/double` is
+third and fourth. Leaving the endpoint open would have let the check be settled
+by choosing one.
+
+*Degenerate case.* If every cell clears the solved threshold on the endpoint
+used, the ordering is declared **uninformative** and reported as such: not as
+agreement, and not as disagreement. This is not hypothetical. In the n=1 pilot
+all four cells finished above threshold on LunarLander final score, spanning
+1.1479 to 1.1787 on the normalised scale where 1.0 is solved, a range of 0.031
+against a ceiling. That makes a final-score ordering a comparison of ceilings.
+
+*Asymmetry that bounds what a disagreement can mean.* They sweep the learning
+rate per configuration and report each component at its own optimum (their §4.1,
+and Figure 1 uses "the optimal hyper-parameters from Table 1 for each"). We hold
+one learning rate fixed across cells by design, because the transfer contrast
+requires it. Their ordering is therefore each-cell-at-its-own-best and ours is
+all-cells-at-a-common-value: these are not estimates of the same quantity. A
+disagreement is consequently **weak** evidence, is a finding about our
+hyperparameter regime rather than about transfer, is reported with E3 as the
+diagnostic, and may **not** be written as a contradiction of their result.
 
 ---
 
@@ -732,6 +845,13 @@ error the Phase 0 audit found in the published paper.
 
 | Date | Change | Effect on claims |
 |---|---|---|
+| 2026-08-26 | **`auc_score` re-derived on the spec-conformant divisor**, and 7's pilot `auc` row updated accordingly. `src/dqn/train.py` had divided the trapezoid by the span between the first and last evaluation point rather than by total env steps, which 5.2 and `ANALYSIS_PLAN.md` 1 both specify; `aggregate.py` copied the manifest value rather than recomputing it, so co-primary endpoint P2 had no independent check anywhere. Both fixed: the divisor is corrected at source and `aggregate.py` now recomputes P2 from `metrics.jsonl` and *compares* the manifest value instead of substituting it. All 44 pilot values fall by 0.39% to 3.54%, median 0.61%. | **None on any ordering.** The four-cell ranking is unchanged on `auc_score` under all three ways of forming it, no within-cell delta changes sign, and the 44 pilot runs are corrected by **re-derivation from data already on disk** rather than needing a re-run |
+| 2026-08-26 | **3.3's secondary tuning policy will actually be run.** Found before launch that only `E3` varied `lr` in the whole catalogue, so the pre-registered arbitration ("asserted only if it holds under both policies") was unsatisfiable and **RQ2, the primary confirmatory question, could not have been asserted at all**. Resolved by executing the policy rather than weakening the rule: `E1` and `E2` are replicated at each cell's `E3`-selected configuration on the same `CONFIRM` seeds, as a stage sequentially dependent on `E3`. Estimated at 31 h on top of the measured 125.3 h, and an upper bound because a cell reselecting 5e-4 shares its existing run directories. | **Restores the ability to assert RQ2 and RQ3 at all**, and answers ICANN #5's Q1 and Q5 (the fair-baseline objection to arms sharing one learning rate) with runs rather than with an argument. Where the two policies disagree, that disagreement is the reported finding |
+| 2026-08-26 | **4.3 gains an explicit scope statement.** The source-validity gate governs the sources of reported estimates and presumes a source trained to the design's budget, so it does not apply to a selection made entirely of `SMOKE`-block experiments at `SMOKE` seeds. Written down because `sweep.py` now behaves this way and a behavioural gate exemption justified only in code is the exact pattern this document exists to prevent. Four narrowing conditions are listed and all four are enforced. | **None.** No reported estimate may draw on a `SMOKE` run under any circumstances, so the narrowing cannot reach a published number. It repairs the documented pre-launch smoke, which previously exhausted `RESERVE`, trained 42 runs instead of 7, exited 3 and never validated the target-side pipeline at all |
+| 2026-08-26 | **Funded scope fixed: E1, E2, E3, E4, E5, E8i, E9 at ten seeds.** 1200 runs, a measured 125.3 h at `--jobs 6`. Deliberately **not** a clean tier cut: it takes both tier-2 ablation screens (E4 freeze duration, E5 layer set) because standing instruction S3 asks for clean ablations and C5 was raised by three reviewers, while leaving the other tier-2 entries out. E6, E7, E8, E11, E12 and E13 are **not funded**. Supersedes an earlier row quoting 103 h for a scope that omitted E3, which is a prerequisite because it selects the learning rate, and which summed two separately-costed selections instead of costing their union. | Section 6 of the manuscript keeps 6.1 (E4) and 6.2 (E5) and loses 6.3 (E6), 6.4 (E7), 6.6 (E11) and 6.7 (E13). 6.5 keeps the interface half (E8i) and loses the shift-severity half (E8). The **plasticity rival account is therefore measured and not excluded**, and every claim touching it must say so |
+| 2026-08-26 | **Correction to revision 6, found by independent review.** The pilot evidence quoted in 7 for the endpoint amendment was computed over every row with `condition == 'scratch'` and `env == 'LunarLander-v3'`. That is eight rows, not four: it pooled the `CONFIRM` scratch arms at seed 0 with the `C4SRC` positive-control sources at seed 300, which 3.4 forbids in those exact words ("never used for target-side estimation"). The corrected ordering has `mlp/vanilla` **fourth** on final score and **second** on AUC; the text said first and last, which is inverted. Both orderings and the saturation range are now given in full. | **None on the amendment**, whose conclusion is unchanged and better supported: the two endpoints still disagree, three of four cells still change rank, and all four still clear the threshold. The illustrative sentence was wrong and is corrected. Logged rather than quietly patched, because it is an instance of the very error the seed blocks exist to prevent |
+| 2026-08-26 | **Revision 7, two pre-launch decisions and one correction.** (a) `E9` promoted from tier 3 to **tier 1**: it is the only answer to C1, which six of eight reviewers raised, and leaving it in the tier most likely to be cut contradicted its own registry entry. Measured cost 20.2 h at `--jobs 6`. (b) **`REPLICATE` will not be run; n=10 stands.** Recorded here, before any confirmatory run, on compute grounds only, exactly as `ANALYSIS_PLAN.md` 6.5 requires. (c) This table's `E9` run count was **360 against the registry's 240** and is corrected; the other thirteen rows matched. | (a) and (c) widen and cheapen the generalisation evidence. (b) is a real cost: at n=10 the confirmatory MDE under Holm over 8 is 1.53 sigma_delta, so the between-cell interaction stays **estimation-only** and the paper reports intervals and exclusion bounds for it rather than a test |
+| 2026-08-25 | **Revision 6**, after verifying Obando-Ceron & Castro and Sabatelli & Geurts against the papers rather than the abstracts. The external-validity check in §7 named no endpoint, and the n=1 pilot showed the two candidate endpoints ranking the cells differently while all four cleared the solved threshold on one of them. The check now fixes the endpoint (AUC), pre-specifies the saturated case as uninformative, and records the tuning asymmetry (they optimise the learning rate per configuration; we hold it fixed) that bounds what a disagreement can mean. Separately, Sabatelli & Geurts is *On The Transferability of Deep-Q Networks*, not *Deep-RL Models*, and its Only-Head result (positive transfer on all four Catch versions when the body is frozen and only the head is trained) was missing from the related-work concession and is now stated. | The check was **ambiguous, not wrong**; closing it removes a degree of freedom before any confirmatory run. Disclosed in full: the amendment was made *after* inspecting n=1 pilot scratch numbers, which carry no result under `ANALYSIS_PLAN.md` §9, and *before* any n=10 run exists. The related-work correction narrows our claimed gap |
 | 2026-08-24 | Revision 1: initial specification. | - |
 | 2026-08-24 | Revision 2: the twelve items in §11, following adversarial review. No confirmatory run had launched, so no result is affected. | None: nothing had been run |
 | 2026-08-24 | **Revision 5, forced by P0.** The exploration schedule was indexed on environment steps, which makes the horizon endogenous to policy quality; on CartPole a 1000-episode run delivered 8.2 % of the 300,000-step horizon, epsilon fell only to 0.684, and all four sources failed the validity gate. Exploration is now indexed on episodes with the floor at 900, which reproduces the published schedule to within 0.001 and restores the sources (score 0.268 -> 0.772). Freezing keeps its step indexing. **This is why P0 exists**: 3 h of compute bought the finding, and every run made under the old schedule is discarded. | None reported: the affected runs were the single-seed validation pass, and no result had been claimed from them |

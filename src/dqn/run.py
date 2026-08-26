@@ -22,7 +22,7 @@ from .train import train
 
 def main(argv=None) -> int:
     cfg = config_from_args(argv)
-    print(f'=== {cfg.run_id()} on {cfg.env_id} ===')
+    print(f'=== {cfg.run_id()} on {cfg.env} ===')
     print(f'    arch={cfg.arch}  target_rule={cfg.target_rule}  '
           f'mode={cfg.mode}  lr={cfg.lr}  episodes={cfg.num_episodes}')
     manifest = train(cfg)

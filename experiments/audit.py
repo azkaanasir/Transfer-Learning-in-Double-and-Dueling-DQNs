@@ -32,18 +32,41 @@ hypothetical; each was found, by execution, either in the published study
   hyperparameters" is therefore not an assertion here: for each experiment,
   every field in `Experiment.invariants()` is required to take one value across
   every run the experiment contains, and the offending values and directories
-  are printed when it does not (`DESIGN.md` §3.3, §8.4).
+  are printed when it does not (`DESIGN.md` §3.3, §8.4). At a second, narrower
+  scope as well. `DESIGN.md` §3.3 declares two tuning policies, and under the
+  secondary one a field such as `lr` varies *between* cells while remaining
+  invariant *within* a cell. Adding it to an experiment's `varies` to permit the
+  first would drop it from `invariants()` and stop it being checked at the
+  second, so every field in `registry.CORE_INVARIANTS`, varied ones included, is
+  additionally required to be constant within each (arch, target_rule) cell of
+  every non-screen experiment. A screen is exempt, because varying a
+  hyperparameter inside one cell is what a screen is for.
 
 * **Seed completeness.** One seed was dropped from one published arm with no
   stated rule. The declared arm x seed inventory comes from
   `registry.jobs()` -- the same function the runner uses -- so a missing run is
   a missing row here rather than a silently smaller n (`DESIGN.md` §9,
-  `ANALYSIS_PLAN.md` §8).
+  `ANALYSIS_PLAN.md` §8). A seed *set* that resolves to nothing is refused
+  before any of that, because an empty target inventory makes every
+  completeness assertion vacuously true: `--seeds ""` used to turn nineteen
+  errors into a silent pass on an unchanged tree, and print `seeds : the block
+  each experiment declares` while doing it.
 
-* **Tune leakage.** Revision 1 selected hyperparameters on seeds 0-4 and then
-  ran every confirmatory arm on 0-9, so half of each confirmatory sample had
-  been tuned on. A reported experiment touching the `TUNE` block fails
-  (`DESIGN.md` §3.4).
+* **Seed blocks, in both directions.** Revision 1 selected hyperparameters on
+  seeds 0-4 and then ran every confirmatory arm on 0-9, so half of each
+  confirmatory sample had been tuned on. Checking only that a reported
+  experiment avoids `TUNE` catches one half of that: it says nothing about a
+  *selection* experiment that has wandered out of its own block and onto the
+  seeds the confirmatory arms are estimated from, which is the same leak
+  approached from the other side and is what `--seeds 0` does to E3. So the
+  whole of the `DESIGN.md` §3.4 block table is enforced here, row by row: a
+  reported experiment on `TUNE`, a selection experiment outside `TUNE`, a
+  target-side arm on `C4SRC` or `RESERVE` (both of which are source-side blocks
+  by declaration), a `SMOKE` seed anywhere but E0, and a seed belonging to no
+  block at all. Sharpest of all, and the one that actually fires: a single run
+  directory attributed both to a selection experiment and to a reported one is
+  the leak itself rather than a proxy for it, and it is an error whenever the
+  run was launched as part of the selection.
 
 * **Config/digest consistency and run-directory uniqueness.** These two are the
   fabrication mode the adversarial review demonstrated: the old directory scheme
@@ -57,10 +80,18 @@ hypothetical; each was found, by execution, either in the published study
   digest written anywhere inside a run directory (the manifest, `state.json`,
   each `ckpt_ep*/state.json`) is required to be the same one.
 
-* **Metrics integrity.** The published trainer appended to its metrics file on
-  resume without truncating, so a crash between checkpoints duplicated episodes
-  and corrupted every window statistic downstream. The episode index set must be
-  exactly `range(0, episodes_completed)` (`DESIGN.md` §8.2).
+* **Metrics integrity.** The published trainer appended to its `metrics.jsonl`
+  on resume without truncating, so a crash between checkpoints duplicated
+  episodes and corrupted every window statistic downstream. The episode index
+  set must be exactly `range(0, episodes_completed)` (`DESIGN.md` §8.2). Two
+  further things are read from that file, because an index check alone is
+  content-blind. First, the outcome column: a run whose `score` is null on
+  every episode, or constant across every episode, trained without recording
+  anything and would otherwise reach `aggregate.py` with the audit's blessing.
+  Second, a hash of the file itself, required distinct between run
+  directories -- the digest scheme catches the route to "one run's metrics
+  served under five manifests" that goes through a config collision, and this
+  catches the route that goes through a file copy.
 
 * **Freeze verification.** The manuscript described a freeze schedule the code
   never implemented. Freezing is now indexed in gradient updates and checked by
@@ -71,22 +102,42 @@ hypothetical; each was found, by execution, either in the published study
   only the first direction, so this check is deliberately stricter than that
   flag.
 
-* **Source validity and lineage.** A published source agent scored 26.94 on a
-  task solved at 475, and the transfer arm that consumed it is now
-  unidentifiable -- the only surviving CartPole checkpoint is from the wrong
+* **Source validity, the reserve rule, and lineage.** A published source agent
+  scored 26.94 on a task solved at 475, and the transfer arm that consumed it is
+  now unidentifiable: the only surviving CartPole checkpoint is from the wrong
   architecture. So every transfer run must carry a validity verdict on the
   normalised gate of `DESIGN.md` §4.3 (a *missing* verdict is an error; an
   *invalid* verdict is a reported exclusion, not an error), and its recorded
   source must resolve to a real run whose digest, environment and cell are the
-  ones the config names.
+  ones the config names. The verdict is *recomputed* rather than believed: the
+  recorded gate is compared with `registry.SOURCE_VALIDITY_GATE` and the
+  recorded `valid` flag with what the recorded score implies, because a check
+  that reads a self-declared boolean is passed by the very edit it exists to
+  catch. And §4.3's second half is checked too: a rejected source must be
+  *replaced* from `RESERVE` until the arm has its full complement of valid
+  sources, so a declared arm x seed slot occupied by a run whose source failed
+  the gate, with no replacement in the ledger, is an arm that is complete to the
+  seed count and empty in the primary estimand.
 
 * **Transferred-parameter fraction.** Revision 1 held the layer list fixed
   across architectures and called that the same protocol; it transferred 97 % of
   the mlp and 51 % of the dueling network, confounding `arch` with treatment
   intensity by a factor of two -- the published study's own error, reconstituted
-  inside the corrected design. Cross-`arch` groups whose fractions differ by
-  more than 0.05 are labelled `intensity-confounded` here so that `report.py`
-  cannot present them as an architecture contrast (`DESIGN.md` §3.1).
+  inside the corrected design. `DESIGN.md` §3.1 refuses such a contrast "unless
+  it is explicitly labelled intensity-confounded", and the catalogue is where
+  that label lives: a group whose `transfer_set` is not the matched protocol is
+  the deliberately unmatched comparison and carries the label as a warning,
+  while a group that *claims* matched intensity and does not have it is refused
+  outright as an error. A fraction that varies between the seeds of one arm is
+  an error too, because the intensity is fixed by the configuration and
+  averaging over a disagreement lets one bad seed rewrite the headline number.
+  The tolerance itself is written down twice, here and as
+  `stats.INTENSITY_TOLERANCE` in the module that decides whether the analysis
+  draws the same contrast, and nothing compared the two: widening this copy
+  tenfold left every guard in `validate.py` green while `stats.py` went on
+  refusing at 0.05. So the two are compared at audit time, and a disagreement
+  is an error, because two copies of one pre-registered constant returning
+  opposite verdicts on one group is not a difference of opinion.
 
 * **Plan hash, provenance, reference coverage.** A confirmatory result is
   interpretable only against the pre-registered plan in force when it ran, so
@@ -95,7 +146,21 @@ hypothetical; each was found, by execution, either in the published study
   reproducible from the repository, so the count is reported. And a missing
   reference return would silently put one variant's scores on a different scale
   from every other's, which is what made the published cross-variant comparisons
-  meaningless (`DESIGN.md` §5.1).
+  meaningless (`DESIGN.md` §5.1). Provenance is checked for the whole of
+  `DESIGN.md` §8.3 and not only the git flags: package versions, machine, argv
+  and the derived seed per stream are each required to be present, because a
+  provenance block that is half absent is not a reproducibility record.
+
+* **Robustness of the audit itself.** A checker that dies on one malformed field
+  produces no report for any of the other runs, which is worse than the defect
+  it choked on: a single non-integer `episodes_completed`, or `freeze_events`
+  written as an object rather than an array, used to end the process with a
+  traceback. Every value read out of a manifest is therefore coerced through a
+  guard that turns a malformed field into a finding about that run. In the same
+  spirit, a run directory holding run output but no manifest is discovered and
+  reported rather than being invisible to a glob for `manifest.json` -- a crash
+  before the manifest is written is the commonest way a run goes missing, and
+  `DESIGN.md` §9 forbids dropping one silently.
 
 How a run is attributed to an experiment
 ---------------------------------------
@@ -129,6 +194,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -143,6 +209,7 @@ for _path in (_REPO, _HERE):
         sys.path.insert(0, _path)
 
 import registry                                              # noqa: E402
+import statlib                                               # noqa: E402
 from src.dqn import envs, provenance                         # noqa: E402
 from src.dqn.config import (Config, MEASUREMENT_FIELDS,      # noqa: E402
                             TRAJECTORY_FIELDS)
@@ -153,14 +220,47 @@ from src.dqn.config import (Config, MEASUREMENT_FIELDS,      # noqa: E402
 ERROR, WARN, NOTE = 'error', 'warning', 'note'
 
 # DESIGN.md 3.1: the declared tolerance on transferred-parameter fraction for a
-# cross-architecture contrast.
+# cross-architecture contrast. The design declares one tolerance and names this
+# file as the module that refuses on it, so this is where it lives and
+# `stats.py`'s `INTENSITY_TOLERANCE` is the second copy of it. Nothing compared
+# the two: `validate.py` pins six statlib/stats constant pairs and this pair is
+# not among them, so widening this copy tenfold left every guard green while
+# `stats.py` went on refusing the same contrast from its own 0.05, and the two
+# modules would have returned opposite verdicts on one question. They are
+# therefore compared at audit time, in `check_transferred_fraction`, which is
+# what `GATE_TOLERANCE` below already does for the source-validity gate: a
+# disagreement between two copies of one pre-registered constant becomes a
+# finding in the report rather than staying a fact about the source.
 FRACTION_TOLERANCE = 0.05
 # A recorded normalisation constant may drift only by float round-trip.
 REFERENCE_TOLERANCE = 1e-6
+# The same slack, applied to the recorded source-validity gate. registry.py's
+# own comment says the two copies of the constant "must agree" and that a
+# disagreement should be "visible in the data"; this is where it becomes so.
+GATE_TOLERANCE = 1e-9
 # ANALYSIS_PLAN.md 9: below this, output is pipeline validation, not a result.
-MIN_N_FOR_A_RESULT = 3
+# Imported rather than restated. The plan declares one floor; this file used to
+# carry a fourth independent copy of it, beside `statlib`'s, `stats.py`'s and
+# the one `aggregate.py` already takes from `statlib`. `validate.py` pins the
+# `statlib` copy and pinned nothing here, so setting this one to 1 dropped the
+# pipeline-validation note from every audit report with the whole guard suite
+# still green.
+MIN_N_FOR_A_RESULT = statlib.MIN_N_FOR_INFERENCE
 # How many run directories to name per finding before summarising the rest.
 MAX_LISTED = 6
+
+# --strict promotes a warning to an error, and every warning in this file is a
+# deviation a campaign can clear, with one exception. `intensity_confounded`
+# *is* the DESIGN.md 3.1 label: a group whose `transfer_set` is not the matched
+# protocol is the deliberately unmatched comparison, and E4 and E5 declare four
+# of them, so a structurally correct complete tree carries the warning by
+# construction. Promoting a declared label to an error made --strict a mode no
+# tree can pass, which is a mode nobody runs and therefore no gate at all. The
+# warning is still emitted, still printed and still the thing standing between
+# the reader and the confound; what it is not is something a campaign could
+# ever be asked to fix. Anything added here has to meet the same test: not "it
+# is inconvenient" but "the catalogue guarantees it on a correct tree".
+DECLARED_BY_DESIGN = frozenset({'intensity_confounded'})
 
 # The registry's own line between a budget setting a caller may scale and a
 # factor that defines what the experiment is. Used, not re-derived, so the
@@ -169,6 +269,82 @@ SCALING_FIELDS = frozenset(registry.SCALING_FIELDS)
 
 CONFIG_DEFAULTS: dict[str, Any] = {f.name: f.default
                                    for f in dataclasses.fields(Config)}
+
+# The metrics columns that carry an outcome. `score` is the normalised
+# per-episode return of DESIGN.md 5.1 and every row has one; `eval_score` is
+# recorded on evaluation episodes only, so its absence from a given row is not
+# a defect while its absence from every row of a run is.
+OUTCOME_FIELD = 'score'
+EVAL_OUTCOME_FIELD = 'eval_score'
+
+# Files that make a directory a run directory even when its manifest is gone.
+# A run writes metrics from its first episode, so a directory holding these and
+# no `manifest.json` is a run that died before it could describe itself.
+RUN_OUTPUT_MARKERS = ('metrics.jsonl', 'state.json', 'model.keras')
+
+# Directory names under the run root that hold bookkeeping rather than runs.
+BOOKKEEPING_PREFIXES = ('_', '.')
+# A checkpoint directory inside a run directory. It carries a `state.json` of
+# its own, so it has to be told apart from the run that owns it.
+CHECKPOINT_PREFIX = 'ckpt_ep'
+
+
+# ---------------------------------------------------------------------------
+# Coercion guards
+# ---------------------------------------------------------------------------
+# A manifest is data read off disk, not a trusted structure. Every one of these
+# exists because an unguarded read of the same field ended the whole audit with
+# a traceback and produced no report for any other run in the tree, which is a
+# worse outcome than whatever the malformed field was going to be reported as.
+# ---------------------------------------------------------------------------
+def _as_int(value: Any) -> Optional[int]:
+    """`int(value)` or None. Never raises, and never accepts a bool."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return None
+    return out
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """`float(value)` or None, refusing non-finite values.
+
+    A NaN is not a number that failed a gate, it is a measurement that did not
+    happen, and `nan >= 0.6` being False is exactly how a degenerate evaluation
+    reads as a rejection. So it is returned as absent and reported as such.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out or out in (float('inf'), float('-inf')):
+        return None
+    return out
+
+
+def _events(value: Any) -> tuple[list[dict], int]:
+    """The dict elements of a freeze-event list, and how many were not dicts.
+
+    `freeze_events` written as a JSON object rather than an array made
+    `enumerate` walk its keys, so the elements were strings and the audit died
+    on `str.get`. A non-list, or a list with a non-dict in it, is a malformed
+    manifest to be reported, not an exception to be raised.
+    """
+    if isinstance(value, dict):
+        return [], len(value)
+    if not isinstance(value, list):
+        return [], (0 if value is None else 1)
+    good = [e for e in value if isinstance(e, dict)]
+    return good, len(value) - len(good)
+
+
+def _mapping(value: Any) -> Optional[dict]:
+    """`value` when it is a dict, else None. For nested manifest branches."""
+    return value if isinstance(value, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +373,17 @@ class Check:
     def count(self, level: str) -> int:
         return sum(1 for f in self.findings if f.level == level)
 
+    def promotable(self) -> int:
+        """The warnings --strict turns into errors: deviations, not labels.
+
+        See `DECLARED_BY_DESIGN`. A warning the catalogue guarantees on a
+        correct tree is reported at every setting and promoted at none.
+        """
+        return sum(1 for f in self.findings
+                   if f.level == WARN and f.code not in DECLARED_BY_DESIGN)
+
     def status(self, strict: bool = False) -> str:
-        if self.count(ERROR) or (strict and self.count(WARN)):
+        if self.count(ERROR) or (strict and self.promotable()):
             return 'FAIL'
         if self.count(WARN):
             return 'WARN'
@@ -218,16 +403,18 @@ class Run:
 
     @property
     def cfg(self) -> dict:
-        return self.manifest.get('config') or {}
+        return _mapping(self.manifest.get('config')) or {}
 
     @property
     def identity(self) -> dict:
-        return self.manifest.get('identity') or {}
+        return _mapping(self.manifest.get('identity')) or {}
 
     @property
     def seed(self) -> Optional[int]:
-        seed = self.cfg.get('seed')
-        return None if seed is None else int(seed)
+        # Coerced, not cast: a manifest whose seed is a string is a run with a
+        # broken identity, which `check_digests` reports. It must not be a
+        # ValueError raised out of a property every other check calls.
+        return _as_int(self.cfg.get('seed'))
 
     @property
     def condition(self) -> str:
@@ -251,20 +438,78 @@ class Run:
         return node
 
 
+def unmanifested_run_dirs(out_root: str) -> list[str]:
+    """Directories holding run output but no `manifest.json`.
+
+    A glob for `manifest.json` cannot see a run whose manifest was never
+    written, and a crash before the manifest is the commonest way that happens:
+    the directory still holds the metrics, the checkpoints and the weights. The
+    docstring on `discover_runs` promises that a run whose identity cannot be
+    read is an error rather than a skip, and a *missing* identity is the same
+    problem as an unreadable one, so the tree is walked independently for the
+    output markers a run leaves behind.
+
+    A checkpoint directory is not reported in its own right. The walk stops at
+    any directory holding a manifest, so a healthy run's `ckpt_ep*` children are
+    never reached; and where the manifest is the thing that is missing, a
+    `ckpt_ep*` carrying its own `state.json` is attributed to the run directory
+    above it rather than counted as a run of its own.
+    """
+    root = os.path.abspath(out_root)
+    if not os.path.isdir(root):
+        return []
+    out: set[str] = set()
+    for entry in sorted(os.listdir(root)):
+        if entry.startswith(BOOKKEEPING_PREFIXES):
+            continue                    # _jobs, _index, _logs: not runs
+        top = os.path.join(root, entry)
+        if not os.path.isdir(top):
+            continue
+        for current, dirs, files in os.walk(top):
+            names = set(files)
+            if 'manifest.json' in names:
+                dirs[:] = []            # a run directory holds no run directory
+                continue
+            if not names.intersection(RUN_OUTPUT_MARKERS):
+                continue
+            found = current
+            if os.path.basename(current).startswith(CHECKPOINT_PREFIX) \
+                    and os.path.dirname(current) != root:
+                found = os.path.dirname(current)
+            out.add(os.path.relpath(found, root).replace(os.sep, '/'))
+            dirs[:] = []
+    return sorted(out)
+
+
 def discover_runs(out_root: str) -> tuple[list[Run], list[Finding]]:
     """Every run directory under `out_root`, with unreadable manifests reported.
 
     An unreadable manifest is an error rather than a skip: a run whose identity
     cannot be read cannot be excluded from an analysis that globs the tree, so
-    silently ignoring it here would leave it to be picked up downstream.
+    silently ignoring it here would leave it to be picked up downstream. A
+    manifest that is *absent* is the same defect and is reported the same way,
+    which a glob for `manifest.json` cannot do on its own.
     """
     root = os.path.abspath(out_root)
     findings: list[Finding] = []
     runs: list[Run] = []
+    bookkeeping: list[str] = []
     pattern = os.path.join(glob.escape(root), '**', 'manifest.json')
     for path in sorted(glob.glob(pattern, recursive=True)):
         run_dir = os.path.dirname(os.path.abspath(path))
         rel = os.path.relpath(run_dir, root).replace(os.sep, '/')
+        head = rel.split('/', 1)[0]
+        if head not in ('.', '') and head.startswith(BOOKKEEPING_PREFIXES):
+            # `unmanifested_run_dirs` skips `_jobs`, `_index` and `_logs` by
+            # this same rule, and the two functions are documented as covering
+            # one population from two directions. While the glob did not, an
+            # archived copy of a manifest under `_index/` became a Run and
+            # entered every per-run check, attribution and the metrics-hash
+            # set, while an unmanifested directory beside it stayed invisible.
+            # Skipped rather than silently dropped: the count is reported
+            # below, so a manifest in the wrong place is still a fact.
+            bookkeeping.append(rel)
+            continue
         try:
             with open(path, encoding='utf-8') as fh:
                 manifest = json.load(fh)
@@ -272,12 +517,33 @@ def discover_runs(out_root: str) -> tuple[list[Run], list[Finding]]:
             findings.append(Finding(ERROR, 'manifest_unreadable',
                                     f'{rel}: {exc}', [rel]))
             continue
-        if not isinstance(manifest, dict) or 'config' not in manifest:
+        if not isinstance(manifest, dict) or not isinstance(
+                manifest.get('config'), dict):
             findings.append(Finding(
                 ERROR, 'manifest_malformed',
                 f'{rel}: manifest has no config block', [rel]))
             continue
         runs.append(Run(run_dir, rel, manifest))
+    absent = unmanifested_run_dirs(out_root)
+    if absent:
+        findings.append(Finding(
+            ERROR, 'manifest_absent',
+            f'{len(absent)} director(ies) hold run output '
+            f'({", ".join(RUN_OUTPUT_MARKERS)}) but no manifest.json, so they '
+            f'are in no count, no attribution and no analysis. A run that '
+            f'cannot say what it is cannot be reported and cannot be excluded '
+            f'by a glob either; DESIGN.md 9 forbids dropping one silently',
+            absent[:MAX_LISTED], {'n': len(absent), 'dirs': absent[:24]}))
+    if bookkeeping:
+        findings.append(Finding(
+            NOTE, 'manifest_under_bookkeeping_dir',
+            f'{len(bookkeeping)} manifest.json file(s) sit under a '
+            f'bookkeeping directory ({", ".join(BOOKKEEPING_PREFIXES)}...) and '
+            f'are not runs: {", ".join(bookkeeping[:MAX_LISTED])}. They are '
+            f'excluded from attribution and from every per-run check, on the '
+            f'same rule unmanifested_run_dirs applies',
+            bookkeeping[:MAX_LISTED],
+            {'n': len(bookkeeping), 'dirs': bookkeeping[:24]}))
     return runs, findings
 
 
@@ -382,7 +648,8 @@ class Declared:
 
 
 def declare(seeds=None, observed_seeds: Iterable[int] = (),
-            overrides: dict | None = None) -> Declared:
+            overrides: dict | None = None,
+            out_root: str = 'runs') -> Declared:
     """Resolve the catalogue into concrete (experiment, arm, seed) configs.
 
     Built over every experiment, not only the selected ones, because the
@@ -394,9 +661,19 @@ def declare(seeds=None, observed_seeds: Iterable[int] = (),
     against. Its union with the seeds actually present on disk is what
     attribution uses, so a run at an undeclared seed is recognised and reported
     rather than silently dropped.
+
+    `out_root` is passed through to `registry.jobs`, and must be: `jobs` reads
+    the DESIGN.md 4.3 reserve-replacement ledger from
+    `<out_root>/_jobs/source_replacements.jsonl`, so taking its default meant
+    that auditing any tree resolved that tree's declared inventory against
+    `runs/`'s ledger. Once a reserve replacement fires, a substituted run is
+    declared from the wrong tree or not declared at all, and the reserve rule
+    becomes unauditable in exactly the campaign that needs it. The declared
+    `source_checkpoint` path is wrong for the same reason.
     """
     out = Declared(classes=defaultdict(list))
-    observed = sorted({int(s) for s in observed_seeds if s is not None})
+    observed = sorted({s for s in (_as_int(s) for s in observed_seeds)
+                       if s is not None})
     for eid, exp in registry.EXPERIMENTS.items():
         for arm in exp.arms:
             out.arms[(eid, arm.label)] = arm
@@ -408,10 +685,12 @@ def declare(seeds=None, observed_seeds: Iterable[int] = (),
             # the runs match it. Whether that launch should have overridden
             # a factor is the invariants check's verdict, not this call's.
             target_jobs = registry.jobs(eid, seeds=list(target),
+                                        out_root=out_root,
                                         overrides=overrides,
                                         allow_factor_overrides=True)
             union_jobs = registry.jobs(
                 eid, seeds=sorted(set(target) | set(observed)),
+                out_root=out_root,
                 overrides=overrides, allow_factor_overrides=True)
         except Exception as exc:                            # noqa: BLE001
             out.findings.append(Finding(
@@ -451,6 +730,78 @@ def attribute(runs: list[Run], exp_ids: Iterable[str], declared: Declared):
     return membership, orphans, everywhere
 
 
+def declared_coverage(membership, declared: Declared
+                      ) -> dict[str, tuple[int, int]]:
+    """Per experiment: runs attributed, and runs filling a *declared* slot.
+
+    The single definition of "this run was measured against something". Every
+    completeness, block and source-validity assertion in this file is made
+    against `declared.target_pairs`; a run outside those pairs is attributed,
+    listed and then compared with nothing. Counting the two separately is what
+    makes an audit that verified nothing visible instead of green. Under
+    `--seeds 999` on the real tree the first number is 44 and the second is 0
+    for every experiment, and the audit rendered "AUDIT PASS".
+    """
+    out: dict[str, tuple[int, int]] = {}
+    for eid, arms in membership.items():
+        pairs = declared.target_pairs.get(eid) or set()
+        attributed = covered = 0
+        for label, group in arms.items():
+            for run in group:
+                attributed += 1
+                if (label, run.seed) in pairs:
+                    covered += 1
+        out[eid] = (attributed, covered)
+    return out
+
+
+def launched_as_declared(run: Run, declared: Declared) -> bool:
+    """True when the run sits in a slot the experiment it names declares.
+
+    The run's own manifest records the `experiment` and `label` the runner was
+    given. If the registry schedules that arm at that seed, the run is where
+    its launcher said it would be, and any *other* experiment that also claims
+    it does so only because the two configurations coincide.
+    """
+    eid = str(run.cfg.get('experiment'))
+    label = str(run.cfg.get('label'))
+    return (label, run.seed) in (declared.target_pairs.get(eid) or set())
+
+
+def shared_configuration_only(eid: str, label: str, run: Run,
+                              declared: Declared) -> bool:
+    """True when `eid` claims this run only because two configs coincide.
+
+    `declare()` resolves every experiment at the union of its declared seeds
+    and the seeds present on disk, so that a run at an undeclared seed is
+    recognised rather than silently dropped. The cost is that the union
+    manufactures arm x seed keys no experiment schedules: `E8i`'s `c4src-*`
+    donors at seed 300 are digest-identical to the `scratch-*` target arms of
+    ten other experiments, so every one of those ten acquires a target-side
+    membership the catalogue never declared. Three things have to hold before a
+    membership is dismissed as that artefact, and all three are properties of
+    the catalogue rather than of the check that wants the exemption:
+
+    * the run's own manifest names some other experiment, so `eid` did not
+      launch it;
+    * `eid` declares no arm x seed slot this run could fill, so nothing `eid`
+      reports can draw on it (`aggregate.py`'s `MembershipIndex` builds
+      membership from `present & (declared | reserve)` and excludes it too);
+    * the experiment that *did* launch it declares the slot it sits in, so the
+      run is accounted for somewhere.
+
+    A run failing any of the three keeps every verdict. In particular a run
+    launched into a block it does not belong to is still judged, because the
+    first condition fails, and a rogue run its own launcher does not declare is
+    still judged, because the third does.
+    """
+    if str(run.cfg.get('experiment')) == eid:
+        return False
+    if (label, run.seed) in (declared.target_pairs.get(eid) or set()):
+        return False
+    return launched_as_declared(run, declared)
+
+
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
@@ -460,6 +811,10 @@ def check_invariants(membership, exps, declared: Declared) -> Check:
         'the published transfer arm ran at lr=1e-4 against a baseline\'s 5e-4 '
         'under a claim of identical hyperparameters (DESIGN.md 3.3, 8.4)')
     audited = tuple(sorted(set(TRAJECTORY_FIELDS) | set(MEASUREMENT_FIELDS)))
+    # Coverage of the second, per-cell scope below, counted rather than
+    # assumed. See the note it feeds at the end of this function.
+    cell_scope_experiments = 0
+    cell_scope_comparisons = 0
     for eid, arms in membership.items():
         exp = exps[eid]
         runs = {r.rel: r for group in arms.values() for r in group}
@@ -486,6 +841,58 @@ def check_invariants(membership, exps, declared: Declared) -> Check:
                         experiment=eid, field=name,
                         values={str(v): {'n': len(rs), 'runs': rs[:MAX_LISTED]}
                                 for v, rs in groups.items()})
+
+        # The second scope DESIGN.md 3.3 names. Under the secondary,
+        # per-cell-tuned policy `lr` is invariant *within* a cell and varies
+        # between them, so it would be added to `varies` -- which drops it from
+        # `invariants()` above and would stop it being checked at either scope.
+        # This scope closes that hole: a field the experiment declares varied
+        # is still required to be constant within each cell. The remaining
+        # CORE_INVARIANTS are skipped here because the loop above already
+        # asserts them across the whole experiment, which implies them within
+        # every cell; skipping them is not a gap, it is the stronger assertion
+        # already made. A screen is exempt because varying a hyperparameter
+        # inside one cell is the whole point of a screen: E3 sweeps four
+        # learning rates per cell and E12 two capacities, both by declaration.
+        #
+        # Which leaves this scope with nothing to compare on today's catalogue,
+        # and saying so is the point of `cell_scope_dormant` below: E3 and E12
+        # are the only experiments with a `varies` list and both are screens,
+        # so the field set here is empty for every experiment in the catalogue.
+        # The check is correct and it is in force; its coverage is currently
+        # zero, and a check whose coverage is zero must not be reported as
+        # enforcement (DESIGN.md 11 defect 12).
+        if exp.family != 'screen':
+            by_cell: dict[str, list[str]] = defaultdict(list)
+            for rel, run in sorted(runs.items()):
+                by_cell[run.cell].append(rel)
+            declared_invariant = set(exp.invariants())
+            varied_core = [f for f in registry.CORE_INVARIANTS
+                           if f not in declared_invariant]
+            cell_scope_experiments += 1
+            cell_scope_comparisons += len(varied_core) * len(by_cell)
+            for cell in sorted(by_cell):
+                for name in varied_core:
+                    groups = defaultdict(list)
+                    for rel in by_cell[cell]:
+                        groups[_norm(name, runs[rel].cfg.get(
+                            name, CONFIG_DEFAULTS.get(name)))].append(rel)
+                    if len(groups) > 1:
+                        chk.add(ERROR, 'cell_invariant_violated',
+                                f'{eid}: {name} takes {len(groups)} values '
+                                f'within cell {cell}. {eid} declares {name} '
+                                f'varied, which DESIGN.md 3.3 licenses only '
+                                f'*between* cells: under the per-cell-tuned '
+                                f'policy it is still invariant within one '
+                                f'({", ".join(str(v) for v in groups)})',
+                                runs=[r for rs in groups.values()
+                                      for r in rs[:2]],
+                                experiment=eid, field=name, cell=cell,
+                                values={str(v): {'n': len(rs),
+                                                 'runs': rs[:MAX_LISTED]}
+                                        for v, rs in groups.items()})
+            chk.detail[eid]['cells'] = sorted(by_cell)
+            chk.detail[eid]['cell_scope_fields'] = varied_core
 
         # And the second half of the same question: is the value in force the
         # value the catalogue declares? The registry draws the line for us.
@@ -557,14 +964,40 @@ def check_invariants(membership, exps, declared: Declared) -> Check:
                     f'declared arms at a reduced setting, which is what a '
                     f'pipeline-validation launch is and is not a result',
                     experiment=eid, fields=fields)
+    chk.detail['cell_scope'] = {
+        'non_screen_experiments': cell_scope_experiments,
+        'field_x_cell_comparisons': cell_scope_comparisons}
+    if cell_scope_experiments and not cell_scope_comparisons:
+        chk.add(NOTE, 'cell_scope_dormant',
+                f'the DESIGN.md 3.3 secondary scope compared nothing: across '
+                f'{cell_scope_experiments} non-screen experiment(s) it made 0 '
+                f'field x cell comparison(s). It tests a CORE_INVARIANT the '
+                f'experiment declares varied, and no non-screen experiment in '
+                f'the catalogue declares one: E3 and E12 are the only entries '
+                f'with a varies list and both are screens, which this scope '
+                f'exempts. The check is in force and fires the moment the '
+                f'per-cell-tuned policy of 3.3 is adopted for a reported '
+                f'experiment. Until then it enforces nothing, and this file '
+                f'says so rather than counting it as a guardrail',
+                non_screen_experiments=cell_scope_experiments,
+                comparisons=0,
+                core_invariants=list(registry.CORE_INVARIANTS))
     return chk
 
 
-def check_seed_completeness(membership, exps, seeds, declared: Declared) -> Check:
+def check_seed_completeness(membership, exps, declared: Declared) -> Check:
+    """Completeness against the declared inventory, with the gate held shut.
+
+    The requested seed set is deliberately not a parameter here. It arrives
+    resolved, as `declared.target_pairs`, and the check is measured against
+    that alone: a `seeds` argument that the body never read was the parameter a
+    reader would assume carried the gate.
+    """
     chk = Check(
         'SEED COMPLETENESS',
         'one seed was dropped from one published arm with no stated rule; '
         'partial arms are refused (DESIGN.md 9, ANALYSIS_PLAN.md 8)')
+    vacuous: list[str] = []
     for eid, arms in membership.items():
         exp = exps[eid]
         pairs = declared.target_pairs.get(eid)
@@ -577,6 +1010,11 @@ def check_seed_completeness(membership, exps, seeds, declared: Declared) -> Chec
         observed = {(label, r.seed) for label, group in arms.items()
                     for r in group if r.seed is not None}
         target = {seed for _, seed in pairs}
+        if not pairs:
+            # The gate held shut rather than allowed to pass vacuously. With no
+            # declared pair, `pairs - observed` is empty, every assertion below
+            # is true of nothing, and the audit reports a pass it never made.
+            vacuous.append(eid)
 
         # One arm at one seed is one run. Two runs there are two independent
         # estimates of one quantity that a reader would take for two arms --
@@ -603,28 +1041,82 @@ def check_seed_completeness(membership, exps, seeds, declared: Declared) -> Chec
                     runs=twin_runs[:MAX_LISTED], experiment=eid,
                     slots=twinned[:24], n=len(twinned))
         missing = sorted(pairs - observed)
-        extra = sorted(p for p in observed - pairs if p[1] in target)
+        # Every observed pair the registry does not schedule, not only those at
+        # a selected seed. The `p[1] in target` filter that used to sit here
+        # discarded precisely the class `declare()`'s docstring promises to
+        # report -- a run at an *undeclared* seed -- so the target/observed
+        # union was used for attribution and then filtered back out of the
+        # reporting path. That is the mechanism by which four C4SRC-block runs
+        # were folded into E1's confirmatory arms without a word.
+        extra = sorted(observed - pairs)
+        # Of those, the ones that are this experiment's business. A pair that
+        # exists only because `declare()` resolved every experiment at the
+        # union of its own seeds and the seeds on disk is not a run this
+        # experiment has anything to do with: `shared_configuration_only`
+        # requires that another experiment launched it, that this one declares
+        # no slot it could fill, and that its launcher does declare the slot it
+        # sits in. E8i's ten `c4src-*` donors satisfy all three for each of the
+        # ten experiments whose `scratch-*` arms are digest-identical to them,
+        # and reporting that as ten deviations was 10 of the 29 warnings that
+        # made --strict unpassable. This is not the `p[1] in target` filter
+        # that used to sit here and discarded genuine undeclared runs: a run at
+        # an undeclared seed whose own launcher does not declare it, or one
+        # this experiment launched itself, is still a warning below.
+        by_pair: dict[tuple[str, Optional[int]], list[Run]] = defaultdict(list)
+        for label, group in arms.items():
+            for run in group:
+                by_pair[(label, run.seed)].append(run)
+        shared_cfg = sorted(
+            p for p in extra
+            if by_pair.get(p) and all(
+                shared_configuration_only(eid, p[0], r, declared)
+                for r in by_pair[p]))
+        extra = [p for p in extra if p not in set(shared_cfg)]
         per_arm = {label: sorted({r.seed for r in group})
                    for label, group in arms.items()}
         n_by_arm = {label: len([s for s in seen if s in target])
                     for label, seen in per_arm.items()}
+        # ANALYSIS_PLAN.md 9 is an any-arm rule, not an every-arm one: "under
+        # n < 3, stats.py emits no test and no interval, and report.py stamps
+        # every page PIPELINE VALIDATION: NOT A RESULT". One arm below the
+        # floor stops every contrast that arm enters, so the page carries the
+        # stamp. This used to read `max(n_by_arm.values())`, which is true only
+        # when *every* arm is below the floor, and the disagreement was visible
+        # on runs_demo: aggregate.py printed "an arm has fewer than 3 seeds
+        # (smallest count 1)" for E2 while the audit recorded
+        # pipeline_validation=False for the same experiment on the same tree.
+        # The minimum is taken over the arms that have runs, which is what
+        # aggregate.py (min over the per-arm counts it tabulates) and tables.py
+        # (min over the groups present in the frame) both do: an arm with no
+        # runs at all is `arm_absent` above, not a small sample here.
+        populated = sorted(n for n in n_by_arm.values() if n)
+        smallest = populated[0] if populated else 0
         chk.detail[eid] = {
             'declared_runs': len(pairs),
             'observed_runs': len(observed & pairs),
             'seeds_declared': sorted(target),
             'per_arm_seeds': per_arm,
             'family': exp.family,
-            # ANALYSIS_PLAN.md 9: below n=3 no test and no interval may be
-            # emitted, and every page carries PIPELINE VALIDATION - NOT A RESULT.
-            'pipeline_validation': (max(n_by_arm.values()) < MIN_N_FOR_A_RESULT
-                                    if n_by_arm else True),
+            'pipeline_validation': smallest < MIN_N_FOR_A_RESULT,
+            'min_n_per_populated_arm': smallest,
             'max_n_per_arm': max(n_by_arm.values()) if n_by_arm else 0,
+            'arms_populated': len(populated),
             'runs_attributed': sum(len(g) for g in arms.values()),
         }
         if not (observed & pairs):
-            chk.add(NOTE, 'experiment_not_run',
+            # A warning, not a note, when runs exist at other seeds: the
+            # completeness gate was then measured against an inventory that has
+            # nothing to do with what is on disk, which is the same vacuity as
+            # an empty seed set reached by a different route.
+            attributed = sum(len(g) for g in arms.values())
+            chk.add(WARN if attributed else NOTE, 'experiment_not_run',
                     f'{eid}: no run on disk belongs to any declared arm at the '
-                    f'selected seeds', experiment=eid)
+                    f'selected seeds'
+                    + (f', though {attributed} run(s) are attributed to it at '
+                       f'other seeds, so completeness here was asserted against '
+                       f'an inventory none of them fills'
+                       if attributed else ''),
+                    experiment=eid, runs_attributed=attributed)
             continue
         absent = sorted(label for label, seen in per_arm.items() if not seen)
         if absent:
@@ -644,49 +1136,374 @@ def check_seed_completeness(membership, exps, seeds, declared: Declared) -> Chec
                     missing=[f'{a}@s{s}' for a, s in missing[:24]],
                     n_missing=len(missing), partial_arms=partial)
         if extra:
-            chk.add(NOTE, 'undeclared_runs',
-                    f'{eid}: {len(extra)} run(s) at a selected seed belong to an '
-                    f'arm the registry does not schedule there',
-                    experiment=eid,
-                    pairs=[f'{a}@s{s}' for a, s in extra[:MAX_LISTED]])
+            off_block = sorted(p for p in extra if p[1] not in target)
+            chk.add(WARN, 'undeclared_runs',
+                    f'{eid}: {len(extra)} run(s) belong to an arm the registry '
+                    f'does not schedule at that seed, of which '
+                    f'{len(off_block)} sit outside the selected seed set '
+                    f'entirely. They are attributed to this experiment and are '
+                    f'in none of its declared inventory, so they inflate the '
+                    f'runs column without entering the denominator; which block '
+                    f'they belong to, and whether that is licensed, is the SEED '
+                    f'BLOCKS check\'s verdict',
+                    runs=sorted({r.rel for label, group in arms.items()
+                                 for r in group
+                                 if (label, r.seed) in set(extra)})[:MAX_LISTED],
+                    experiment=eid, n=len(extra),
+                    pairs=[f'{a}@s{s}' for a, s in extra[:24]],
+                    off_block=[f'{a}@s{s}' for a, s in off_block[:24]])
+        if shared_cfg:
+            chk.add(NOTE, 'shared_configuration_runs',
+                    f'{eid}: {len(shared_cfg)} arm x seed slot(s) are filled '
+                    f'by runs another experiment launched into a slot it '
+                    f'declares, and which this experiment declares nowhere. '
+                    f'They are in its membership because the two '
+                    f'configurations coincide, they are in none of its '
+                    f'declared inventory, and nothing it reports draws on '
+                    f'them: aggregate.py builds membership from '
+                    f'present & (declared | reserve) and excludes them too',
+                    runs=sorted({r.rel for p in shared_cfg
+                                 for r in by_pair[p]})[:MAX_LISTED],
+                    experiment=eid, n=len(shared_cfg),
+                    pairs=[f'{a}@s{s}' for a, s in shared_cfg[:24]])
         if chk.detail[eid]['pipeline_validation']:
+            det = chk.detail[eid]
             chk.add(NOTE, 'pipeline_validation',
-                    f'{eid}: at most {chk.detail[eid]["max_n_per_arm"]} seed(s) '
-                    f'per arm. ANALYSIS_PLAN.md 9 forbids a test or an interval '
-                    f'below n={MIN_N_FOR_A_RESULT} and requires the output to be '
-                    f'stamped PIPELINE VALIDATION - NOT A RESULT',
-                    experiment=eid)
+                    f'{eid}: the smallest arm carrying runs has '
+                    f'{det["min_n_per_populated_arm"]} seed(s), against '
+                    f'{det["max_n_per_arm"]} in the largest. ANALYSIS_PLAN.md 9 '
+                    f'forbids a test or an interval below '
+                    f'n={MIN_N_FOR_A_RESULT} and requires the output to be '
+                    f'stamped PIPELINE VALIDATION - NOT A RESULT; one arm below '
+                    f'the floor stops every contrast it enters, which is why '
+                    f'this reads the smallest arm and not the largest',
+                    experiment=eid, min_n=det['min_n_per_populated_arm'],
+                    max_n=det['max_n_per_arm'])
+    if vacuous:
+        chk.add(ERROR, 'inventory_empty',
+                f'{len(vacuous)} experiment(s) declare no arm x seed at all at '
+                f'the requested seed set ({", ".join(vacuous[:MAX_LISTED])}'
+                + (f', +{len(vacuous) - MAX_LISTED} more'
+                   if len(vacuous) > MAX_LISTED else '')
+                + '). Every completeness assertion below is then true of '
+                  'nothing, so the audit would report a pass it never made. '
+                  'A seed selection that resolves to the empty set does not '
+                  'relax this gate, it disables it, and DESIGN.md 8.4 permits '
+                  'an override only when it is stamped into the output',
+                experiments=vacuous[:24], n=len(vacuous))
     return chk
 
 
-def check_tune_leakage(membership, exps) -> Check:
+#: The DESIGN.md 3.4 rows that name a block as source-side. A target-side arm
+#: at one of these seeds is estimating from a block declared never to be used
+#: for target-side estimation.
+SOURCE_SIDE_BLOCKS = ('C4SRC', 'RESERVE')
+
+
+def blocks_for_seed(seed: Optional[int]) -> tuple[str, ...]:
+    """Every declared block a seed belongs to. Empty means no block at all."""
+    if seed is None:
+        return ()
+    return tuple(sorted(name for name, seeds in registry.SEED_BLOCKS.items()
+                        if seed in seeds))
+
+
+def declaring_experiments(run: Run, declared: Declared) -> set[str]:
+    """Every experiment whose *declared* inventory this run fills.
+
+    `everywhere` answers a wider question: which experiments could claim the
+    run, the ones that claim it only because `declare()` resolved them at the
+    union of their own seeds and the seeds on disk included. Contamination is
+    the narrower fact. A run enters an experiment's estimand when that
+    experiment schedules the arm x seed slot the run occupies, and only then,
+    which is also the rule `aggregate.py`'s `MembershipIndex` builds membership
+    on, so that is what the leak is computed over.
+    """
+    key = (str(run.cfg.get('experiment')), str(run.cfg.get('label')), run.seed)
+    digest = declared.digests.get(key)
+    if digest is None:
+        return set()
+    return {eid for eid, label, seed in declared.classes.get(digest, ())
+            if seed == run.seed
+            and (label, seed) in (declared.target_pairs.get(eid) or set())}
+
+
+def check_seed_blocks(membership, exps, declared: Declared,
+                      everywhere: dict[str, set[str]]) -> Check:
+    """The whole of the DESIGN.md 3.4 block table, in both directions.
+
+    The predecessor of this check tested one proposition: a reported experiment
+    contains a run at a TUNE seed. That is one cell of a six-row table, and it
+    is the half of the selection-bias problem that is easiest to avoid by
+    accident. The other half is a *selection* experiment that has left its own
+    block: `registry.resolve_seeds` lets `--seeds` override the block for every
+    experiment at once, so a single-seed validation invocation maps E3's
+    hyperparameter screen onto CONFIRM seed 0, where E3's `hp-*-lr0.0005-hard`
+    arms share a run digest with E1's confirmatory scratch arms. Selecting a
+    learning rate on runs that are then used as the confirmatory denominator is
+    revision 1's defect verbatim (DESIGN.md 11 item 2), and the old check
+    reported PASS on it twice over: seed 0 is not in TUNE, and E3 was exempt
+    anyway.
+
+    Every row is therefore enforced, and the sharpest statement of the leak is
+    checked directly rather than through a proxy: one run directory that is in
+    the declared inventory of a selection experiment *and* in the declared
+    inventory of a reported one is the contamination itself.
+
+    Graded on that, not on launch order. The predecessor of this paragraph
+    graded on `config.experiment`: the leak was an error when the manifest
+    happened to name the selection experiment and a warning otherwise. On the
+    real tree at `--seeds 0`, where E3's `hp-*-lr0.0005-hard` arms and E1's
+    confirmatory `scratch-*` arms resolve to the same four directories, that
+    reported `[warn] 0 error`; changing two strings in one manifest, and
+    nothing else, turned the identical statistical fact into `[FAIL] 2 error`.
+    Which experiment the operator listed first on the sweep command line is not
+    a fact about contamination, so it no longer decides the severity: both
+    experiments declaring the run is an error, and a run launched as part of a
+    selection is an error whether or not the selection declares the slot.
+
+    What is left over is a genuine collision of configurations that no declared
+    inventory realises: E3 is scheduled on TUNE 200-204 and E1 on CONFIRM 0-9,
+    so under the declared blocks their shared configuration is never one run,
+    and `declare()` puts them in one equivalence class only because it resolves
+    every experiment at the union of its seeds and the seeds on disk. Nothing
+    reported can draw on it, so it is recorded as a note rather than promoted
+    to an error by --strict. The severity that used to sit there has not been
+    given up: it has moved onto the case that actually leaks, which now fires
+    regardless of who launched the run, and onto `tune_block_not_a_screen`,
+    which refuses the declaration itself.
+    """
     chk = Check(
-        'TUNE LEAKAGE',
+        'SEED BLOCKS',
         'revision 1 selected hyperparameters on seeds 0-4 and ran every '
-        'confirmatory arm on 0-9 (DESIGN.md 3.4)')
-    tune = set(registry.SEED_BLOCKS['TUNE'])
-    chk.detail['tune_block'] = sorted(tune)
+        'confirmatory arm on 0-9; DESIGN.md 3.4 makes the blocks disjoint and '
+        'gives each a single licensed use, in both directions')
+    chk.detail['blocks'] = {name: [seeds[0], seeds[-1]] if seeds else []
+                            for name, seeds in registry.SEED_BLOCKS.items()}
+    # Findings are accumulated per (code, experiment, level) and emitted once.
+    # A block violation moves every run of an arm at once, and one line per run
+    # would bury the rest of the audit exactly as the per-run schema-drift line
+    # did. The offending arms, seeds and blocks go into the finding's detail,
+    # where they identify the runs without multiplying the lines.
+    hits: dict[tuple[str, str, str], dict] = {}
+
+    # A run for which a specific row of the table has already spoken. The
+    # generic out-of-block warning would otherwise repeat that verdict in
+    # weaker words, and two lines saying one thing is how a finding gets read
+    # as two problems or as none.
+    named: set[tuple[str, str]] = set()
+
+    def record(level: str, code: str, eid: str, note: str, run: Run,
+               label: str, blocks: tuple[str, ...]) -> None:
+        entry = hits.setdefault((code, eid, level),
+                                {'note': note, 'runs': [], 'arms': set(),
+                                 'seeds': set(), 'blocks': set()})
+        entry['runs'].append(run.rel)
+        entry['arms'].add(label)
+        if run.seed is not None:
+            entry['seeds'].add(run.seed)
+        entry['blocks'].update(blocks)
+        if code != 'out_of_declared_block':
+            named.add((eid, run.rel))
+
+    artefacts: dict[str, list[str]] = defaultdict(list)
     for eid, arms in membership.items():
         exp = exps[eid]
-        # The only licensed exemption is the selection experiment itself: a
-        # screen whose declared block *is* TUNE. Narrowing the exemption to that
-        # intersection keeps `family='screen'` from becoming a way to launder a
-        # tuned seed into a reported estimate.
-        exempt = exp.family == 'screen' and exp.seed_block == 'TUNE'
-        hits = sorted({r.rel for group in arms.values() for r in group
-                       if r.seed in tune})
-        chk.detail[eid] = {'exempt': exempt, 'runs_on_tune_seeds': len(hits)}
-        if hits and not exempt:
-            chk.add(ERROR, 'tune_leakage',
-                    f'{eid} is reported (family={exp.family}, block='
-                    f'{exp.seed_block}) and contains {len(hits)} run(s) on TUNE '
-                    f'seeds; no reported estimate may draw on the selection block',
-                    runs=hits[:MAX_LISTED], experiment=eid, n=len(hits))
-        elif hits:
-            chk.add(NOTE, 'tune_seeds_expected',
-                    f'{eid}: {len(hits)} run(s) on TUNE seeds, which is what '
-                    f'this experiment is for; nothing it produces may enter a '
-                    f'reported estimate', experiment=eid, n=len(hits))
+        # The only licensed exemption from the TUNE rule is the selection
+        # experiment itself: one whose declared block *is* TUNE. It has to be
+        # the block and not the family, because the shared-run backstop below
+        # reads the same set: narrowing this predicate to screens would take a
+        # non-screen experiment declared on TUNE out of `selection_ids` and so
+        # out of the very check that catches it. The strength the old
+        # `family == 'screen' and seed_block == 'TUNE'` conjunction carried is
+        # restored one line down instead, where it belongs and where it does
+        # not depend on `family` being one of the three documented values: an
+        # experiment may be declared on TUNE only if it is a screen, and that
+        # is a fact about the declaration, checkable before a single run
+        # exists.
+        selection = exp.seed_block == 'TUNE'
+        if selection and exp.family != 'screen':
+            chk.add(ERROR, 'tune_block_not_a_screen',
+                    f'{eid} is declared on the TUNE block with '
+                    f'family={exp.family!r}. DESIGN.md 3.4 gives TUNE one '
+                    f'licensed use, selection, and nothing computed on it may '
+                    f'enter a reported estimate; an experiment that is not a '
+                    f'screen has no business declaring it, and declaring it '
+                    f'exempts every run of that experiment from the TUNE '
+                    f'leakage rule below',
+                    experiment=eid, family=exp.family,
+                    seed_block=exp.seed_block)
+        census: Counter = Counter()
+        for label, group in sorted(arms.items()):
+            arm = declared.arms.get((eid, label))
+            source_side = arm is not None and arm.role == 'source'
+            for run in group:
+                launched_here = str(run.cfg.get('experiment')) == eid
+                declared_pair = (label, run.seed) in (
+                    declared.target_pairs.get(eid) or set())
+                # A run the experiment launched is that experiment's own doing,
+                # and so is a slot the experiment declares: in both cases the
+                # launch or the catalogue put a run where the 3.4 table says it
+                # must not be. A run that merely shares a configuration is an
+                # artefact of the equivalence classes, and the three deserve
+                # different verdicts.
+                lvl = ERROR if (launched_here or declared_pair) else WARN
+                blocks = blocks_for_seed(run.seed)
+                census[blocks[0] if blocks else 'none'] += 1
+                if shared_configuration_only(eid, label, run, declared):
+                    # Not this experiment's run, by all three tests in
+                    # `shared_configuration_only`. Judging it here produced 21
+                    # of the 29 warnings on the real tree and made --strict
+                    # unpassable on a structurally correct campaign: E8i's
+                    # `c4src-*` donors are digest-identical to ten other
+                    # experiments' `scratch-*` target arms, so each of the ten
+                    # was told it had put a target arm on a source block. It
+                    # had not. Counted and reported below rather than dropped.
+                    artefacts[eid].append(run.rel)
+                    continue
+                if run.seed is None:
+                    record(ERROR, 'seed_unreadable', eid,
+                           'carry no readable seed, so the block they belong '
+                           'to cannot be established and no row of the 3.4 '
+                           'table can be applied to them',
+                           run, label, blocks)
+                    continue
+                if not blocks:
+                    record(ERROR, 'seed_outside_every_block', eid,
+                           f'sit at seeds in none of the declared blocks '
+                           f'{sorted(registry.SEED_BLOCKS)}, so no row of the '
+                           f'DESIGN.md 3.4 table licenses them',
+                           run, label, blocks)
+                    continue
+                if 'TUNE' in blocks and not selection:
+                    record(ERROR, 'tune_leakage', eid,
+                           f'sit on TUNE seeds while this experiment is '
+                           f'reported (family={exp.family}, declared block '
+                           f'{exp.seed_block}); no reported estimate may draw '
+                           f'on the selection block',
+                           run, label, blocks)
+                elif 'TUNE' in blocks:
+                    record(NOTE, 'tune_seeds_expected', eid,
+                           'sit on TUNE seeds, which is what this experiment '
+                           'is for; nothing it produces may enter a reported '
+                           'estimate', run, label, blocks)
+                if selection and 'TUNE' not in blocks:
+                    record(lvl, 'selection_out_of_block', eid,
+                           'belong to a selection experiment (declared block '
+                           'TUNE) and sit outside it. DESIGN.md 3.4 reserves '
+                           'CONFIRM and REPLICATE against selection: a '
+                           'hyperparameter chosen at these seeds is chosen on '
+                           'the very runs the reported estimates are computed '
+                           'from', run, label, blocks)
+                if not source_side and any(b in SOURCE_SIDE_BLOCKS
+                                           for b in blocks):
+                    record(lvl, 'source_block_on_target_arm', eid,
+                           'fill an arm with role=target at a seed in a block '
+                           'DESIGN.md 3.4 declares source-side and "never used '
+                           'for target-side estimation"', run, label, blocks)
+                if 'SMOKE' in blocks and exp.seed_block != 'SMOKE':
+                    record(lvl, 'smoke_seed_in_reported_experiment', eid,
+                           'sit at the SMOKE seed, which is disjoint from '
+                           'CONFIRM precisely so that a pipeline-validation '
+                           'run cannot be mistaken for a real one by its seed',
+                           run, label, blocks)
+                if run.seed not in registry.SEED_BLOCKS[exp.seed_block] \
+                        and (eid, run.rel) not in named \
+                        and not (source_side and any(b in SOURCE_SIDE_BLOCKS
+                                                     for b in blocks)):
+                    record(WARN, 'out_of_declared_block', eid,
+                           f'sit outside the {exp.seed_block} block this '
+                           f'experiment declares. Reducing or moving the seed '
+                           f'set is the STANDING_INSTRUCTIONS S8 validation '
+                           f'invocation and is stamped in the header above, '
+                           f'but these runs are not in the block the catalogue '
+                           f'schedules', run, label, blocks)
+        chk.detail[eid] = {'declared_block': exp.seed_block,
+                           'family': exp.family,
+                           'selection_experiment': selection,
+                           'runs_by_block': dict(sorted(census.items()))}
+
+    # The leak itself rather than a proxy for it. Computed over the whole
+    # catalogue, not the selection, because a run shared between a screen and a
+    # confirmatory arm is contaminated whether or not both were asked for.
+    selection_ids = {eid for eid, exp in registry.EXPERIMENTS.items()
+                     if exp.seed_block == 'TUNE'}
+    reported_ids = {eid for eid, exp in registry.EXPERIMENTS.items()
+                    if exp.family in ('confirmatory', 'estimation')}
+    scoped = {r.rel: r for arms in membership.values()
+              for group in arms.values() for r in group}
+    shared_err: list[str] = []
+    shared_note: list[str] = []
+    detail: dict[str, dict] = {}
+    for rel, run in sorted(scoped.items()):
+        also = everywhere.get(rel) or set()
+        sel, rep = sorted(also & selection_ids), sorted(also & reported_ids)
+        if not (sel and rep):
+            continue
+        launched_as = str(run.cfg.get('experiment'))
+        # Who actually estimates from this run: the experiments that declare
+        # the slot it occupies, plus the experiment that launched it, which
+        # owns it whether or not the slot is declared.
+        realised = declaring_experiments(run, declared) | {launched_as}
+        sel_real = sorted(realised & selection_ids)
+        rep_real = sorted(realised & reported_ids)
+        detail[rel] = {'selection': sel, 'reported': rep,
+                       'selection_realised': sel_real,
+                       'reported_realised': rep_real,
+                       'launched_as': launched_as, 'seed': run.seed}
+        (shared_err if (sel_real and rep_real) else shared_note).append(rel)
+    if shared_err:
+        chk.add(ERROR, 'selection_shares_run_with_reported',
+                f'{len(shared_err)} run(s) launched as part of a selection '
+                f'experiment are also the runs a reported experiment estimates '
+                f'from. A hyperparameter chosen on a run and a confirmatory '
+                f'denominator computed from the same run is revision 1\'s '
+                f'defect verbatim (DESIGN.md 11 item 2)',
+                runs=shared_err[:MAX_LISTED], n=len(shared_err),
+                runs_detail={k: detail[k] for k in shared_err[:MAX_LISTED]})
+    if shared_note:
+        chk.add(NOTE, 'selection_shares_configuration_with_reported',
+                f'{len(shared_note)} run(s) resolve to one configuration for '
+                f'both a selection experiment and a reported one, and no '
+                f'declared inventory realises the collision: the selection '
+                f'experiment schedules that arm at other seeds, and the run '
+                f'was not launched as part of it. Under the declared blocks '
+                f'the two never meet (TUNE is 200-204 and CONFIRM 0-9). It is '
+                f'recorded because a screen launched at these seeds would then '
+                f'be selecting on the reported denominators, which is the '
+                f'error above and not this note',
+                runs=shared_note[:MAX_LISTED], n=len(shared_note),
+                runs_detail={k: detail[k] for k in shared_note[:MAX_LISTED]})
+    chk.detail['shared_selection_and_reported'] = len(detail)
+    if artefacts:
+        total = sum(len(v) for v in artefacts.values())
+        chk.add(NOTE, 'shared_configuration_membership',
+                f'{total} (experiment, run) pairing(s) across '
+                f'{len(artefacts)} experiment(s) exist only because two '
+                f'catalogue configurations coincide: the run was launched as '
+                f'another experiment, fills a slot that experiment declares, '
+                f'and fills no slot this one declares. The DESIGN.md 3.4 rows '
+                f'are not applied to them, because nothing this experiment '
+                f'reports can draw on them',
+                n=total,
+                by_experiment={eid: len(v)
+                               for eid, v in sorted(artefacts.items())},
+                runs=sorted({r for v in artefacts.values()
+                             for r in v})[:MAX_LISTED])
+
+    for (code, eid, level), entry in sorted(hits.items()):
+        rels = sorted(set(entry['runs']))
+        chk.add(level, code,
+                f'{eid}: {len(rels)} run(s) {entry["note"]}. Seeds '
+                f'{sorted(entry["seeds"])} in block(s) '
+                f'{sorted(entry["blocks"]) or ["none"]}, across '
+                f'{len(entry["arms"])} arm(s): '
+                + ', '.join(sorted(entry['arms'])[:MAX_LISTED])
+                + (f' (+{len(entry["arms"]) - MAX_LISTED} more)'
+                   if len(entry['arms']) > MAX_LISTED else ''),
+                runs=rels[:MAX_LISTED], experiment=eid, n=len(rels),
+                seeds=sorted(entry['seeds']), blocks=sorted(entry['blocks']),
+                arms=sorted(entry['arms'])[:24])
     return chk
 
 
@@ -699,19 +1516,21 @@ def check_digests(runs: list[Run]) -> Check:
     # Aggregated per field rather than per run: a schema change moves every
     # digest at once, and one line per run would bury every other check.
     mismatched: dict[str, list[str]] = defaultdict(list)
+    # Aggregated for the same reason as the digests below, and it was not:
+    # `--out-root runs_demo --overrides num_episodes=14 freeze_updates=150`
+    # produced 198 near-identical `config_schema_drift` lines, one per run,
+    # which is precisely what buried the PLAN HASH, INVARIANTS and SEED
+    # COMPLETENESS findings in that same invocation.
+    drifted: dict[str, list[str]] = defaultdict(list)
+    invalid: dict[str, list[str]] = defaultdict(list)
     for run in runs:
         try:
             cfg = Config(**run.cfg)
         except TypeError as exc:
-            chk.add(ERROR, 'config_schema_drift',
-                    f'{run.rel}: the stored config cannot be loaded into the '
-                    f'current Config ({exc}); its digests are not comparable '
-                    f'with any run written by this code', runs=[run.rel])
+            drifted[str(exc)].append(run.rel)
             continue
         except ValueError as exc:
-            chk.add(ERROR, 'config_invalid',
-                    f'{run.rel}: the stored config is rejected by Config '
-                    f'validation ({exc})', runs=[run.rel])
+            invalid[str(exc)].append(run.rel)
             continue
         schemas[run.identity.get('digest_schema')] += 1
         for name, recomputed in (('run_digest', cfg.run_digest()),
@@ -724,6 +1543,17 @@ def check_digests(runs: list[Run]) -> Check:
                     f'{run.rel}: stored arm_id {run.identity.get("arm_id")!r} '
                     f'!= {cfg.arm_id()!r} from the stored config',
                     runs=[run.rel])
+    for reason, rels in sorted(drifted.items()):
+        chk.add(ERROR, 'config_schema_drift',
+                f'{len(rels)} of {len(runs)} run(s): the stored config cannot '
+                f'be loaded into the current Config ({reason}); their digests '
+                f'are not comparable with any run written by this code',
+                runs=rels[:MAX_LISTED], reason=reason, n=len(rels))
+    for reason, rels in sorted(invalid.items()):
+        chk.add(ERROR, 'config_invalid',
+                f'{len(rels)} of {len(runs)} run(s): the stored config is '
+                f'rejected by Config validation ({reason})',
+                runs=rels[:MAX_LISTED], reason=reason, n=len(rels))
     for name, rels in sorted(mismatched.items()):
         chk.add(ERROR, 'digest_mismatch',
                 f'{len(rels)} of {len(runs)} run(s): the stored {name} does not '
@@ -736,6 +1566,8 @@ def check_digests(runs: list[Run]) -> Check:
                 runs=rels[:MAX_LISTED], field=name, n=len(rels))
     chk.detail['digest_schemas'] = dict(schemas)
     chk.detail['mismatched'] = {k: len(v) for k, v in sorted(mismatched.items())}
+    chk.detail['config_unloadable'] = sum(len(v) for v in drifted.values())
+    chk.detail['config_rejected'] = sum(len(v) for v in invalid.values())
     if len(schemas) > 1:
         chk.add(ERROR, 'digest_schema_split',
                 f'runs were written under {len(schemas)} digest schemas '
@@ -846,12 +1678,26 @@ def check_run_dir_uniqueness(runs: list[Run]) -> Check:
 
 
 def check_metrics_integrity(runs: list[Run]) -> Check:
+    """Index integrity, outcome content, and per-run distinctness of the file.
+
+    The index check on its own is content-blind, which the adversarial pass
+    demonstrated by copying one seed's `metrics.jsonl` verbatim into three seed
+    directories under rewritten manifests and watching the tree pass clean.
+    Three byte-identical seeds were indistinguishable from three real ones,
+    which is the fabrication mode named in this module's own docstring reached
+    by the one route the digest scheme does not cover. So the file's content
+    hash is required to be distinct between run directories, and the outcome
+    column is required to exist and to vary: a run that trained and recorded no
+    score, or recorded one constant, otherwise reaches `aggregate.py` with the
+    audit's blessing.
+    """
     chk = Check(
         'METRICS INTEGRITY',
         'the published trainer appended on resume without truncating, so a '
         'crash duplicated episodes and corrupted every window statistic '
-        '(DESIGN.md 8.2)')
+        '(DESIGN.md 8.2); and an index check alone cannot see the content')
     short = 0
+    by_content: dict[str, list[str]] = defaultdict(list)
     for run in runs:
         path = os.path.join(run.path, 'metrics.jsonl')
         if not os.path.exists(path):
@@ -859,7 +1705,20 @@ def check_metrics_integrity(runs: list[Run]) -> Check:
                     f'{run.rel}: metrics.jsonl is missing', runs=[run.rel])
             continue
         episodes: list[int] = []
+        outcomes: list[float] = []
+        evals: list[float] = []
+        outcome_rows = 0
         bad_rows = 0
+        digest = hashlib.sha256()
+        try:
+            with open(path, 'rb') as raw:
+                for chunk in iter(lambda: raw.read(1 << 20), b''):
+                    digest.update(chunk)
+        except OSError as exc:
+            chk.add(ERROR, 'metrics_unreadable',
+                    f'{run.rel}: metrics.jsonl cannot be read ({exc})',
+                    runs=[run.rel])
+            continue
         with open(path, encoding='utf-8') as fh:
             for line in fh:
                 line = line.strip()
@@ -870,11 +1729,23 @@ def check_metrics_integrity(runs: list[Run]) -> Check:
                     episodes.append(int(row['episode']))
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     bad_rows += 1
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if OUTCOME_FIELD in row:
+                    outcome_rows += 1
+                    value = _as_float(row.get(OUTCOME_FIELD))
+                    if value is not None:
+                        outcomes.append(value)
+                value = _as_float(row.get(EVAL_OUTCOME_FIELD))
+                if value is not None:
+                    evals.append(value)
+        if episodes:
+            by_content[digest.hexdigest()].append(run.rel)
         if bad_rows:
             chk.add(ERROR, 'metrics_unparseable',
                     f'{run.rel}: {bad_rows} row(s) are not JSON objects keyed '
                     f'by episode', runs=[run.rel], rows=bad_rows)
-        completed = run.get('result', 'episodes_completed')
         counts = Counter(episodes)
         duplicates = sorted(e for e, n in counts.items() if n > 1)
         if duplicates:
@@ -882,23 +1753,117 @@ def check_metrics_integrity(runs: list[Run]) -> Check:
                     f'{run.rel}: {len(duplicates)} episode index/indices appear '
                     f'more than once (first: {duplicates[:5]})',
                     runs=[run.rel], duplicates=duplicates[:24])
-        if completed is None:
+
+        # `episodes_completed` is a field on disk, not an integer. Casting it
+        # unguarded meant one manifest carrying the string 'one thousand' ended
+        # the process with a ValueError and produced no report for any of the
+        # other runs in the tree.
+        raw_completed = run.get('result', 'episodes_completed')
+        completed = _as_int(raw_completed)
+        if raw_completed is None:
             chk.add(ERROR, 'result_absent',
                     f'{run.rel}: no result.episodes_completed; the run did not '
                     f'finish, so it has no endpoint to report', runs=[run.rel])
+        elif completed is None or completed < 0:
+            chk.add(ERROR, 'result_malformed',
+                    f'{run.rel}: result.episodes_completed is '
+                    f'{raw_completed!r}, which is not an episode count, so the '
+                    f'run\'s own claim about its length cannot be checked '
+                    f'against the file', runs=[run.rel],
+                    value=str(raw_completed))
         else:
-            expected = set(range(0, int(completed)))
+            expected = set(range(0, completed))
             if set(episodes) != expected:
                 missing = sorted(expected - set(episodes))
                 extra = sorted(set(episodes) - expected)
                 chk.add(ERROR, 'metrics_not_contiguous',
                         f'{run.rel}: episode index set is not range(0, '
-                        f'{int(completed)}) -- {len(missing)} missing, '
+                        f'{completed}) -- {len(missing)} missing, '
                         f'{len(extra)} out of range',
                         runs=[run.rel], missing=missing[:24], extra=extra[:24])
-            declared = int(run.cfg.get('num_episodes') or 0)
-            if declared and int(completed) < declared:
+            raw_declared = run.cfg.get('num_episodes')
+            declared = _as_int(raw_declared) or 0
+            if raw_declared is not None and _as_int(raw_declared) is None:
+                chk.add(ERROR, 'config_num_episodes_malformed',
+                        f'{run.rel}: config.num_episodes is {raw_declared!r}, '
+                        f'which is not an episode count', runs=[run.rel])
+            if declared and completed < declared:
                 short += 1
+
+        # The outcome, which nothing here used to read. DESIGN.md 5.1 puts
+        # every comparison on the normalised score, so a run with no finite
+        # score has no endpoint, and one with a single distinct score across
+        # every episode recorded a constant rather than a trajectory.
+        if not outcome_rows:
+            chk.add(ERROR, 'outcome_column_absent',
+                    f'{run.rel}: no row carries a {OUTCOME_FIELD!r} field, so '
+                    f'the run recorded no outcome on the normalised scale every '
+                    f'comparison is drawn on (DESIGN.md 5.1)', runs=[run.rel])
+        elif not outcomes:
+            chk.add(ERROR, 'outcome_all_null',
+                    f'{run.rel}: {outcome_rows} row(s) carry {OUTCOME_FIELD!r} '
+                    f'and not one holds a finite number. The run trained and '
+                    f'recorded no score; every statistic computed from it '
+                    f'downstream would be over an empty column', runs=[run.rel],
+                    rows=outcome_rows)
+        elif len(outcomes) == 1 and len(episodes) > 1:
+            # Split out of `outcome_constant`, which used to report this as
+            # "takes one value across 1 episode(s)" on a run of a thousand:
+            # the branch tested `len(episodes)` and the message printed
+            # `len(outcomes)`, so a column that is null almost everywhere was
+            # diagnosed as a zero-variance arm. They are different defects and
+            # only one of them is ambiguous.
+            chk.add(ERROR, 'outcome_mostly_null',
+                    f'{run.rel}: exactly one of {len(episodes)} episode(s) '
+                    f'carries a finite {OUTCOME_FIELD}. That is not a '
+                    f'zero-variance arm, it is a column that is null almost '
+                    f'everywhere, and every statistic drawn from it downstream '
+                    f'would be one number wearing the n of the whole run',
+                    runs=[run.rel], value=str(outcomes[0]),
+                    finite_rows=1, episodes=len(episodes))
+        elif len(episodes) > 1 and len(set(outcomes)) == 1:
+            # A warning, not an error, and the demotion is the point.
+            #
+            # A constant outcome column has two causes and this file cannot
+            # tell them apart. One is the fabrication mode: the column was
+            # written once and never updated. The other is a policy that
+            # collapsed onto a return the environment produces exactly, which
+            # is physically attainable and has been measured in this repo:
+            # `reference_returns.json` records Acrobot-v1 at `noop_return
+            # -500.0` over 100 episodes, and under the 200-step cap every run
+            # on disk was launched with, a near-random Acrobot policy returns
+            # the cap on every single episode. Acrobot is the source env of
+            # E9's `acro2ll` pair and the target env of `cp2acro`.
+            #
+            # DESIGN.md 4.3 already rules on that second case, and its ruling
+            # is not a refusal: a source that did not learn is a stated
+            # exclusion plus a RESERVE draw. Erroring here refused data the
+            # pre-registered spec declares valid, and the only escape,
+            # --allow-audit-failure, waives the whole audit and stamps every
+            # artifact of an otherwise-clean campaign as an override. So it is
+            # reported at a severity that says "look at this", and --strict
+            # still promotes it, so a confirmatory campaign cannot carry one
+            # silently.
+            chk.add(WARN, 'outcome_constant',
+                    f'{run.rel}: {OUTCOME_FIELD} takes one value '
+                    f'({outcomes[0]!r}) across all {len(outcomes)} finite '
+                    f'row(s) of {len(episodes)} episode(s). Either the column '
+                    f'was written once and never updated, or the policy '
+                    f'collapsed onto a return the environment yields exactly '
+                    f'(Acrobot-v1 under a step cap returns the cap every '
+                    f'episode; see reference_returns.json). This file cannot '
+                    f'tell those apart, so it reports rather than adjudicates: '
+                    f'DESIGN.md 4.3 governs a source that did not learn, and '
+                    f'--strict promotes this to an error',
+                    runs=[run.rel], value=str(outcomes[0]),
+                    finite_rows=len(outcomes), episodes=len(episodes))
+        if outcome_rows and not evals:
+            chk.add(WARN, 'eval_outcome_absent',
+                    f'{run.rel}: no row carries a finite '
+                    f'{EVAL_OUTCOME_FIELD!r}; the held-out endpoint '
+                    f'ANALYSIS_PLAN.md draws its co-primary from is not in this '
+                    f'run', runs=[run.rel])
+
         stated = run.get('result', 'metrics_integrity', 'contiguous')
         if stated is False:
             chk.add(ERROR, 'metrics_integrity_self_reported',
@@ -906,6 +1871,19 @@ def check_metrics_integrity(runs: list[Run]) -> Check:
                     f'non-contiguous: '
                     f'{run.get("result", "metrics_integrity", "problems")}',
                     runs=[run.rel])
+    for content, rels in sorted(by_content.items()):
+        if len(rels) > 1:
+            chk.add(ERROR, 'metrics_content_duplicated',
+                    f'{len(rels)} run directories hold a byte-identical '
+                    f'metrics.jsonl (sha256 {content[:12]}). Distinct seeds '
+                    f'cannot produce identical trajectories, so one run\'s '
+                    f'metrics are being served under more than one manifest: '
+                    f'the fabrication mode of DESIGN.md 8.2 reached by a file '
+                    f'copy rather than by a configuration collision',
+                    runs=sorted(rels)[:MAX_LISTED], sha256=content,
+                    n=len(rels))
+    chk.detail['distinct_metrics_files'] = len(by_content)
+    chk.detail['runs_with_metrics'] = sum(len(v) for v in by_content.values())
     if short:
         chk.add(WARN, 'runs_short_of_budget',
                 f'{short} run(s) completed fewer episodes than num_episodes; '
@@ -923,14 +1901,55 @@ def check_freeze(runs: list[Run]) -> Check:
     verified = unverified = 0
     never_left: list[tuple[str, int, int]] = []
     for run in runs:
-        events = run.manifest.get('freeze_events') or []
+        # `freeze_events` written as a JSON object rather than an array made
+        # `enumerate` walk its keys, so `event` was a string and the audit died
+        # on `str.get`, producing no report for any run in the tree. A
+        # malformed schedule is a finding about that run, not an exception.
+        events, malformed = _events(run.manifest.get('freeze_events'))
+        if malformed:
+            chk.add(ERROR, 'freeze_events_malformed',
+                    f'{run.rel}: {malformed} freeze event(s) are not JSON '
+                    f'objects (freeze_events is '
+                    f'{type(run.manifest.get("freeze_events")).__name__}); the '
+                    f'schedule this run recorded cannot be read, so it is '
+                    f'unverified whichever way it ran',
+                    runs=[run.rel], n=malformed)
         transfer = run.condition != 'scratch'
-        window = int(run.cfg.get('freeze_updates') or 0)
-        updates = run.get('result', 'updates', default=0) or 0
+        window = _as_int(run.cfg.get('freeze_updates')) or 0
+        updates = _as_int(run.get('result', 'updates', default=0)) or 0
         checked = 0
         for i, event in enumerate(events):
-            verdict = event.get('verification')
+            # DESIGN.md 8.3 requires a freeze event to carry its
+            # trainable-parameter counts, and a window in which nothing is
+            # trainable is a run that made no progress at all: the fingerprint
+            # check cannot catch it, because a layer that is meant to be frozen
+            # and a layer nobody is training look identical from the weights.
+            trainable = _as_int(event.get('trainable_params'))
+            if 'trainable_params' not in event:
+                chk.add(ERROR, 'freeze_event_params_unrecorded',
+                        f'{run.rel}: freeze event {i} records no '
+                        f'trainable_params; DESIGN.md 8.3 requires the '
+                        f'parameter counts on every freeze event, and without '
+                        f'them a freeze of everything is indistinguishable '
+                        f'from a freeze of the trunk',
+                        runs=[run.rel], event=i)
+            elif trainable is None or trainable <= 0:
+                chk.add(ERROR, 'freeze_event_nothing_trainable',
+                        f'{run.rel}: freeze event {i} declares '
+                        f'trainable_params={event.get("trainable_params")!r}, '
+                        f'so no parameter in the network could move across that '
+                        f'window and the run learned nothing while it was open',
+                        runs=[run.rel], event=i,
+                        trainable_params=str(event.get('trainable_params')))
+            verdict = _mapping(event.get('verification'))
             if verdict is None:
+                if event.get('verification') is not None:
+                    chk.add(ERROR, 'freeze_verification_malformed',
+                            f'{run.rel}: freeze event {i} carries a '
+                            f'verification that is not an object '
+                            f'({event.get("verification")!r}), so the '
+                            f'fingerprint comparison cannot be read',
+                            runs=[run.rel], event=i)
                 continue
             checked += 1
             if verdict.get('frozen_but_changed'):
@@ -992,25 +2011,78 @@ def check_freeze(runs: list[Run]) -> Check:
     return chk
 
 
-def check_source_validity(runs: list[Run]) -> Check:
+def check_source_validity(runs: list[Run], membership=None,
+                          declared: "Declared | None" = None,
+                          out_root: str = 'runs') -> Check:
+    """The gate recomputed, and DESIGN.md 4.3's reserve rule audited.
+
+    Two things were wrong with reading `source.validity.valid` and believing
+    it. First, the flag is written by the run it judges, so the check named
+    after "a source scoring 26.94 out of 475 was transferred from anyway" was
+    passed by a manifest that simply said `valid: true, gate: 0.0`. The gate is
+    therefore compared with `registry.SOURCE_VALIDITY_GATE` and the verdict
+    recomputed from the recorded score, which is also where a disagreement
+    between the two copies of that constant becomes "visible in the data" as
+    `registry.py`'s own comment promises it will be.
+
+    Second, 4.3 does not stop at excluding an invalid source. It requires the
+    seed to be *replaced*, "with source seeds drawn in order from RESERVE until
+    the cell has its full complement of valid sources". Nothing compared the
+    post-exclusion count of valid sources against the declared inventory, so an
+    arm could be complete to the seed-completeness gate and empty in the primary
+    estimand: in the real tree, cell dueling-vanilla stood at one valid source
+    against four exclusions with no replacement ledger at all, and SOURCE
+    VALIDITY reported `[ok]`. The exclusion itself stays a note, exactly as 4.3
+    says; the *absence of the replacement it mandates* is the error.
+    """
     chk = Check(
         'SOURCE VALIDITY',
         'a published source agent scored 26.94 on a task solved at 475 and was '
-        'transferred from anyway (DESIGN.md 4.3)')
+        'transferred from anyway; and an exclusion without the reserve draw '
+        'DESIGN.md 4.3 mandates leaves the primary estimand short')
+    gate_declared = float(registry.SOURCE_VALIDITY_GATE)
+    chk.detail['gate'] = gate_declared
     per_cell: dict[str, Counter] = defaultdict(Counter)
     excluded: dict[str, list[tuple[str, Any, Any]]] = defaultdict(list)
+    invalid_rels: set[str] = set()
     for run in runs:
         if run.condition == 'scratch':
             continue
-        validity = run.get('source', 'validity')
+        validity = _mapping(run.get('source', 'validity'))
         if validity is None:
-            chk.add(ERROR, 'validity_verdict_missing',
-                    f'{run.rel}: a {run.condition} run with no source-validity '
-                    f'verdict; the gate of DESIGN.md 4.3 was never evaluated',
+            code = ('validity_verdict_malformed'
+                    if run.get('source', 'validity') is not None
+                    else 'validity_verdict_missing')
+            chk.add(ERROR, code,
+                    f'{run.rel}: a {run.condition} run with no readable '
+                    f'source-validity verdict; the gate of DESIGN.md 4.3 was '
+                    f'never evaluated, or what it wrote cannot be read',
                     runs=[run.rel])
             per_cell[run.cell]['missing'] += 1
             continue
         valid = validity.get('valid')
+        raw_score = validity.get('source_final_score')
+        score = _as_float(raw_score)
+        raw_gate = validity.get('gate')
+        gate = _as_float(raw_gate)
+
+        # The gate itself, before anything is concluded from it. A recorded gate
+        # that is not the declared one means the verdict was taken under some
+        # other rule than the one DESIGN.md 4.3 states, whatever it claims.
+        if raw_gate is None:
+            chk.add(ERROR, 'validity_gate_unrecorded',
+                    f'{run.rel}: the validity verdict records no gate, so which '
+                    f'threshold it was taken against is unknown',
+                    runs=[run.rel])
+        elif gate is None or abs(gate - gate_declared) > GATE_TOLERANCE:
+            chk.add(ERROR, 'validity_gate_mismatch',
+                    f'{run.rel}: the verdict was taken against gate '
+                    f'{raw_gate!r}, not the {gate_declared} of DESIGN.md 4.3 '
+                    f'and registry.SOURCE_VALIDITY_GATE. A self-declared gate '
+                    f'is the one edit this check exists to refuse',
+                    runs=[run.rel], recorded=str(raw_gate),
+                    declared=gate_declared)
+
         if run.condition == 'transfer_untrained':
             # Not applicable by construction: the source is random, and the
             # manifest must say so rather than leaving a null to be read as a
@@ -1022,22 +2094,51 @@ def check_source_validity(runs: list[Run]) -> Check:
                         f'verdict with no note saying the gate does not apply',
                         runs=[run.rel])
             continue
+
+        # The verdict recomputed. A non-finite score is a measurement failure
+        # and not a rejection: `nan >= 0.6` is False, which is exactly how a
+        # degenerate evaluation comes to read as a source below the gate.
+        if raw_score is None:
+            chk.add(ERROR, 'validity_score_unrecorded',
+                    f'{run.rel}: the validity verdict carries no '
+                    f'source_final_score, so the gate cannot be recomputed and '
+                    f'the flag beside it cannot be checked', runs=[run.rel])
+        elif score is None:
+            chk.add(ERROR, 'validity_score_not_finite',
+                    f'{run.rel}: source_final_score is {raw_score!r}. That is a '
+                    f'measurement which did not happen, not a source which fell '
+                    f'below the gate, and the two must not read the same way',
+                    runs=[run.rel], value=str(raw_score))
+        elif isinstance(valid, bool):
+            implied = score >= gate_declared
+            if implied != valid:
+                chk.add(ERROR, 'validity_verdict_contradicts_gate',
+                        f'{run.rel}: the manifest declares valid={valid} while '
+                        f'its own recorded score {score:.4f} against the '
+                        f'{gate_declared} gate implies valid={implied}. The '
+                        f'verdict is recomputed here rather than believed, '
+                        f'because a check that reads a self-declared boolean is '
+                        f'passed by the very edit it exists to catch',
+                        runs=[run.rel], score=round(score, 6),
+                        declared_valid=valid, implied_valid=implied)
+
         if valid is True:
             per_cell[run.cell]['valid'] += 1
         elif valid is False:
             per_cell[run.cell]['invalid'] += 1
+            invalid_rels.add(run.rel)
             # Reported, never fatal: DESIGN.md 4.3 makes the primary estimand
             # valid-sources-only with the exclusions printed, so an invalid
             # source is an exclusion for `report.py` to carry, not a broken run.
-            excluded[run.cell].append(
-                (run.rel, validity.get('source_final_score'),
-                 validity.get('gate')))
+            # What is fatal is the reserve draw that must follow it, checked
+            # against the declared inventory below.
+            excluded[run.cell].append((run.rel, raw_score, raw_gate))
         else:
             per_cell[run.cell]['unknown'] += 1
             chk.add(ERROR, 'validity_unknown',
                     f'{run.rel}: the validity verdict is null and the condition '
-                    f'is {run.condition}, so the source\'s competence was never '
-                    f'established', runs=[run.rel])
+                    f'is {run.condition}, so the source competence this run '
+                    f'depends on was never established', runs=[run.rel])
     for cell, rows in sorted(excluded.items()):
         gate = rows[0][2]
         chk.add(NOTE, 'source_invalid',
@@ -1048,10 +2149,89 @@ def check_source_validity(runs: list[Run]) -> Check:
                 f'table',
                 runs=[r for r, _s, _g in rows][:MAX_LISTED], cell=cell,
                 n=len(rows),
-                scores=sorted({round(float(s), 4) for _r, s, _g in rows
-                               if s is not None}))
+                scores=sorted({round(_as_float(s), 4) for _r, s, _g in rows
+                               if _as_float(s) is not None}))
     chk.detail['per_cell'] = {cell: dict(counts)
                               for cell, counts in sorted(per_cell.items())}
+
+    # DESIGN.md 4.3's second half: the reserve rule. A declared arm x seed slot
+    # whose occupant transferred from a rejected source is a slot the primary
+    # estimand cannot use, and the design says it is refilled from RESERVE
+    # rather than left short. Measured against the declared inventory, so it
+    # says nothing about seeds that were never run at all: that is seed
+    # completeness's verdict, not this one's.
+    replacements, draws = registry.load_source_replacements(out_root)
+    chk.detail['reserve_ledger'] = {
+        'path': os.path.join(os.path.abspath(out_root),
+                             registry.REPLACEMENTS_RELPATH),
+        'assignments': len(replacements),
+        'arms_drawn_for': sorted(draws),
+    }
+    if membership is not None and declared is not None:
+        short: dict[str, list[str]] = defaultdict(list)
+        short_runs: dict[str, list[str]] = defaultdict(list)
+        smoke_short: dict[str, list[str]] = defaultdict(list)
+        for eid, arms in membership.items():
+            exp = registry.EXPERIMENTS.get(eid)
+            # DESIGN.md 3.4 gives SMOKE one licensed use, pipeline validation,
+            # and ANALYSIS_PLAN.md 9 says nothing computed on it is a result.
+            # An experiment declared there runs under `registry.SMOKE_OVERRIDES`
+            # at twelve episodes, so its sources cannot reach the 0.6
+            # normalised gate and neither can any RESERVE replacement, which is
+            # another twelve-episode run: measured in runs_demo, smoke-transfer
+            # sources score -0.027 / -0.030 / -0.030 and smoke-iface 0.284 /
+            # -0.519 / -1.122. The reserve rule is a rule about a reported
+            # estimand, and E0 has none, so requiring it there made the one
+            # experiment DESIGN.md provides for validating the pipeline
+            # incapable of ever producing a green audit, with
+            # --allow-audit-failure as the only route past it. Recorded as a
+            # note there, and left an error everywhere else: it is currently
+            # and correctly firing on the real tree for src-dueling-vanilla at
+            # 0.5992 against the 0.600 gate, and nothing here touches that.
+            bucket = (smoke_short if exp is not None
+                      and exp.seed_block == 'SMOKE' else short)
+            pairs = declared.target_pairs.get(eid) or set()
+            for label, group in sorted(arms.items()):
+                for run in group:
+                    if (label, run.seed) not in pairs:
+                        continue          # not part of the declared estimand
+                    if run.rel in invalid_rels:
+                        bucket[eid].append(f'{label}@s{run.seed}')
+                        short_runs[eid].append(run.rel)
+        for eid in sorted(smoke_short):
+            slots = sorted(smoke_short[eid])
+            chk.add(NOTE, 'reserve_rule_not_applicable',
+                    f'{eid}: {len(slots)} declared arm x seed slot(s) are '
+                    f'filled by a run whose source failed the validity gate, '
+                    f'and no RESERVE replacement can clear it: {eid} is '
+                    f'declared on the SMOKE block, so every draw is another '
+                    f'pipeline-validation run at the same reduced budget and '
+                    f'fails the same gate. ANALYSIS_PLAN.md 9 puts nothing it '
+                    f'produces in a reported estimand, so there is no '
+                    f'complement for DESIGN.md 4.3 to fill: '
+                    f'{", ".join(slots[:MAX_LISTED])}'
+                    + (f' (+{len(slots) - MAX_LISTED} more)'
+                       if len(slots) > MAX_LISTED else ''),
+                    runs=sorted(set(short_runs[eid]))[:MAX_LISTED],
+                    experiment=eid, n=len(slots), slots=slots[:24])
+        for eid in sorted(short):
+            slots = sorted(short[eid])
+            chk.add(ERROR, 'reserve_rule_not_applied',
+                    f'{eid}: {len(slots)} declared arm x seed slot(s) are '
+                    f'filled by a run whose source failed the validity gate, '
+                    f'and the declared inventory still points at those runs. '
+                    f'DESIGN.md 4.3 makes the primary estimand valid-sources '
+                    f'only, "with source seeds drawn in order from RESERVE '
+                    f'until the cell has its full complement of valid sources", '
+                    f'and the ledger at {registry.REPLACEMENTS_RELPATH} carries '
+                    f'{len(replacements)} assignment(s). Until the draw happens '
+                    f'the arm is complete to the seed count and short in the '
+                    f'estimand: {", ".join(slots[:MAX_LISTED])}'
+                    + (f' (+{len(slots) - MAX_LISTED} more)'
+                       if len(slots) > MAX_LISTED else ''),
+                    runs=sorted(set(short_runs[eid]))[:MAX_LISTED],
+                    experiment=eid, n=len(slots), slots=slots[:24],
+                    ledger_assignments=len(replacements))
     return chk
 
 
@@ -1167,7 +2347,89 @@ def check_source_lineage(runs: list[Run],
     return chk
 
 
+def cross_check_tolerance(chk: Check) -> None:
+    """Compare this file's copy of the DESIGN.md 3.1 tolerance with stats.py's.
+
+    `DESIGN.md` 3.1 declares "a declared tolerance", singular, and names this
+    file as the module that refuses on it. It is nevertheless written down
+    twice: `FRACTION_TOLERANCE` here, which decides
+    `intensity_confounded_unlabelled` below, and `stats.INTENSITY_TOLERANCE`,
+    which decides whether the analysis will draw the same contrast. Neither
+    module read the other and `validate.py` pins six `statlib`/`stats` pairs
+    without pinning this one, so setting this copy to 0.50 left `28 passed, 0
+    failed` while `stats.py` went on refusing at 0.05: two shipped artifacts
+    giving opposite verdicts on one group, and nothing anywhere saying so.
+
+    This is the same move `check_source_validity` makes on the validity gate,
+    for the same reason and with the same severity: a verdict taken under a
+    tolerance other than the declared one was taken under some other rule than
+    the one the design states, whatever it claims. It does not remove the
+    duplication -- the constant should live in `registry.py` beside
+    `SOURCE_VALIDITY_GATE`, which both modules already import -- but it stops
+    the duplication being silent.
+
+    `stats.py` is imported here rather than at module scope: this file is the
+    gate `stats.py` calls, and a module-level dependency on the module it gates
+    would put the analysis on the audit's import path. An import that fails is
+    reported, not passed over. A guard that could not be checked is not a guard
+    that held, so it is a warning and `--strict` promotes it.
+    """
+    try:
+        from experiments import stats as _stats            # noqa: PLC0415
+    except Exception as exc:                               # noqa: BLE001
+        chk.add(WARN, 'tolerance_cross_check_unavailable',
+                f'the second copy of the DESIGN.md 3.1 tolerance lives in '
+                f'stats.py and stats.py could not be imported ({exc!r}), so '
+                f'the two were not compared. The refusal below was taken '
+                f'against {FRACTION_TOLERANCE} and whether the analysis will '
+                f'apply the same number is unknown',
+                tolerance=FRACTION_TOLERANCE, error=str(exc))
+        return
+    other = getattr(_stats, 'INTENSITY_TOLERANCE', None)
+    value = _as_float(other)
+    if value is None:
+        chk.add(WARN, 'tolerance_cross_check_unavailable',
+                f'stats.py declares no readable INTENSITY_TOLERANCE '
+                f'({other!r}), so the second copy of the DESIGN.md 3.1 '
+                f'tolerance could not be compared with the '
+                f'{FRACTION_TOLERANCE} declared here. Either the duplicate '
+                f'was removed, in which case this check should be too, or it '
+                f'was renamed, in which case it is unguarded again',
+                tolerance=FRACTION_TOLERANCE, recorded=str(other))
+        return
+    chk.detail['tolerance_in_stats'] = value
+    if abs(value - FRACTION_TOLERANCE) > GATE_TOLERANCE:
+        chk.add(ERROR, 'tolerance_disagreement',
+                f'DESIGN.md 3.1 declares one tolerance on the cross-arch '
+                f'transferred-parameter fraction and the two copies of it '
+                f'disagree: audit.FRACTION_TOLERANCE={FRACTION_TOLERANCE} '
+                f'refuses the groups below, stats.INTENSITY_TOLERANCE={value} '
+                f'decides whether the analysis draws the same contrast. One '
+                f'of them is not the pre-registered rule, so every verdict in '
+                f'this check and every intensity verdict in stats.py was taken '
+                f'under a threshold the design does not state',
+                tolerance=FRACTION_TOLERANCE, tolerance_in_stats=value,
+                difference=round(abs(value - FRACTION_TOLERANCE), 12))
+
+
 def check_transferred_fraction(membership, exps) -> Check:
+    """Cross-architecture intensity: labelled where declared, refused where not.
+
+    DESIGN.md 3.1 says the audit "refuses a cross-arch contrast whose fractions
+    differ beyond a declared tolerance unless the contrast is explicitly
+    labelled intensity-confounded". Emitting the label itself and warning was
+    not a refusal, so nothing was ever refused. The label the design means is a
+    catalogue declaration, and there is exactly one: an arm whose
+    `transfer_set` is not `PROTOCOL['transfer_set']` is the deliberately
+    unmatched comparison, and its intensity gap is the finding rather than a
+    fault. A group that *claims* the matched protocol and does not have matched
+    intensity is the published defect reconstituted, and is refused.
+
+    The within-arm case is an error outright. The transferred fraction is fixed
+    by the configuration, so it cannot legitimately differ between the seeds of
+    one arm, and averaging over a disagreement is how one bad seed silently
+    rewrote a printed gap from 0.034 to 0.315 and flipped the group's label.
+    """
     chk = Check(
         'TRANSFERRED-FRACTION MATCHING',
         'the same layer list transfers 97 % of the mlp and 51 % of the dueling '
@@ -1179,6 +2441,13 @@ def check_transferred_fraction(membership, exps) -> Check:
     # mlp/dueling pair to compare at all.
     keys = tuple(k for k in DISCRIMINATING
                  if k not in ('arch', 'aggregation'))
+    matched_set = registry.PROTOCOL.get('transfer_set')
+    chk.detail['matched_protocol_transfer_set'] = matched_set
+    chk.detail['tolerance'] = FRACTION_TOLERANCE
+    cross_check_tolerance(chk)
+    # Every group that claims the matched protocol, with how far it sits from
+    # the refusal. Reported below, because the closest one is 0.008 away.
+    headroom: list[tuple[float, str, str, dict]] = []
     for eid, arms in membership.items():
         groups: dict[tuple, dict[str, list[tuple[str, float]]]] = defaultdict(
             lambda: defaultdict(list))
@@ -1186,18 +2455,26 @@ def check_transferred_fraction(membership, exps) -> Check:
             for run in group:
                 if run.condition == 'scratch':
                     continue
-                frac = run.get('transfer', 'summary',
-                               'fraction_of_model_transferred')
-                if frac is None:
+                raw = run.get('transfer', 'summary',
+                              'fraction_of_model_transferred')
+                frac = _as_float(raw)
+                if raw is None:
                     chk.add(ERROR, 'fraction_unrecorded',
                             f'{run.rel}: a {run.condition} run with no '
                             f'transferred-parameter fraction; the intensity of '
                             f'the treatment it received is unknown',
                             runs=[run.rel])
                     continue
+                if frac is None:
+                    chk.add(ERROR, 'fraction_not_finite',
+                            f'{run.rel}: the transferred-parameter fraction is '
+                            f'{raw!r}, which is not a fraction; the intensity '
+                            f'of the treatment it received is unknown',
+                            runs=[run.rel], value=str(raw))
+                    continue
                 sig = _run_signature(run)
                 groups[tuple(sig[k] for k in keys)][str(sig['arch'])].append(
-                    (run.rel, float(frac)))
+                    (run.rel, frac))
 
         # Name each group by the fields that actually differ between the groups
         # of this experiment, so the printed table identifies a row without
@@ -1206,42 +2483,117 @@ def check_transferred_fraction(membership, exps) -> Check:
                         if len({g[i] for g in groups}) > 1)
         for key, by_arch in sorted(groups.items(), key=lambda kv: str(kv[0])):
             described = dict(zip(keys, key))
-            for arch, entries in by_arch.items():
+            unstable: list[str] = []
+            for arch, entries in sorted(by_arch.items()):
                 spread = max(f for _, f in entries) - min(f for _, f in entries)
                 if spread > 1e-9:
-                    chk.add(WARN, 'fraction_varies_within_arm',
+                    unstable.append(arch)
+                    chk.add(ERROR, 'fraction_varies_within_arm',
                             f'{eid}: {arch} runs at one configuration report '
-                            f'transferred fractions spanning {spread:.4f}; the '
-                            f'treatment intensity is not constant across seeds',
+                            f'transferred fractions spanning {spread:.4f}, so '
+                            f'the treatment intensity is not constant across '
+                            f'seeds. The fraction is fixed by the '
+                            f'configuration; a spread means the runs did not '
+                            f'all receive the arm they are labelled with, and '
+                            f'the group mean below is an average over that '
+                            f'disagreement rather than a measurement. Per seed: '
+                            + ', '.join(f'{r}={f:.4f}'
+                                        for r, f in sorted(entries)),
                             runs=[r for r, _ in entries][:MAX_LISTED],
-                            experiment=eid)
+                            experiment=eid, arch=arch,
+                            spread=round(spread, 6),
+                            per_run={r: round(f, 6) for r, f in entries})
             if len(by_arch) < 2:
                 continue
             means = {arch: sum(f for _, f in e) / len(e)
                      for arch, e in by_arch.items()}
             gap = max(means.values()) - min(means.values())
             name = ' '.join(f'{k}={described[k]}' for k in varying) or 'all runs'
+            # The catalogue's own label. `transfer_set` is the field DESIGN.md
+            # 3.1 matches intensity with, so a group that does not carry the
+            # matched protocol is a declared unmatched contrast, and one that
+            # does is claiming intensity it must then actually have.
+            observed_set = described.get('transfer_set')
+            declared_unmatched = (matched_set is not None
+                                  and observed_set is not None
+                                  and observed_set != matched_set)
+            confounded = gap > FRACTION_TOLERANCE
             record = {'experiment': eid, 'group': name,
                       'condition': described.get('condition'),
+                      'transfer_set': observed_set,
                       'fractions': {a: round(f, 4) for a, f in means.items()},
                       'gap': round(gap, 4),
                       'n_runs': sum(len(e) for e in by_arch.values())}
             chk.detail.setdefault('cross_arch_groups', []).append(
-                {**record, 'intensity_confounded': gap > FRACTION_TOLERANCE})
-            if gap > FRACTION_TOLERANCE:
-                # DESIGN.md 3.1 permits such a contrast only when it is
-                # explicitly labelled, so the label is emitted here for
-                # `report.py` to carry rather than the contrast being refused
-                # outright here.
+                {**record, 'intensity_confounded': confounded,
+                 'declared_unmatched': declared_unmatched,
+                 'fractions_not_constant': sorted(unstable),
+                 'per_run': {a: {r: round(f, 6) for r, f in sorted(e)}
+                             for a, e in sorted(by_arch.items())}})
+            if not declared_unmatched:
+                headroom.append((FRACTION_TOLERANCE - gap, eid, name, record))
+            if not confounded:
+                continue
+            fractions = ', '.join(f'{a}={f:.3f}'
+                                  for a, f in sorted(means.items()))
+            if declared_unmatched:
+                # The licensed case, and the label DESIGN.md 3.1 requires the
+                # contrast to carry. E1's and E5's `transfer_set=trunk` arms are
+                # the deliberately unmatched comparison; the gap is what they
+                # are for, and the warning is how the reader is told.
                 chk.add(WARN, 'intensity_confounded',
                         f'{eid}: the cross-arch group [{name}] has fractions '
-                        + ', '.join(f'{a}={f:.3f}'
-                                    for a, f in sorted(means.items()))
-                        + f' -- a gap of {gap:.3f} beyond the '
-                          f'{FRACTION_TOLERANCE} tolerance. Any architecture '
-                          f'contrast drawn here is intensity-confounded and '
-                          f'must be labelled so',
-                        **record)
+                        f'{fractions} -- a gap of {gap:.3f} beyond the '
+                        f'{FRACTION_TOLERANCE} tolerance. This group declares '
+                        f'transfer_set={observed_set!r} rather than the matched '
+                        f'protocol {matched_set!r}, so it is the catalogue\'s '
+                        f'own unmatched contrast and DESIGN.md 3.1 permits it '
+                        f'labelled. Any architecture contrast drawn here is '
+                        f'intensity-confounded and must be presented so',
+                        **record, declared_unmatched=True)
+            else:
+                chk.add(ERROR, 'intensity_confounded_unlabelled',
+                        f'{eid}: the cross-arch group [{name}] declares the '
+                        f'matched protocol transfer_set={observed_set!r} and '
+                        f'has fractions {fractions} -- a gap of {gap:.3f} '
+                        f'beyond the {FRACTION_TOLERANCE} tolerance. The '
+                        f'matching this group claims did not happen, so arch is '
+                        f'confounded with treatment intensity here exactly as '
+                        f'in the published study, with nothing in the catalogue '
+                        f'declaring it. DESIGN.md 3.1 refuses such a contrast '
+                        f'unless it is explicitly labelled: either match the '
+                        f'layer sets, or declare the arm unmatched',
+                        **record, declared_unmatched=False)
+
+    # How close the catalogue itself sits to its own gate. The tolerance was
+    # written when this was a warning and it is now a refusal, and the smallest
+    # margin in the catalogue is E8i's matched groups at a 0.042 gap against
+    # 0.050: the interface-shift experiment, whose subject is varying pad_obs
+    # and extra_actions, which is exactly what moves a parameter count and so
+    # the fraction. Reported unconditionally, because the alternative is that a
+    # maintainer meets it as an audit failure after the change rather than as a
+    # margin before it. Recording it does not move the gate: the refusal above
+    # is unchanged and no group is exempted by appearing here.
+    if headroom:
+        margin, eid, name, record = min(headroom, key=lambda h: h[0])
+        chk.detail['smallest_matched_headroom'] = {
+            'experiment': eid, 'group': name, 'gap': record['gap'],
+            'tolerance': FRACTION_TOLERANCE, 'headroom': round(margin, 6),
+            'groups_claiming_the_matched_protocol': len(headroom)}
+        chk.add(NOTE, 'matched_intensity_headroom',
+                f'{len(headroom)} cross-arch group(s) claim the matched '
+                f'protocol; the closest to refusal is {eid} [{name}] at a gap '
+                f'of {record["gap"]:.4f} against the {FRACTION_TOLERANCE} '
+                f'tolerance, {margin:.4f} from intensity_confounded_unlabelled '
+                f'and a blocked report. DESIGN.md 3.1 makes that tolerance a '
+                f'gate rather than a caption, so the best matched protocol '
+                f'the design achieves has {margin:.4f} of room: a change to '
+                f'the padded interface that widens the gap by that much turns '
+                f'the matched contrast the catalogue declares into an audit '
+                f'error rather than the labelled warning 3.1 asks for',
+                experiment=eid, group=name, gap=record['gap'],
+                tolerance=FRACTION_TOLERANCE, headroom=round(margin, 6),
+                n_matched_groups=len(headroom))
     return chk
 
 
@@ -1283,11 +2635,45 @@ def check_plan_hash(runs: list[Run]) -> Check:
     return chk
 
 
+#: The provenance record DESIGN.md 8.3 requires, as (manifest path, why it is
+#: there). Presence is checked, not content: a provenance block that is half
+#: absent is not a reproducibility record, and the half that is missing is
+#: never the half a reader thinks to look for.
+PROVENANCE_REQUIRED: tuple[tuple[tuple[str, ...], str], ...] = (
+    (('provenance', 'packages'),
+     'the package versions the run was produced under; without them a rerun '
+     'reproduces the code and not the numerics'),
+    (('provenance', 'machine'),
+     'the platform and CPU, which is what a difference in float behaviour is '
+     'traced to'),
+    (('provenance', 'argv'),
+     'the exact invocation, which is the only record of what was asked for as '
+     'opposed to what the catalogue declares'),
+    (('seeds', 'streams'),
+     'the derived seed per RNG stream; DESIGN.md 8.1 gives each role its own '
+     'stream so an ablation cannot perturb machinery it does not touch, and '
+     'the derivation is what makes that checkable'),
+)
+
+
 def check_provenance(runs: list[Run]) -> Check:
     chk = Check(
         'PROVENANCE',
         'a result produced from an uncommitted tree is not reproducible from '
-        'the repository (DESIGN.md 8.3)')
+        'the repository, and a half-recorded provenance block is not a '
+        'reproducibility record (DESIGN.md 8.3)')
+    # Aggregated per field: a provenance field goes missing because the writer
+    # changed, which moves every run at once.
+    for path, why in PROVENANCE_REQUIRED:
+        absent = [r.rel for r in runs if r.get(*path) is None]
+        name = '.'.join(path)
+        chk.detail.setdefault('required_present', {})[name] = \
+            len(runs) - len(absent)
+        if absent:
+            chk.add(ERROR, 'provenance_field_absent',
+                    f'{len(absent)} of {len(runs)} run(s) record no {name}. '
+                    f'DESIGN.md 8.3 requires it: {why}',
+                    runs=absent[:MAX_LISTED], field=name, n=len(absent))
     dirty = [r.rel for r in runs if r.get('provenance', 'git', 'dirty') is True]
     unknown = [r.rel for r in runs
                if r.get('provenance', 'git', 'dirty') is None]
@@ -1405,7 +2791,16 @@ def check_attribution(runs: list[Run], membership, selected,
         for run in orphans:
             eid = str(run.cfg.get('experiment'))
             label = str(run.cfg.get('label'))
-            if eid not in known_exps:
+            if run.seed is None:
+                # Named separately because it is the one reason that is a
+                # property of the manifest rather than of the catalogue: a run
+                # whose seed cannot be read cannot be placed at an arm x seed
+                # slot, so no arm can claim it however well the rest matches.
+                reasons[f'config.seed is '
+                        f'{run.cfg.get("seed")!r}, which is not a seed, so the '
+                        f'run cannot be placed at any arm x seed slot'].append(
+                            run.rel)
+            elif eid not in known_exps:
                 reasons['experiment not in the catalogue'].append(run.rel)
             elif label not in known_labels:
                 reasons['label not an arm of any experiment'].append(run.rel)
@@ -1413,10 +2808,16 @@ def check_attribution(runs: list[Run], membership, selected,
                 reasons['arm exists but is not scheduled at this seed'].append(
                     run.rel)
         for reason, rels in sorted(reasons.items()):
-            chk.add(WARN, 'unattributed_runs',
+            # An error, as this check's own `why` says it must be: a run no
+            # declared arm accounts for cannot be reported and cannot be
+            # excluded by a glob either, so leaving the audit green on it means
+            # an ad hoc or hand-labelled run sits in the tree and everything
+            # downstream that globs will find it.
+            chk.add(ERROR, 'unattributed_runs',
                     f'{len(rels)} run(s): {reason}. Either they are ad hoc, or '
                     f'the catalogue has moved under them; either way no '
-                    f'experiment in it accounts for them',
+                    f'experiment in it accounts for them, so they can neither '
+                    f'be reported nor reliably excluded downstream',
                     runs=rels[:MAX_LISTED], n=len(rels), reason=reason)
     outside = sorted(set(r.rel for r in runs) - claimed_by_selection
                      - {r.rel for r in orphans})
@@ -1433,6 +2834,126 @@ def check_attribution(runs: list[Run], membership, selected,
                 f'arm-level values still win, exactly as in registry.jobs',
                 overrides={k: str(v) for k, v in overrides.items()})
     return chk
+
+
+def check_seed_selection(seeds, declared: "Declared | None" = None,
+                         membership=None, n_runs: int = 0,
+                         experiments: Iterable[str] | None = None
+                         ) -> list[Finding]:
+    """Refuse a selection before it can empty the inventory it is judged on.
+
+    `registry.resolve_seeds('')` returns `()`, which is a legal answer to a
+    legal question and a disaster here: with no target pair for any experiment,
+    `observed & pairs` is empty everywhere, every completeness assertion is true
+    of nothing, and the audit prints a pass. On the real tree `--seeds ""` took
+    nineteen errors to zero without touching a run.
+
+    Emptiness, though, is only the loudest shape of that failure, and closing
+    it alone left the quieter one open. `--seeds 999` resolves to a perfectly
+    good non-empty tuple, so the guard above passes it, and it then names arm x
+    seed slots nobody ran: `check_seed_completeness` reaches
+    `if not (observed & pairs)`, reports `experiment_not_run` as a warning and
+    continues, skipping `arm_absent` and `seeds_missing` entirely, while
+    `check_source_validity`'s reserve loop skips every run because
+    `(label, run.seed) not in pairs`. Measured, on a tree brought current in
+    every other respect: 25 errors at the declared blocks, 0 errors and a
+    rendered "AUDIT PASS" at `--seeds 999`, with the PIPELINE VALIDATION stamp
+    gone from all twelve inventory rows. It is not an out-of-block trick
+    either: `--seeds 5`, an ordinary CONFIRM seed that simply was not run, does
+    the same, so a single-digit typo is enough.
+
+    The property that matters is therefore not that the spec resolves to
+    something, but that what it resolves to is an inventory the tree fills. An
+    empty audit is not a passing audit, so:
+
+    * a selection under which no run on disk fills any declared slot of any
+      selected experiment is refused outright, however that selection was
+      arrived at;
+    * and where the selection was *supplied* (`--seeds` or `--experiments`,
+      rather than the declared blocks and the experiments that have runs), an
+      experiment carrying attributed runs and not one of them at a declared
+      seed is refused too. `--experiments E3` on the real tree is the same hole
+      by the other door: E3's eight attributed runs are E1's, E3 declares none
+      of them, and `requested_experiment_empty` does not fire because the
+      membership is not empty.
+
+    Under the declared blocks the same situation stays a warning
+    (`experiment_not_run`), because nothing was overridden and the runs are
+    still checked under the experiment that does declare them.
+
+    An explicit spec is resolved once, here, because it does not depend on the
+    experiment: `resolve_seeds` consults `exp.seed_block` only when the spec is
+    `None`, which is the one case that cannot be empty.
+    """
+    findings: list[Finding] = []
+    if seeds is not None:
+        try:
+            resolved = registry.resolve_seeds(seeds, 'CONFIRM')
+        except (ValueError, TypeError, KeyError) as exc:
+            return [Finding(
+                ERROR, 'seed_spec_unparseable',
+                f'--seeds {seeds!r} is not a block name, a list or a range '
+                f'({exc}), so no experiment can be resolved into an inventory '
+                f'and nothing below is measured against anything')]
+        if not resolved:
+            findings.append(Finding(
+                ERROR, 'seed_selection_empty',
+                f'--seeds {seeds!r} resolves to no seed at all. The declared '
+                f'arm x seed inventory is then empty for every experiment, so '
+                f'seed completeness has nothing to compare against and reports '
+                f'a pass it never made. DESIGN.md 8.4 permits overriding the '
+                f'gate only when the override is stamped into the output; this '
+                f'one removes the gate. Pass a block name, a list or a range'))
+    if declared is None or membership is None:
+        return findings
+
+    coverage = declared_coverage(membership, declared)
+    covered = sum(cov for _att, cov in coverage.values())
+    supplied = ([f'--seeds {seeds!r}'] if seeds is not None else []) \
+        + ([f'--experiments {" ".join(sorted(experiments))}']
+           if experiments is not None else [])
+    how = ', '.join(supplied) if supplied else 'the declared seed blocks'
+    if n_runs and not covered:
+        attributed = sum(att for att, _cov in coverage.values())
+        findings.append(Finding(
+            ERROR, 'selection_matches_no_run',
+            f'{how} selects an inventory no run on disk fills: {n_runs} run(s) '
+            f'were discovered under this tree, {attributed} of them are '
+            f'attributed to a selected experiment, and not one fills a '
+            f'declared arm x seed slot. Seed completeness, seed blocks and the '
+            f'DESIGN.md 4.3 reserve rule are then all true of the empty set, '
+            f'and the audit reports a pass it never made. An empty audit is '
+            f'not a passing audit. Audit these runs at the seeds they were run '
+            f'at',
+            detail={'runs_discovered': n_runs, 'runs_attributed': attributed,
+                    'runs_at_a_declared_slot': 0,
+                    'seeds_requested': str(seeds),
+                    'experiments_requested': (sorted(experiments)
+                                              if experiments is not None
+                                              else None)}))
+    elif supplied:
+        hollow = sorted(eid for eid, (att, cov) in coverage.items()
+                        if att and not cov)
+        if hollow:
+            lost = sum(coverage[eid][0] for eid in hollow)
+            findings.append(Finding(
+                ERROR, 'selection_scopes_out_runs',
+                f'{len(hollow)} experiment(s) in the selection carry {lost} '
+                f'attributed run(s) and not one of them fills a declared arm x '
+                f'seed slot: {", ".join(hollow[:MAX_LISTED])}'
+                + (f' (+{len(hollow) - MAX_LISTED} more)'
+                   if len(hollow) > MAX_LISTED else '')
+                + f'. The selection was supplied on the command line ({how}), '
+                  f'so what those experiments were measured against is an '
+                  f'inventory nothing on disk fills, and every completeness, '
+                  f'block and source-validity assertion made about them was '
+                  f'vacuous. DESIGN.md 8.4 permits overriding the gate only '
+                  f'when the override is stamped into the output; scoping it '
+                  f'away is not an override, it is a removal',
+                detail={'experiments': hollow[:24], 'n': len(hollow),
+                        'runs_scoped_out': lost,
+                        'seeds_requested': str(seeds)}))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -1469,8 +2990,10 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
     """Run every check. Returns (ok, report)."""
     runs, discovery = discover_runs(out_root)
     overrides = dict(overrides or {})
-    declared = declare(seeds, {r.seed for r in runs}, overrides)
-
+    # `out_root` reaches `registry.jobs` through here, so the DESIGN.md 4.3
+    # reserve ledger is read from the tree under audit rather than from `runs/`.
+    declared = declare(seeds, {r.seed for r in runs}, overrides,
+                       out_root=out_root)
     unknown = sorted(set(experiments or ()) - set(registry.EXPERIMENTS))
     explicit = experiments is not None
     _, _, everywhere = attribute(runs, registry.EXPERIMENTS, declared)
@@ -1485,6 +3008,13 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
         selected = [eid for eid in registry.EXPERIMENTS if eid in with_runs]
 
     membership, orphans, _ = attribute(runs, selected, declared)
+    # Resolved after attribution on purpose. Whether a seed spec parses is a
+    # property of the spec; whether it selects an inventory the tree fills is a
+    # property of the spec *and* the tree, and only the second one closes the
+    # vacuous pass.
+    selection_findings = check_seed_selection(
+        seeds, declared, membership, len(runs),
+        list(experiments) if experiments is not None else None)
     exps = {eid: registry.EXPERIMENTS[eid] for eid in selected}
     in_scope = {r.rel for arms in membership.values()
                 for group in arms.values() for r in group}
@@ -1494,13 +3024,13 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
 
     checks = [
         check_invariants(membership, exps, declared),
-        check_seed_completeness(membership, exps, seeds, declared),
-        check_tune_leakage(membership, exps),
+        check_seed_completeness(membership, exps, declared),
+        check_seed_blocks(membership, exps, declared, everywhere),
         check_digests(scoped),
         check_run_dir_uniqueness(scoped),
         check_metrics_integrity(scoped),
         check_freeze(scoped),
-        check_source_validity(scoped),
+        check_source_validity(scoped, membership, declared, out_root),
         check_source_lineage(scoped, runs),
         check_transferred_fraction(membership, exps),
         check_plan_hash(scoped),
@@ -1519,6 +3049,13 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
                                  'be excluded from an analysis that globs')
         disc.findings.extend(discovery)
         checks.insert(0, disc)
+    if selection_findings:
+        sel = Check('SEED SELECTION',
+                    'a selection that resolves to nothing, or to an inventory '
+                    'no run on disk fills, does not relax the completeness '
+                    'gate, it disables it (DESIGN.md 8.4)')
+        sel.findings.extend(selection_findings)
+        checks.insert(0, sel)
     if unknown:
         bad = Check('SELECTION', 'an experiment id that is not in the catalogue')
         bad.add(ERROR, 'unknown_experiment',
@@ -1542,7 +3079,11 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
 
     n_err = sum(c.count(ERROR) for c in checks)
     n_warn = sum(c.count(WARN) for c in checks)
-    ok = n_err == 0 and not (strict and n_warn)
+    # Not `n_warn`: see DECLARED_BY_DESIGN. Both counts go into the report, so
+    # the difference between "warnings" and "warnings --strict would promote"
+    # is a number the reader can see rather than a rule buried in a predicate.
+    n_promotable = sum(c.promotable() for c in checks)
+    ok = n_err == 0 and not (strict and n_promotable)
     report = {
         'ok': ok,
         'out_root': os.path.abspath(out_root),
@@ -1558,6 +3099,8 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
         'multiplicity_ledger': multiplicity_ledger(selected),
         'errors': n_err,
         'warnings': n_warn,
+        'warnings_promotable_under_strict': n_promotable,
+        'warnings_declared_by_design': sorted(DECLARED_BY_DESIGN),
         'checks': [{'name': c.name, 'why': c.why, 'status': c.status(strict),
                     'errors': c.count(ERROR), 'warnings': c.count(WARN),
                     'notes': c.count(NOTE), 'detail': c.detail,
@@ -1570,7 +3113,13 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
 def audit_ok(out_root: str, experiments: Iterable[str] | None = None,
              seeds=None, strict: bool = False,
              overrides: dict | None = None) -> tuple[bool, dict]:
-    """The gate `report.py` calls. True only when every check passes.
+    """The gate `report.py` calls. Returns `(ok, report)`, not a bare bool.
+
+    Spelled out because the tuple is a trap for a caller who trusts the name:
+    `if not audit_ok(...)` is always False, since a two-element tuple is always
+    truthy, and a caller written that way gets a silently green gate over a
+    failed audit. The one caller in the tree, `report.py`, unpacks it correctly.
+    `ok` is True only when every check passes.
 
     `DESIGN.md` §8.4: aggregation and reporting refuse to run on a failed audit
     unless overridden, and the override is stamped into the output. The report
@@ -1612,7 +3161,17 @@ def render(report: dict, verbose: bool = False, notes: bool = False) -> str:
                   else '   (default: those with runs on disk)'))
     out.append(f'  runs        : {report["runs_in_scope"]} in scope of '
                f'{report["runs_discovered"]} discovered')
-    seeds = report['seeds_requested'] or 'the block each experiment declares'
+    # `or` was wrong here, and dangerously so: `--seeds ""` is falsy, so the
+    # header printed "the block each experiment declares" over an invocation
+    # that had requested no seed at all. DESIGN.md 8.4 requires an override to
+    # be stamped into the output, and a mislabelled one is worse than none: the
+    # audit trail positively asserted a check it had not made. Only `None` means
+    # the declared block.
+    requested = report['seeds_requested']
+    if requested is None:
+        seeds = 'the block each experiment declares'
+    else:
+        seeds = f'{requested!r}   (OVERRIDE of the declared blocks)'
     out.append(f'  seeds       : {seeds}')
     out.append(f'  plan hash   : {report["plan_hash"]}  '
                f'(ANALYSIS_PLAN.md, current)')
@@ -1680,13 +3239,23 @@ def render(report: dict, verbose: bool = False, notes: bool = False) -> str:
         out.append('   every mlp/dueling pair the selection permits; the group '
                    'key names what differs between rows')
     for group in groups:
+        # The label and the refusal are printed apart. DESIGN.md 3.1 permits a
+        # confounded contrast only when the catalogue declares it unmatched, so
+        # a reader has to be able to see at a glance which rows are the
+        # declared unmatched comparison and which are a matching that failed.
+        if not group['intensity_confounded']:
+            mark = '  '
+        elif group.get('declared_unmatched'):
+            mark = '  INTENSITY-CONFOUNDED (declared unmatched)  '
+        else:
+            mark = '  INTENSITY-CONFOUNDED, UNDECLARED: REFUSED  '
         out.append(f'  {group["experiment"]:4s} '
                    + '  '.join(f'{arch}={f:.3f}'
                                for arch, f in sorted(group['fractions'].items()))
                    + f'  gap={group["gap"]:.3f}'
-                   + ('  INTENSITY-CONFOUNDED  '
-                      if group['intensity_confounded'] else '  ')
-                   + str(group['group'])[:96])
+                   + ('  FRACTION VARIES WITHIN ARM'
+                      if group.get('fractions_not_constant') else '')
+                   + mark + str(group['group'])[:96])
 
     # ANALYSIS_PLAN.md 7. Printed on every invocation so that the count of
     # analyses carrying no p-value is a recorded fact rather than a claim -- and
@@ -1734,7 +3303,10 @@ def main(argv=None) -> int:
                         'a list/range such as "0-2" (default: the block each '
                         'experiment declares). Reducing it is the '
                         'STANDING_INSTRUCTIONS S8 validation invocation, and it '
-                        'is recorded in the report')
+                        'is recorded in the report and stamped in the header. '
+                        'A spec resolving to no seed at all is refused rather '
+                        'than obeyed: it would empty the declared inventory and '
+                        'make every completeness assertion vacuously true')
     p.add_argument('--overrides', nargs='*', default=None,
                    help='the launch-level overrides that were in force, as '
                         'field=value (e.g. freeze_updates=150 '

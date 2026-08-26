@@ -189,3 +189,219 @@ when its guard is removed is false for roughly ten of the sixteen rows.
 4. Re-run `validate.py --runs runs` until green, and fix A8 so green means green.
 5. A1–A3: the correctness-of-reported-numbers set.
 6. A4–A7: before any number reaches the paper.
+
+
+---
+
+## Audit state on the P0 tree, 2026-08-25
+
+`python experiments/audit.py --out-root runs` reports **AUDIT FAIL: 27 errors, 5
+warnings**, on three checks. None of them is a live defect, and each is expected
+for a different reason. Recorded so that a later reader does not have to
+re-derive this, and so that a *fourth* failure would stand out.
+
+| Check | Errors | Why it fires | Action |
+|---|---|---|---|
+| `PLAN HASH` | 1 (+1 warn) | `ANALYSIS_PLAN.md` and `DESIGN.md` were amended on 2026-08-25 (revision 6), after the 44 P0 runs were produced. The check is doing exactly its job: it says the affected results are exploratory until the change is recorded in `ANALYSIS_PLAN.md` §11 | **Done.** The amendment is recorded in §11. P0 is n=1 pipeline validation and carries no result regardless (§9) |
+| `SEED COMPLETENESS` | 19 | P0 ran one seed; the design requires ten | None. Clears when Tier 1 runs |
+| `INVARIANTS` | 7 | `source_seed` did not exist when the P0 runs were written, so their manifests have no such key and the audit reads `None` against a declared `0`. **Verified not a live defect**: a freshly constructed transfer `Config` populates `source_seed=0`, so runs launched after B4 store it | None. Clears on relaunch |
+
+The 4 `intensity_confounded` warnings on E1 and E5 `transfer_set=trunk` are **by
+design**: that arm is the deliberately unmatched comparison, and the warning is
+the label the design requires it to carry (`DESIGN.md` §3.1).
+
+One live consequence worth stating: because the plan hash changed, **no P0 run
+may be pooled with a Tier 1 run in a single table**. `aggregate.py` already
+refuses that (more than one `ANALYSIS_PLAN.md` hash in one table is a
+reporting-stopper), and `audit.py` escalates it to `ERROR`. This is the intended
+behaviour, not something to work around.
+
+
+---
+
+## Sleep contamination in the cost model, 2026-08-26
+
+**Established independently of `plan.py`**, from `wall_time_s` and `env_steps` in
+the 44 P0 manifests, with each run's start reconstructed from the manifest mtime.
+Three bands separate cleanly, with no judgement call:
+
+| Band | n | median ms/step | range |
+|---|---|---|---|
+| clean | 33 | **5.98** | 4.72 to 7.23 |
+| spans an idle window | 4 | **169.44** | 158.88 to 192.08 |
+| immediately post-wake | 7 | **10.14** | 7.45 to 12.48 |
+
+The four slow runs all started between 18:23 and 18:37 on 2026-08-24 and all
+finished between 08:34 and 09:10 the next morning. They did not fail and they did
+not collide with each other. They were in flight across an overnight idle window
+and their wall clock includes it. **This is machine sleep, not defect B1.** B1 was
+real and the fix is still required, but it did not cause these four.
+
+### What this confirms
+
+The re-harvest of the plain-LunarLander coefficient is **correct**. It moved from
+0.011609 to 0.006184 s/step, and the 14 clean LunarLander dueling runs give
+6.36 ms/step gross by direct division, against 6.184 fitted net of the documented
+0.023 s/episode overhead. The old value was contaminated; the new one is not.
+
+### What it also exposes, and the re-harvest did not catch
+
+**The new interface-variant cost keys are themselves contaminated.** Of the eight
+`extra_actions=2,pad_obs=4` runs, exactly one is clean:
+
+| Run | Band | ms/step |
+|---|---|---|
+| `iface-scratch-mlp-vanilla` | clean | **5.25** |
+| `iface-scratch-mlp-double` | spans sleep | 169.81 |
+| `iface-scratch-dueling-vanilla` | spans sleep | 192.08 |
+| `iface-transfer-mlp-vanilla` | post-wake | 11.76 |
+| `iface-transfer-mlp-double` | post-wake | 10.14 |
+| `iface-scratch-dueling-double` | post-wake | 11.50 |
+| `iface-transfer-dueling-vanilla` | post-wake | 9.87 |
+| `iface-transfer-dueling-double` | post-wake | 7.45 |
+
+Every run behind the fitted `0.009352` and `0.008803` s/step is post-wake. The one
+clean interface run is **5.25 ms/step**, statistically indistinguishable from the
+clean plain-LunarLander median of 5.70. So the interface variant is **not
+intrinsically slower**, and those two keys overestimate by roughly 1.7x.
+
+The exclusion rule the re-harvest applied ("group gate", "whole-harvest gate")
+removed the worst contamination by accident rather than by diagnosis. The correct
+filter is **temporal**: exclude any run that overlaps an idle window, and any run
+that starts within about two hours after one. A ms/step outlier rule cannot
+distinguish a slow configuration from a slow machine, and only the timestamps can.
+
+### Launch blocker
+
+**Sleep and hibernation must be disabled before the confirmatory run.** This is
+not housekeeping, it is the dominant term in the schedule. The projected cost of
+E1, E2, E4, E5 and E8i at ten seeds is 720 runs and **82.8 h at `--jobs 6`**,
+which is three and a half days and therefore three overnight windows. At the P0
+rate, each overnight costs about 14 h of stalled wall clock plus a degraded
+post-wake period, and the added time creates further overnights. Left alone this
+roughly doubles the calendar time; it does not change the compute.
+
+Two consequences for the runner, neither of which is currently implemented:
+
+1. `wall_time_s` is **not a trustworthy cost signal** for any run that spans an
+   idle window, and nothing in the pipeline currently detects that. A run whose
+   wall clock exceeds its own step count times a plausible rate by more than, say,
+   5x should be flagged in the manifest rather than silently fitted.
+2. The harvest should record the wall-clock **band** of each run it fits, so a
+   later reader can see whether a coefficient rests on clean data. Two of the four
+   current keys do not.
+
+
+---
+
+## Adversarial verification of the fix pass, 2026-08-26
+
+Ten reviewers were pointed at the ten rewritten modules and told that the fix
+agents' claims were unverified and might be wrong, and that a defect "fixed" by
+deleting a check, widening a tolerance or broadening an exemption was the single
+most important thing to find. Every finding rated critical or high was then
+handed to a separate skeptic told to **refute** it.
+
+**59 findings across 7 reviewers. 20 sent for refutation: 18 confirmed, 2 refuted.**
+Three reviewers (`sweep.py`, `plan.py`, `plots.py`+`tables.py`) died on connection
+errors and were re-commissioned.
+
+| Severity | Count |
+|---|---|
+| critical | 5 |
+| high | 22 |
+| medium | 21 |
+| low | 11 |
+
+### The five criticals
+
+1. **`stats.py` `section_controls` is row-order dependent.** It builds its
+   per-seed map with a last-wins `iterrows` loop, the exact pattern
+   `arm_by_seed`'s own docstring says was fixed; that section never calls
+   `arm_by_seed`. The skeptic reproduced corruption on **unmodified repo data**:
+   copying `runs_demo/per_seed.csv` once in file order and once row-reversed, the
+   same rows in a different order, moves **32 contrast rows and flips signs and
+   verdicts**. `C1-C0` for dueling-vanilla goes from "positive, excludes zero" to
+   "covers zero". Section 5 correctly *refuses* the same estimand on the same
+   data while section 7 prints it with an interval excluding zero, and it reaches
+   a generated paper table under a caption naming it as the confirmatory
+   estimand.
+2. **`stats.py` computes n, mean, SD and the "seed-level bootstrap" CI over rows,
+   not seeds.**
+3. **`aggregate.py` credits a zero-shot policy with reaching 25% of solved.**
+   `min_periods=1` makes the trailing-100-episode mean at episode 0 a single
+   5-episode evaluation. Two runs record `steps_to_threshold_p25 = 83` env steps,
+   uncensored, at `updates=0` with `learning_starts=1000`. Next smallest is 8379,
+   median 38435. Both are transfer arms and the **top two by jumpstart**, so the
+   bias is systematic and points toward the arms the transfer claim rests on.
+   Only p25 is affected.
+4. **`audit.py --seeds 999` scopes the gate away.** 33 errors become 8, and the 8
+   survivors are two known-stale conditions unrelated to seeds. On a clean tree
+   this is AUDIT PASS, exit 0, no override stamp. The audit is the gate
+   `report.py` refuses on.
+5. **`registry.py` never plumbs `source_seed` into `Config`.** A reserve
+   replacement re-points `source_checkpoint` to the RESERVE source but leaves
+   `cfg.source_seed` at the default, so the digest is unchanged and the
+   replacement writes into the **rejected run's directory**, recording the wrong
+   source seed. This defeats fix B4 one layer up, and the reserve rule is about
+   to fire for real: `src-dueling-vanilla` scored 0.5992 against the 0.600 gate.
+
+### What the weakening lens found, which is the reassuring half
+
+Mostly clean, and checked properly rather than asserted: `report.py`'s wording
+guards are strictly stronger across 11,592 sentence-by-kind-by-evidence
+combinations (0 weakenings, 12 strengthenings); `statlib`'s primitives return
+bit-identical numbers across 600 differential calls; an old-versus-new run of
+`stats.py` on one `per_seed.csv` changed **zero** of 4,406 shared JSON leaves. No
+module-level numeric constant changed value. Several checks got genuinely
+stronger. The real weakening is narrow: the TUNE exemption lost its
+`family == 'screen'` conjunct, and the MDE agreement tolerance was set to 0.02,
+which is exactly the smallest round value admitting the one row that fails at
+0.01.
+
+### One error of the parent's own, found by review
+
+`DESIGN.md` 7's pilot evidence for the revision-6 endpoint amendment was computed
+over every row with `condition == 'scratch'` and `env == 'LunarLander-v3'`. That
+is eight rows, not four: it pooled the `CONFIRM` scratch arms at seed 0 with the
+`C4SRC` positive-control sources at seed 300, which 3.4 forbids in those words.
+The corrected ordering puts `mlp/vanilla` **fourth** on final score and **second**
+on AUC; the text said first and last. Corrected in place, and logged in the
+change log rather than quietly patched, because it is an instance of the very
+error the seed blocks exist to prevent.
+
+### Consequence for the launch
+
+The **run path and the analysis path are separable**. Only `registry.py` corrupts
+what gets *recorded*; every other defect above is in a layer that reads
+`metrics.jsonl` and can be re-derived. So the campaign is gated on a short list:
+`registry.py`'s `source_seed`, the `auc_score` denominator in `src/dqn/train.py`
+(baked into manifests at write time), and an independent review of `sweep.py`,
+whose FATAL B1 fix is the only blocking fix in this project that has never been
+checked by anyone other than the agent that wrote it.
+
+
+### Sleep blocker: CLEARED and verified, 2026-08-26
+
+The user disabled sleep, and it was checked at the OS level rather than taken on
+trust, because the schedule depends on it:
+
+| Setting | AC value | Meaning |
+|---|---|---|
+| `STANDBYIDLE` (sleep after) | `0x0` | Never |
+| `HIBERNATEIDLE` (hibernate after) | `0x0` | Never |
+| `HYBRIDSLEEP` | `0x0` | Disabled |
+| `DISKIDLE` | `0x4b0` | 1200 s, irrelevant under six writing workers |
+
+`powercfg /availablesleepstates` reports **Standby (S3)** and explicitly *not*
+Standby (S0 Low Power Idle), so this is classic S3 and the setting above genuinely
+governs it. Modern Standby, which can idle a machine regardless of these values,
+is not in play.
+
+That is consistent with the P0 evidence: the four affected runs **suspended and
+resumed** rather than dying, and their processes survived, which is what S3 does
+and what a reboot would not have allowed.
+
+**One residual, not blocking.** The DC (battery) sleep timeout is still 600 s. If
+this machine is a laptop that can be unplugged, that is the one remaining route to
+a repeat of the overnight stall. On AC it cannot happen.

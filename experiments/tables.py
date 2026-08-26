@@ -23,8 +23,8 @@ What each design choice here is defending against, defect by defect:
   or an endpoint the table does not have.
 * **A blank read as an omission.** An estimation-only row has no p-value *by
   design* -- `ANALYSIS_PLAN.md` 7 emits p-values inside exactly one family of
-  eight -- so its p column carries an explicit em dash and a footnote saying
-  so. A blank cell would read as a number the authors declined to report,
+  eight -- so its p column carries an explicit `NO_P_MARKER` and a footnote
+  saying so. A blank cell would read as a number the authors declined to report,
   which is the opposite of the claim being made.
 * **A suppressed test rendered as a null result.** Where `stats.py` refused a
   confirmatory member (an incomplete arm, an ambiguous primary arm, an
@@ -51,7 +51,31 @@ What each design choice here is defending against, defect by defect:
   the plan's own reference of one score unit.
 * **A single-seed number quoted as a result.** When any tabulated arm has
   n < 3, every caption carries the `PIPELINE VALIDATION - NOT A RESULT` stamp
-  (`ANALYSIS_PLAN.md` 9, `STANDING_INSTRUCTIONS` S8).
+  (`ANALYSIS_PLAN.md` 9, `STANDING_INSTRUCTIONS` S8). **n is a count of
+  distinct seeds**, and so is the number that stamp fires on: a row count
+  presented as a seed count let one seed's table, concatenated three times,
+  print "n = 3 seeds per arm" and drop the stamp entirely.
+* **A seed block used for something it is barred from.** `seed_block` is a
+  REQUIRED column, not an optional one, because two guards read it: TUNE seeds
+  may never enter a reported estimate (`ANALYSIS_PLAN.md` 8) and the `C4SRC`
+  and `RESERVE` blocks may never enter target-side estimation (`DESIGN.md`
+  3.4). Both used to be written `if 'seed_block' in df.columns`, which is a
+  guard that skips itself exactly when the column it needs is missing.
+* **An invalid source treated as valid** (`DESIGN.md` 9). `main_results`
+  carries the source-validity verdict, the source score, the rejected source
+  seeds and any `RESERVE` substitution, because 4.3 puts them in the results
+  table and because `stats.py --source-policy valid` drops exactly those runs
+  from the primary estimand: a descriptive table that prints them unflagged
+  disagrees with the estimand beside it and nothing reconciles the two.
+* **P1 quoted as asymptotic performance.** The convergence gate of
+  `DESIGN.md` 5.2 is reported per arm, the fraction of arms still moving at the
+  budget is stated, and where any arm fails the gate the P1 column is *renamed*
+  performance at budget.
+* **A table produced over a failed audit.** `DESIGN.md` 8.4: reporting refuses
+  to run on a failed audit unless overridden, and the override is stamped into
+  the output. This module calls `audit.audit_ok` itself and refuses; with
+  `--allow-audit-failure` the override and the failing check names go into
+  every caption and every provenance sidecar.
 
 Nothing here computes an inference. Tables 2, 3 and 6 take their estimates from
 `stats.py --json`; without `--stats` those tables are emitted with an explicit
@@ -86,6 +110,7 @@ _REPO = os.path.dirname(_HERE)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
+from experiments import audit as auditmod                         # noqa: E402
 from experiments import registry                                  # noqa: E402
 from experiments import stats as statsmod                         # noqa: E402
 from src.dqn import envs, provenance                              # noqa: E402
@@ -110,6 +135,54 @@ MDE_MULTIPLIERS = statsmod.MDE_MULTIPLIERS
 PLANNING_SDS = statsmod.PLANNING_SDS
 UNPOWERED_MDE = statsmod.UNPOWERED_MDE
 SOURCE_VALIDITY_GATE = statsmod.SOURCE_VALIDITY_GATE
+SOURCE_ONLY_BLOCKS = statsmod.SOURCE_ONLY_BLOCKS
+PLANNING_SDS_MAX = max(PLANNING_SDS.values()) if PLANNING_SDS else float('nan')
+
+#: `ANALYSIS_PLAN.md` 6.3 pre-commits a verdict per cell before any run: in the
+#: quiet cells the design detects "a few tens of return points, which is ample";
+#: in the noisy dueling-vanilla scratch cell "the MDE approaches or exceeds the
+#: whole distance from random play to solved, so that cell is not powered for a
+#: modest effect and will be reported as an estimate with an interval".
+#: `UNPOWERED_MDE` captures only the "exceeds" half, so a cell sitting exactly
+#: at the plan's own tabulated noisy-cell MDE was being reported as powered:
+#: the opposite of the pre-registration for the one cell the plan singles out.
+#: The "approaches" boundary is therefore read off the plan's own planning
+#: inputs rather than invented here: the largest pre-registered planning SD at
+#: the Holm-corrected multiplier IS the noisy cell's tabulated MDE.
+MODEST_EFFECT_MDE = PLANNING_SDS_MAX * MDE_MULTIPLIERS[('paired', 'holm8')]
+
+#: `ANALYSIS_PLAN.md` 6.2's two ways of stating the same gap, both DERIVED from
+#: the pre-registered multipliers. They are not interchangeable: the pairing
+#: reduces the detectable effect by about 28 %, and the unpaired test needs an
+#: effect about 39 % larger. A note that took the second figure, rounded it up
+#: and called it the first cited the section that says the opposite, in a
+#: module whose docstring promises captions and notes that are computed rather
+#: than typed.
+_PAIRING_REDUCTION_PCT = 100.0 * (1.0 - MDE_MULTIPLIERS[('paired', 'nominal')]
+                                  / MDE_MULTIPLIERS[('unpaired', 'nominal')])
+_PAIRING_INFLATION_PCT = 100.0 * (MDE_MULTIPLIERS[('unpaired', 'nominal')]
+                                  / MDE_MULTIPLIERS[('paired', 'nominal')] - 1.0)
+
+#: The note those two figures are quoted in, built once here rather
+#: than inside `table_power`, so `--self-test` can read the rendered
+#: sentence and check that each figure is quoted in its own place. A
+#: note assembled inside the function that returns a whole `Table` was
+#: reachable only by constructing a full `Context`, which is why the
+#: wiring was pinned as two literals instead and then went stale.
+_PAIRING_NOTE = (
+    'sigma(delta) is the SD of the PAIRED delta and scales the paired MDE; '
+    'sigma(pooled) is the root-mean-square of the two arms\' SDs and '
+    'scales the unpaired MDE. The gap between the paired and unpaired '
+    'multipliers is why the paired test is primary: at this sample size '
+    'the matched-seed design REDUCES the detectable effect by '
+    f'{_PAIRING_REDUCTION_PCT:.0f}% '
+    f'({MDE_MULTIPLIERS[("paired", "nominal")]} against '
+    f'{MDE_MULTIPLIERS[("unpaired", "nominal")]} sigma), equivalently '
+    f'the unpaired test needs an effect about {_PAIRING_INFLATION_PCT:.0f}% '
+    'LARGER to reach the same power (ANALYSIS_PLAN.md 6.2). Both figures '
+    'are computed from the pre-registered multipliers rather than typed: '
+    'the reduction and the inflation are different numbers, and quoting '
+    'the second as the first overstates the design gain.')
 C4_LOWER_BOUND = statsmod.C4_LOWER_BOUND
 EXCLUSION_RESTRICTIONS = statsmod.CONTROL_EXCLUSION_RESTRICTIONS
 
@@ -117,13 +190,17 @@ EXCLUSION_RESTRICTIONS = statsmod.CONTROL_EXCLUSION_RESTRICTIONS
 CONDITION_ORDER: tuple[str, ...] = (
     'scratch', 'transfer', 'transfer_untrained', 'transfer_permuted')
 
-#: The em dash that stands in the p column of an estimation-only row. It is a
+#: The marker that stands in the p column of an estimation-only row. It is a
 #: character, not an absence: `ANALYSIS_PLAN.md` 7 permits p-values in exactly
 #: one family, so "no p-value here" is a design statement and must read as one.
-EM_DASH = '—'
+#: Three ASCII hyphens, which LaTeX sets as an em rule: the character itself is
+#: barred from the source by `STANDING_INSTRUCTIONS` S10, and a marker that is
+#: typed as an em dash in one file and as a hyphen in another is a marker a
+#: reader cannot rely on.
+NO_P_MARKER = '---'
 
 #: What a cell says when the quantity was never recorded. Deliberately distinct
-#: from EM_DASH: one means "not defined", the other "not measured".
+#: from NO_P_MARKER: one means "not defined", the other "not measured".
 NOT_RECORDED = 'n/r'
 
 #: `DESIGN.md` 5.1. The no-op score is measured per variant; a variant whose
@@ -212,7 +289,7 @@ _LATEX_SPECIALS: dict[str, str] = {
 #: The non-ASCII that legitimately appears in this study's prose and numbers.
 _LATEX_UNICODE: dict[str, str] = {
     '±': '$' + _BS + 'pm$',        # every mean +/- sd cell
-    '—': '---',                    # the estimation-only p marker
+    chr(0x2014): '---',            # an em dash in the INPUT data, mapped
     '–': '--',
     '−': '-',                      # unicode minus, from numpy formatting
     '→': '$' + _BS + 'rightarrow$',
@@ -425,8 +502,13 @@ def fmt_p(p: Any) -> str:
     (`ANALYSIS_PLAN.md` 2.2).
     """
     if not _isnum(p):
-        return EM_DASH
+        return NO_P_MARKER
     p = float(p)
+    if not 0.0 <= p <= 1.0:
+        # A probability outside [0, 1] is not a p-value, and formatting it as
+        # one would launder an upstream defect into a table cell that reads
+        # like a result. Printed with its value so the defect is traceable.
+        return f'INVALID (not a probability: {p:.5f})'
     return f'{p:.5f}' if p >= 1e-4 else f'{p:.2e}'
 
 
@@ -460,12 +542,22 @@ def exclusion_bound_text(lo: Any, nd: int = 3) -> str:
 
     `ANALYSIS_PLAN.md` 4: always reported, whatever the verdict, because a
     non-significant difference is never evidence of equivalence.
+
+    The three branches are not cosmetic. An interval whose lower bound is zero
+    excludes nothing, so the phrase "no degradation" attached to it would be an
+    affirmative no-harm claim resting on a null, which `DESIGN.md` 9 lists as a
+    fallacy to refuse. The branch is taken on the bound AS PRINTED, so the
+    sentence and the number beside it cannot disagree at the third decimal.
     """
     if not _isnum(lo):
         return NOT_RECORDED
-    lo = float(lo)
-    if lo >= 0:
-        return f'no degradation (interval at or above {lo:+.{nd}f})'
+    lo = round(float(lo), nd) + 0.0
+    if lo > 0:
+        return (f'every degradation is excluded: the whole interval lies at '
+                f'or above {lo:+.{nd}f}')
+    if lo == 0:
+        return (f'nothing is excluded: the lower bound is exactly '
+                f'{lo:.{nd}f}, so no degradation bound is licensed here')
     return f'worse than {abs(lo):.{nd}f} excluded'
 
 
@@ -479,7 +571,30 @@ def exclusion_bound_text(lo: Any, nd: int = 3) -> str:
 #: rather than yielding a table full of NOT_RECORDED.
 REQUIRED_COLUMNS: tuple[str, ...] = (
     'run_dir', 'label', 'arm', 'cell', 'condition', 'env', 'seed',
-    'final_score', 'auc_score')
+    'seed_block', 'final_score', 'auc_score')
+
+#: Pinned by `aggregate.py` and read here, but not fatal when absent: an older
+#: CSV can still be tabulated, and the absence is stated in the affected
+#: table's notes rather than rendered as a column of NOT_RECORDED nobody
+#: explains. `seed_block` is deliberately NOT in this list but in the required
+#: one: two correctness guards depend on it (the TUNE exclusion of
+#: `ANALYSIS_PLAN.md` 8 and the source-only-block exclusion of `DESIGN.md` 3.4),
+#: and a guard that skips itself when its input is missing is a guard that
+#: fails open, which is how TUNE seeds reached every table in the version this
+#: one replaces.
+NAMED_OPTIONAL_COLUMNS: tuple[tuple[str, str], ...] = (
+    ('source_valid', 'the source-validity verdict of DESIGN.md 4.3'),
+    ('source_final_score', 'the source normalised score the gate is applied '
+                           'to (DESIGN.md 4.3)'),
+    ('source_seed', 'the seed of the source checkpoint, which differs from '
+                    'the run seed after a RESERVE replacement (DESIGN.md 4.3)'),
+    ('source_seed_block', 'the seed block the source was drawn from '
+                          '(DESIGN.md 3.4)'),
+    ('convergence_slope', 'the final-window slope the convergence gate of '
+                          'DESIGN.md 5.2 is read from'),
+    ('reinitialised_layer_count', 'the reinitialised-layer count DESIGN.md '
+                                  '3.1 requires in every results table'),
+)
 
 
 def load_per_seed(path: str) -> pd.DataFrame:
@@ -496,6 +611,11 @@ def load_per_seed(path: str) -> pd.DataFrame:
             f'as part of the per_seed schema. Refusing to guess at them.')
     if not len(df):
         raise ValueError(f'{path} has no rows; there is nothing to tabulate.')
+    if df['seed'].isna().any():
+        raise ValueError(
+            f'{path} has {int(df["seed"].isna().sum())} row(s) with no seed. '
+            f'n is a count of seeds here, so a row whose seed is unknown '
+            f'cannot be counted into one (ANALYSIS_PLAN.md 9).')
     for col in ('cell', 'condition', 'label', 'arm', 'env', 'source_env'):
         if col in df.columns:
             df[col] = df[col].fillna('').astype(str)
@@ -589,6 +709,16 @@ def env_reference(canonical: str) -> Optional[dict]:
 #    a caption cannot contradict the table it sits under.
 # ===========================================================================
 
+#: What a caption says when a table was produced over a FAILED audit.
+#: `DESIGN.md` 8.4: reporting refuses to run on a failed audit unless
+#: overridden, and the override is stamped into the output. Without the stamp a
+#: table built over a failed audit is byte-indistinguishable from one built
+#: over a passing audit, which is the whole reason the gate exists.
+AUDIT_OVERRIDE_STAMP = (
+    'AUDIT FAILED, OVERRIDDEN (DESIGN.md 8.4): this table was produced over an '
+    'audit that did not pass, on an explicit --allow-audit-failure')
+
+
 @dataclass
 class Context:
     """Everything a caption needs to state, computed once per invocation."""
@@ -603,34 +733,94 @@ class Context:
     n_arms: int
     min_n: int
     max_n: int
+    min_metric_n: int
     validation: bool
     plan_hash_in_data: tuple[str, ...]
+    optional_absent: tuple[tuple[str, str], ...]
     argv: tuple[str, ...]
+    audit_root: Optional[str] = None
+    audit_ok: Optional[bool] = None
+    audit_override: bool = False
+    audit_failing: tuple[str, ...] = ()
+
+    @property
+    def plan_mismatch(self) -> bool:
+        """True when the runs were produced under a different plan hash.
+
+        `DESIGN.md` 8.3 and 9 ("stale artifacts"): a caption that stamps the
+        CURRENT plan hash onto data produced under a different one asserts a
+        provenance the data does not have. The console warning that used to be
+        the only place this appeared does not travel with the .tex file.
+        """
+        current = self.plan_hashes.get('ANALYSIS_PLAN.md')
+        return bool(self.plan_hash_in_data
+                    and (len(self.plan_hash_in_data) > 1
+                         or self.plan_hash_in_data[0] != current))
 
     def n_phrase(self) -> str:
+        """n, always as a count of DISTINCT SEEDS, with the runs beside it."""
         if self.min_n == self.max_n:
-            return (f'n = {self.min_n} seed(s) per arm, over {self.n_arms} '
-                    f'arms and {self.n_runs} runs')
-        return (f'n = {self.min_n}-{self.max_n} seeds per arm -- arms are not '
-                f'equal-sized here, and no seed is dropped to make them so '
-                f'(ANALYSIS_PLAN.md 8) -- over {self.n_arms} arms and '
-                f'{self.n_runs} runs')
+            head = (f'n = {self.min_n} distinct seed(s) per arm, over '
+                    f'{self.n_arms} arms and {self.n_runs} runs')
+        else:
+            head = (f'n = {self.min_n}-{self.max_n} distinct seeds per arm '
+                    f'(arms are not equal-sized here, and no seed is dropped '
+                    f'to make them so, ANALYSIS_PLAN.md 8), over '
+                    f'{self.n_arms} arms and {self.n_runs} runs')
+        if self.n_runs > self.n_arms * self.max_n:
+            head += ('. There are more runs than seeds x arms, so at least one '
+                     'arm holds several configurations at one seed; n counts '
+                     'seeds, not rows')
+        if self.min_metric_n < self.min_n:
+            head += (f'. On at least one co-primary endpoint the value is '
+                     f'finite on only {self.min_metric_n} seed(s) of some arm; '
+                     f'every affected cell carries its own coverage')
+        return head
 
     def stamp(self) -> str:
         bits = [f'per_seed.csv {self.per_seed_sha or "unhashed"}']
         if self.stats_sha:
             bits.append(f'stats.json {self.stats_sha}')
-        bits.append(f'ANALYSIS_PLAN.md {self.plan_hashes.get("ANALYSIS_PLAN.md")}')
+        current = self.plan_hashes.get('ANALYSIS_PLAN.md')
+        bits.append(f'ANALYSIS_PLAN.md in force here {current}')
+        if self.plan_hash_in_data:
+            bits.append('ANALYSIS_PLAN.md recorded in the run data '
+                        + ', '.join(self.plan_hash_in_data))
         commit = (self.git.get('commit') or '')[:12] or 'unknown'
         dirty = ', working tree dirty' if self.git.get('dirty') else ''
         bits.append(f'commit {commit}{dirty}')
-        return 'Provenance: ' + '; '.join(bits) + '.'
+        if self.audit_ok is not None:
+            bits.append('audit ' + ('passed' if self.audit_ok
+                                    else 'FAILED and was overridden'))
+        text = 'Provenance: ' + '; '.join(bits) + '.'
+        if self.plan_mismatch:
+            text += (' PLAN HASH MISMATCH: the runs were produced under a '
+                     'different pre-registration from the one in force here, '
+                     'so every confirmatory number in this table is '
+                     'EXPLORATORY until the change is recorded in '
+                     'ANALYSIS_PLAN.md 11 (DESIGN.md 8.3, 9).')
+        return text
 
 
 def build_context(df: pd.DataFrame, per_seed: str, stats_path: Optional[str],
-                  argv: Sequence[str]) -> Context:
+                  argv: Sequence[str], audit_root: Optional[str] = None,
+                  audit_ok: Optional[bool] = None,
+                  audit_override: bool = False,
+                  audit_failing: Sequence[str] = ()) -> Context:
     groups = arm_groups(df)
-    sizes = [len(g) for _, g in groups] or [0]
+    sizes = [n_seeds(g) for _, g in groups] or [0]
+    # The n the validation stamp fires on is the smallest number of seeds any
+    # tabulated co-primary endpoint was actually computed from, not the arm
+    # size: an arm of ten seeds whose final_score is finite on two of them
+    # supports a two-seed statement, whatever its n column says.
+    metric_sizes: list[int] = []
+    for _k, g in groups:
+        for metric in CONFIRMATORY_ENDPOINTS:
+            if metric in df.columns:
+                vals = _series(g, metric)
+                metric_sizes.append(
+                    int(g[np.isfinite(vals)]['seed'].nunique()))
+    effective = min(sizes + (metric_sizes or [min(sizes)]))
     return Context(
         per_seed_path=per_seed,
         per_seed_sha=provenance.file_hash(per_seed),
@@ -642,11 +832,20 @@ def build_context(df: pd.DataFrame, per_seed: str, stats_path: Optional[str],
         n_arms=len(groups),
         min_n=int(min(sizes)),
         max_n=int(max(sizes)),
-        validation=int(min(sizes)) < MIN_N_FOR_INFERENCE,
+        min_metric_n=(int(min(metric_sizes)) if metric_sizes
+                      else int(min(sizes))),
+        validation=int(effective) < MIN_N_FOR_INFERENCE,
         plan_hash_in_data=tuple(sorted(
             set(df['plan_hash'].dropna().astype(str)))
             if 'plan_hash' in df.columns else ()),
+        optional_absent=tuple((col, why) for col, why
+                              in NAMED_OPTIONAL_COLUMNS
+                              if col not in df.columns),
         argv=tuple(argv),
+        audit_root=audit_root,
+        audit_ok=audit_ok,
+        audit_override=audit_override,
+        audit_failing=tuple(audit_failing),
     )
 
 
@@ -668,6 +867,10 @@ def build_caption(ctx: Context, what: str, *,
     parts.extend(e.rstrip('.') + '.' for e in extra)
     if ctx.validation:
         parts.insert(0, VALIDATION_STAMP + ':')
+    if ctx.audit_override:
+        parts.insert(0, AUDIT_OVERRIDE_STAMP
+                     + (' (' + ', '.join(ctx.audit_failing) + ').'
+                        if ctx.audit_failing else '.'))
     parts.append(ctx.stamp())
     return ' '.join(parts)
 
@@ -722,26 +925,294 @@ def arm_groups(df: pd.DataFrame) -> list[tuple[tuple, pd.DataFrame]]:
     return groups
 
 
-def scratch_headroom(df: pd.DataFrame, cell: str, env: str) -> Optional[float]:
-    """1 - the cell's own scratch mean, in this same environment.
+def target_side(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop the runs whose seed block exists only to donate a source.
+
+    `DESIGN.md` 3.4 bars `C4SRC` from target-side estimation and reserves
+    `RESERVE` for replacement sources. Both blocks hold *scratch* runs on the
+    *target* environment, so without this filter the positive control's donors
+    join the very baseline they are meant to be independent of. `stats.py`
+    applies exactly this filter before every target-side estimate and names the
+    hazard in `scratch_arm`; this module had no equivalent, so its headroom
+    column was computed on scratch and C4SRC pooled, wrong by up to 0.059 score
+    units on the P0 tree, which is larger than the pre-registered equivalence
+    margin. The block list is imported from `stats.py`, never restated, so the
+    two cannot drift apart.
+    """
+    if 'seed_block' not in df.columns:            # refused by load_per_seed
+        return df
+    return df[~df['seed_block'].isin(SOURCE_ONLY_BLOCKS)]
+
+
+def scratch_headroom(df: pd.DataFrame, cell: str,
+                     env: str) -> tuple[Optional[float], int]:
+    """(1 - the cell's own scratch mean in this env, the seeds it was read on).
 
     The residual scale confound `DESIGN.md` 2.5 names: a cell whose scratch
     baseline sits near the ceiling has less room to gain and more to lose, so
     every between-cell reading needs this number beside it. The threshold is 1
     by construction of the normalisation, so headroom is 1 - the scratch mean.
+
+    The seed count travels with the number because the mean is taken over the
+    rows carrying a finite score, which need not be the rows the arm's n
+    counts: a headroom silently computed on two of ten seeds would be a
+    different quantity wearing the same name.
     """
-    rows = df[(df['cell'] == cell) & (df['env'] == env)
-              & (df['condition'] == 'scratch')]
-    vals = pd.to_numeric(rows['final_score'], errors='coerce').dropna()
+    rows = target_side(df)
+    rows = rows[(rows['cell'] == cell) & (rows['env'] == env)
+                & (rows['condition'] == 'scratch')]
+    vals = pd.to_numeric(rows['final_score'], errors='coerce')
+    keep = rows[np.isfinite(vals)]
+    vals = vals[np.isfinite(vals)]
     if not len(vals):
-        return None
-    return 1.0 - float(vals.mean())
+        return None, 0
+    return 1.0 - float(vals.mean()), int(keep['seed'].nunique())
 
 
 def _series(g: pd.DataFrame, col: str) -> pd.Series:
     if col not in g.columns:
         return pd.Series(dtype=float)
     return pd.to_numeric(g[col], errors='coerce')
+
+
+def n_seeds(g: pd.DataFrame) -> int:
+    """The arm's n, as `ANALYSIS_PLAN.md` 9 means it: distinct seeds.
+
+    A row count is not a seed count. Concatenating one seed's table three times
+    (a re-run, a merge) turned n=1 into "n = 3 seed(s) per arm" and took the
+    `PIPELINE VALIDATION - NOT A RESULT` stamp off every caption, because the
+    stamp fires on n < 3. The same defect fires with no tampering at all
+    wherever an arm holds two configurations at each seed. Counting seeds is
+    what makes the stamp mean what it says.
+    """
+    return int(g['seed'].nunique()) if 'seed' in g.columns else 0
+
+
+def fmt_metric(g: pd.DataFrame, col: str, nd: int = 3) -> str:
+    """mean +/- SD for one arm and one metric, carrying its own coverage.
+
+    Two disagreements are marked in the cell rather than left to the reader:
+    a metric present on fewer seeds than the arm has, and an arm holding more
+    rows than seeds. The second is not a formatting nicety: two runs of one arm
+    at one seed are two configurations, so the SD printed there is a
+    within-configuration spread, not the across-seed spread that every interval
+    and every equivalence verdict in this study is scaled by.
+    """
+    vals = _series(g, col)
+    if not len(vals):
+        return NOT_RECORDED
+    finite = g[np.isfinite(vals)]
+    vals = vals[np.isfinite(vals)]
+    if not len(vals):
+        return NOT_RECORDED
+    text = fmt_mean_sd(vals, nd=nd)
+    seeds = int(finite['seed'].nunique())
+    total = n_seeds(g)
+    tags: list[str] = []
+    if seeds < total:
+        tags.append(f'{seeds} of {total} seeds')
+    elif len(vals) < len(g):
+        # Same seeds, fewer runs: the metric is non-finite on some of the arm's
+        # runs. The n beside it would otherwise be the only number on the row,
+        # and it would not be the number this statistic used.
+        tags.append(f'{len(vals)} of {len(g)} runs')
+    if len(vals) > seeds:
+        tags.append(f'{len(vals)} rows at {seeds} seed(s)')
+    return text + (f' [{"; ".join(tags)}]' if tags else '')
+
+
+def metric_coverage(df: pd.DataFrame, cols: Sequence[str]) -> list[str]:
+    """Arms where a tabulated metric is missing on some of the arm's seeds."""
+    out: list[str] = []
+    for (_env, _cell, _cond, label), g in arm_groups(df):
+        total = n_seeds(g)
+        short = []
+        for col in cols:
+            vals = _series(g, col)
+            if not len(vals):
+                continue
+            finite = g[np.isfinite(vals)]
+            seeds = int(finite['seed'].nunique())
+            if seeds < total:
+                short.append(f'{col} on {seeds} of {total} seeds')
+            elif len(finite) < len(g):
+                short.append(f'{col} on {len(finite)} of {len(g)} runs')
+        if short:
+            out.append(f'{label} (' + '; '.join(short) + ')')
+    return out
+
+
+def duplicate_seed_arms(df: pd.DataFrame) -> list[str]:
+    """Arms holding more than one run at some seed, named rather than averaged.
+
+    `DESIGN.md` 8.4 makes a differing configuration inside one arm an audit
+    failure, not a thing to average, and `ANALYSIS_PLAN.md` 4 gates the
+    equivalence claim on the across-seed SD that averaging duplicates deflates.
+    """
+    out: list[str] = []
+    for (_env, _cell, _cond, label), g in arm_groups(df):
+        if len(g) > n_seeds(g):
+            counts = g.groupby('seed').size()
+            worst = counts[counts > 1]
+            out.append(f'{label} ('
+                       + ', '.join(f'seed {int(s)} x{int(k)}'
+                                   for s, k in worst.items()) + ')')
+    return out
+
+
+#: The per-run fields the catalogue uses to tell one arm from another, imported
+#: from `audit.py` rather than listed again here. `DESIGN.md` 8.4 makes "a
+#: differing invariant across an experiment's runs" an audit failure, not a
+#: thing to average, so an arm holding two values of any of them is an arm
+#: whose mean is a mean over two protocols. The check used to be hard-wired to
+#: `freeze_updates`, so injecting a second learning rate into one arm produced
+#: a table that averaged it and said nothing.
+ARM_INVARIANT_FIELDS: tuple[str, ...] = auditmod.DISCRIMINATING
+
+
+def moved_invariants(g: pd.DataFrame, columns: Sequence[str]) -> list[str]:
+    """One entry per declared invariant that moved inside a single arm."""
+    out: list[str] = []
+    for col in columns:
+        if col not in g.columns:
+            continue
+        vals = sorted({str(v) for v in g[col].dropna().tolist()})
+        if len(vals) > 1:
+            out.append(f'{col} ({", ".join(vals)})')
+    return out
+
+
+def arms_with_moved_invariants(df: pd.DataFrame) -> list[str]:
+    """Every arm whose declared invariants are not constant across its runs."""
+    cols = [c for c in ARM_INVARIANT_FIELDS if c in df.columns]
+    out: list[str] = []
+    for (_env, _cell, _cond, label), g in arm_groups(df):
+        moved = moved_invariants(g, cols)
+        if moved:
+            out.append(f'{label}: ' + '; '.join(moved))
+    return out
+
+
+def source_state(g: pd.DataFrame) -> dict[str, Any]:
+    """One arm's source-validity verdict, as `DESIGN.md` 4.3 requires it shown.
+
+    The gate is on the source's NORMALISED score, and the verdict decides
+    whether the arm is inside the primary estimand at all: `stats.py` under
+    `--source-policy valid` drops exactly the runs whose `source_valid` is
+    False. A descriptive table that prints those runs' scores in the same
+    column and the same format as every other arm, with no flag, disagrees with
+    the estimand table beside it and nothing reconciles them. That is the
+    published study's own error (transfer from a source that never learned its
+    task) reproduced inside the corrected pipeline, so the verdict, the score,
+    the rejected seeds and any RESERVE substitution are read here and printed.
+    """
+    out: dict[str, Any] = {'known': False, 'text': NOT_RECORDED,
+                           'rejected': [], 'reserve': [], 'has_source': False}
+    if 'source_valid' not in g.columns:
+        out['text'] = NOT_RECORDED
+        return out
+    v = g['source_valid']
+    scores = _series(g, 'source_final_score')
+    scores = scores[np.isfinite(scores)]
+    if v.isna().all():
+        # No source at all: a scratch arm, or an untrained/permuted control
+        # whose donor is synthesised rather than trained. Not a missing value.
+        out['text'] = 'n/a'
+        return out
+    out['known'] = True
+    out['has_source'] = True
+    n_ok = int((v == True).sum())                            # noqa: E712
+    n_bad = int((v == False).sum())                          # noqa: E712
+    mean = float(scores.mean()) if len(scores) else None
+    score_text = fnum(mean, 3, missing=NOT_RECORDED)
+    if n_bad and not n_ok:
+        out['text'] = f'REJECTED {score_text} < {SOURCE_VALIDITY_GATE}'
+    elif n_bad:
+        out['text'] = (f'{n_ok} valid, {n_bad} REJECTED; '
+                       f'mean {score_text}')
+    else:
+        out['text'] = f'valid {score_text}'
+    for _i, r in g.iterrows():
+        valid_here = r.get('source_valid')
+        if valid_here is False or valid_here == 0:
+            seed = fint(r.get('source_seed', r.get('seed')))
+            out['rejected'].append(
+                f'{r.get("label")} run seed {fint(r.get("seed"))}, source seed '
+                f'{seed}, source score '
+                f'{fnum(r.get("source_final_score"), 6)} against the '
+                f'{SOURCE_VALIDITY_GATE} gate')
+        if str(r.get('source_seed_block', '')) == 'RESERVE':
+            out['reserve'].append(
+                f'{r.get("label")} run seed {fint(r.get("seed"))} draws its '
+                f'source from RESERVE seed {fint(r.get("source_seed"))}')
+    return out
+
+
+def convergence_state(df: pd.DataFrame, stats: Optional[dict]) -> dict:
+    """The convergence gate of `DESIGN.md` 5.2, per arm and in aggregate.
+
+    5.2 is explicit: the gate "is reported alongside P1 ... with the fraction of
+    non-converged runs stated", and "where runs have not converged, P1 is named
+    performance at budget, not asymptotic performance". Neither the fraction nor
+    the renaming appeared in any table, while the caption reproduced the full
+    P1 definition as though the endpoint were asymptotic.
+
+    Distinguishability from zero is `stats.py`'s to decide (it has the arm-level
+    bootstrap, and `per_seed.csv` carries no per-run slope standard error), so
+    the verdict is taken from `s4_convergence` when a stats file is supplied.
+    Without one the point slope is still shown and the table says, in as many
+    words, that the gate itself was not evaluated: a slope with no interval is
+    not a verdict.
+    """
+    per_label: dict[str, dict] = {}
+    for (_env, _cell, _cond, label), g in arm_groups(df):
+        s = _series(g, 'convergence_slope')
+        s = s[np.isfinite(s)]
+        per_label[str(label)] = {
+            'median': float(np.median(s)) if len(s) else None,
+            'n': int(len(s)), 'moving': None}
+    section = (stats or {}).get('s4_convergence') or {}
+    evaluated = bool(section.get('available'))
+    if evaluated:
+        for r in section.get('per_arm', []):
+            rec = per_label.get(str(r.get('label')))
+            if rec is not None:
+                rec['moving'] = bool(r.get('still_moving'))
+                if rec['median'] is None:
+                    rec['median'] = r.get('median_slope')
+    failing = sorted(k for k, v in per_label.items() if v.get('moving'))
+    seen = sorted(k for k, v in per_label.items()
+                  if v.get('moving') is not None)
+    return {'evaluated': evaluated, 'per_label': per_label,
+            'failing': failing, 'n_arms': len(per_label),
+            # Arms the gate never saw are counted separately, never into the
+            # denominator: stats.py evaluates the gate on its analysis set, so
+            # an arm excluded by --source-policy valid has no verdict at all,
+            # and folding it into "0 of 44 arms are still moving" would report
+            # a pass the gate never issued for it.
+            'n_evaluated': len(seen), 'not_evaluated':
+                sorted(set(per_label) - set(seen)),
+            'have_slopes': any(v['n'] for v in per_label.values()),
+            'failing_from_stats': list(section.get('failing') or [])}
+
+
+def convergence_cell(rec: Optional[dict]) -> str:
+    """One arm's slope cell: the number, and whether the gate flagged it."""
+    if not rec or rec.get('median') is None:
+        return NOT_RECORDED
+    text = f'{float(rec["median"]):+.5f}'
+    if rec.get('moving') is True:
+        return text + ' STILL MOVING'
+    if rec.get('moving') is False:
+        return text
+    return text + ' (gate not evaluated)'
+
+
+def p1_endpoint_name(conv: dict) -> str:
+    """The P1 column header, renamed when the convergence gate fails (5.2)."""
+    if conv.get('failing'):
+        return 'final_score (P1, at budget)'
+    return 'final_score (P1)'
 
 
 # ===========================================================================
@@ -751,51 +1222,94 @@ def _series(g: pd.DataFrame, col: str) -> pd.Series:
 #    fraction (`DESIGN.md` 3.1) and headroom (2.5).
 # ===========================================================================
 
-def table_main_results(df: pd.DataFrame, ctx: Context) -> Table:
+def table_main_results(df: pd.DataFrame, ctx: Context,
+                       stats: Optional[dict] = None) -> Table:
+    conv = convergence_state(df, stats)
     cols = (
         Col('arm', 'Arm (label)'),
         Col('cell', 'Cell'),
         Col('condition', 'Condition'),
         Col('env', 'Env'),
-        Col('n', 'n', 'r'),
-        Col('final_score', 'final_score (P1)', 'r'),
+        Col('n', 'n (seeds)', 'r'),
+        Col('final_score', p1_endpoint_name(conv), 'r'),
         Col('final_return', 'raw return', 'r'),
         Col('auc_score', 'auc_score (P2)', 'r'),
         Col('episode_length', 'episode length', 'r'),
         Col('within_run_sd', 'within-run SD', 'r'),
         Col('frac', 'transf. frac.', 'r'),
         Col('headroom', 'headroom', 'r'),
+        Col('source', 'Source validity'),
+        Col('slope', 'conv. slope', 'r'),
     )
     rows: list[dict[str, Any]] = []
     rules: set[int] = set()
     prev_block: Optional[tuple] = None
     fraction_varies: list[str] = []
+    rejected: list[str] = []
+    reserve: list[str] = []
+    n_rejected_arms = 0
+    n_source_arms = 0
+    headroom_short: list[str] = []
     for (env, cell, cond, label), g in arm_groups(df):
         block = (_env_rank(env)[0], cell)
         if prev_block is not None and block != prev_block:
             rules.add(len(rows))
         prev_block = block
+        transfers = cond != 'scratch'
         fr = _series(g, 'transferred_param_fraction').dropna()
         if len(fr) > 1 and float(fr.max() - fr.min()) > 1e-9:
             fraction_varies.append(label)
+        src_state = source_state(g)
+        if src_state['has_source']:
+            n_source_arms += 1
+        if src_state['rejected']:
+            n_rejected_arms += 1
+        rejected.extend(src_state['rejected'])
+        reserve.extend(src_state['reserve'])
+        head, head_seeds = scratch_headroom(df, cell, env)
+        seeds = n_seeds(g)
+        if head is not None and head_seeds < seeds:
+            headroom_short.append(f'{cell} on {env_tag(env)} '
+                                  f'({head_seeds} seed(s))')
         rows.append({
             'arm': label or '(unlabelled)',
             'cell': cell or NOT_RECORDED,
             'condition': cond or NOT_RECORDED,
             'env': env_tag(env),
-            'n': str(len(g)),
-            'final_score': fmt_mean_sd(_series(g, 'final_score')),
-            'final_return': fmt_mean_sd(_series(g, 'final_return'), nd=1),
-            'auc_score': fmt_mean_sd(_series(g, 'auc_score')),
-            'episode_length': fmt_mean_sd(
-                _series(g, 'episode_length_final100'), nd=1),
-            'within_run_sd': fmt_mean_sd(_series(g, 'within_run_sd')),
-            'frac': (fnum(fr.mean(), 3) if len(fr)
-                     else ('n/a' if cond == 'scratch' else NOT_RECORDED)),
-            'headroom': fnum(scratch_headroom(df, cell, env), 3),
+            'n': str(seeds),
+            'final_score': fmt_metric(g, 'final_score'),
+            'final_return': fmt_metric(g, 'final_return', nd=1),
+            'auc_score': fmt_metric(g, 'auc_score'),
+            'episode_length': fmt_metric(g, 'episode_length_final100', nd=1),
+            'within_run_sd': fmt_metric(g, 'within_run_sd'),
+            # The transfer-only discipline, applied through one branch rather
+            # than through a `missing=` argument that is consulted only when
+            # the value is absent: a scratch row carrying a Config default for
+            # transferred_param_fraction was printing a treatment intensity for
+            # an arm that transferred nothing.
+            'frac': (fnum(fr.mean(), 3) if (transfers and len(fr))
+                     else ('n/a' if not transfers else NOT_RECORDED)),
+            'headroom': (fnum(head, 3) + (f' [{head_seeds} seed(s)]'
+                                          if head is not None
+                                          and head_seeds < seeds else '')),
+            'source': src_state['text'],
+            'slope': convergence_cell(conv['per_label'].get(str(label))),
         })
 
+    moved = arms_with_moved_invariants(df)
+    duplicates = duplicate_seed_arms(df)
+    coverage = metric_coverage(
+        df, ('final_score', 'auc_score', 'final_return',
+             'episode_length_final100', 'within_run_sd'))
+
     notes = [
+        'n is a count of DISTINCT SEEDS, never of rows. A row count presented '
+        'as a seed count defeats the n<3 stamp of ANALYSIS_PLAN.md 9 twice '
+        'over: once when the same seed appears twice in an arm, once when the '
+        'endpoint is non-finite on most of the rows counted. Where a metric is '
+        'finite on fewer seeds than the arm has, or where the arm holds more '
+        'rows than seeds, the cell says so in brackets rather than leaving '
+        'the n beside it to be read as the number the statistic used.',
         'Cells are mean ± SD across the seeds of that arm. An arm with n=1 '
         'shows no SD, because one observation has no dispersion and 0.000 '
         'would be a precision claim the data cannot support.',
@@ -809,17 +1323,134 @@ def table_main_results(df: pd.DataFrame, ctx: Context) -> Table:
         'every row because holding one layer list fixed across architectures '
         'transferred 97% of the mlp and 51% of the dueling net in revision 1 '
         'of the design, confounding arch with treatment intensity '
-        '(DESIGN.md 3.1). "n/a" marks an arm that transfers nothing; '
-        f'"{NOT_RECORDED}" marks an arm whose manifest did not record it.',
+        '(DESIGN.md 3.1). "n/a" marks an arm that transfers nothing, whatever '
+        'Config default its rows happen to carry; '
+        f'"{NOT_RECORDED}" marks a transferring arm whose manifest did not '
+        'record it.',
         "headroom is 1 - the same cell's own scratch mean in the same "
         'environment, i.e. the distance left to the registered threshold. No '
         'between-cell reading of any effect is interpretable without it: a '
         'cell near the ceiling has less to gain and more to lose '
-        '(DESIGN.md 2.5).',
+        f'(DESIGN.md 2.5). The mean is taken over target-side scratch runs '
+        f'only: runs in the source-only blocks {list(SOURCE_ONLY_BLOCKS)} are '
+        'excluded (DESIGN.md 3.4). They are scratch runs on the target '
+        'environment, so pooling them shifts the denominator of every delta, '
+        'and on the P0 tree it moved this column by up to 0.059 score units, '
+        f'more than the {EQUIVALENCE_MARGIN} equivalence margin.',
+        'Source validity (DESIGN.md 4.3): a source is valid when its own '
+        f'normalised final score is at least {SOURCE_VALIDITY_GATE}. The '
+        'verdict is printed because it decides membership of the primary '
+        'estimand, not because it is descriptive: stats.py under '
+        '--source-policy valid drops exactly the runs marked REJECTED here, so '
+        'a descriptive row and the estimand beside it can otherwise disagree '
+        'with nothing to reconcile them. "n/a" marks an arm with no trained '
+        'source at all (scratch, and the untrained and permuted controls, '
+        'whose donors are synthesised).',
+        'conv. slope is the final-window OLS slope of the score curve, the '
+        'convergence gate of DESIGN.md 5.2, in score per episode. Where the '
+        'gate flags an arm as STILL MOVING the endpoint in the P1 column is '
+        'performance AT BUDGET and not asymptotic performance, and the column '
+        'header says so.',
         'This table carries no test and no interval. The confirmatory family '
         f'is the {FAMILY_SIZE} tests of Table 2 and nothing else '
         '(ANALYSIS_PLAN.md 2).',
     ]
+
+    # --- source validity: the numbers DESIGN.md 4.3 puts in this table ------
+    if 'source_valid' not in df.columns:
+        notes.append(
+            'source_valid is absent from this per_seed.csv, so no '
+            'source-validity verdict could be read for any arm. DESIGN.md 4.3 '
+            'requires the number and identity of rejected source seeds in the '
+            'results table; the column is named here rather than the absence '
+            'being left to look like an all-valid dataset.')
+    else:
+        notes.append(
+            f'Source-validity verdicts, over the {n_source_arms} arm(s) that '
+            f'transfer from a trained source: {n_rejected_arms} arm(s) carry a '
+            f'rejected source. '
+            + ('Rejected sources, named rather than dropped silently: '
+               + ' | '.join(rejected) + '.' if rejected
+               else 'No source in this dataset fails the gate.'))
+        if reserve:
+            notes.append(
+                'RESERVE substitutions in force (DESIGN.md 4.3: source seeds '
+                'are drawn in order from RESERVE until the cell has its full '
+                'complement of valid sources): '
+                + ' | '.join(sorted(set(reserve)))
+                + '. The substitution is recorded in '
+                  'runs/_jobs/source_replacements.jsonl and enters the run '
+                  'digest, so a replacement-source run has its own directory.')
+
+    # --- the convergence gate ----------------------------------------------
+    if not conv['have_slopes']:
+        notes.append(
+            'convergence_slope is absent from this per_seed.csv, so the '
+            'convergence gate of DESIGN.md 5.2 could not be evaluated at all '
+            'and the word "asymptotic" is licensed nowhere in this paper.')
+    elif conv['evaluated']:
+        n_bad, n_eval = len(conv['failing']), conv['n_evaluated']
+        notes.append(
+            f'Convergence gate (DESIGN.md 5.2, ANALYSIS_PLAN.md 10 item 5): '
+            f'{n_bad} of the {n_eval} arm(s) the gate evaluated '
+            f'({100.0 * n_bad / n_eval if n_eval else 0.0:.1f}%) have a '
+            f'final-window slope distinguishable from zero at 95%, i.e. were '
+            f'still changing at the budget'
+            + (': ' + ', '.join(conv['failing']) if conv['failing'] else '')
+            + '. ' + ('P1 is therefore named performance AT BUDGET throughout, '
+                      'not asymptotic performance.' if conv['failing'] else
+                      'No evaluated arm is flagged, which is consistent with '
+                      'convergence but does not establish it: at this n the '
+                      'interval is wide, so the licensed statement is the '
+                      'interval, not "converged".')
+            + (f' {len(conv["not_evaluated"])} of the {conv["n_arms"]} arms '
+               f'tabulated here were NOT evaluated by the gate, because they '
+               f'are outside the analysis set stats.py ran it on (the '
+               f'source-validity policy of DESIGN.md 4.3 excludes them): '
+               + ', '.join(conv['not_evaluated'])
+               + '. Their slope cell says so rather than borrowing the '
+                 'verdict of the arms that were evaluated.'
+               if conv['not_evaluated'] else ''))
+    else:
+        notes.append(
+            'Convergence gate (DESIGN.md 5.2): the slope column shows the '
+            'point slope per arm, but distinguishability from zero is decided '
+            'by stats.py section 4 (per_seed.csv carries no per-run slope '
+            'standard error, so the interval is an arm-level bootstrap). '
+            'Without --stats the gate is NOT evaluated here, and the fraction '
+            'of non-converged runs is therefore not stated: a slope without an '
+            'interval is not a verdict.')
+
+    if coverage:
+        notes.append(
+            'A tabulated metric is non-finite on some of the arm\'s seeds in: '
+            + ' | '.join(coverage)
+            + '. The affected cells carry their own seed count. Nothing is '
+              'dropped to make a column look complete (DESIGN.md 9, "silent '
+              'seed dropping").')
+    if headroom_short:
+        notes.append(
+            'The headroom denominator is computed on fewer seeds than the arm '
+            'has for: ' + '; '.join(sorted(set(headroom_short)))
+            + '. The count is printed in the cell.')
+    if duplicates:
+        notes.append(
+            'More than one run per seed in arm(s) ' + '; '.join(duplicates)
+            + '. Two runs of one arm at one seed are two configurations, not '
+              'two seeds: the mean is over rows and the SD printed beside it '
+              'is a within-configuration spread, not the across-seed spread '
+              'ANALYSIS_PLAN.md 4 gates the equivalence claim on. This is a '
+              'defect in the input data (DESIGN.md 8.4), stated here rather '
+              'than averaged away.')
+    if moved:
+        notes.append(
+            'A declared invariant is NOT constant within arm(s) '
+            + ' | '.join(moved)
+            + '. DESIGN.md 8.4 makes a differing invariant across an '
+              'experiment\'s runs an audit failure, not a quantity to average, '
+              'so the mean and the n above are taken across configurations '
+              'that differ in the field named. The invariant list is '
+              'audit.py\'s own, so this check cannot fall behind the audit.')
     if fraction_varies:
         notes.append(
             'transferred_param_fraction is not constant within arm(s) '
@@ -827,33 +1458,76 @@ def table_main_results(df: pd.DataFrame, ctx: Context) -> Table:
             + '. The mean is shown and the variation is reported here rather '
               'than averaged away, because DESIGN.md 8.4 treats a moving '
               'invariant as a reason to refuse aggregation, not to smooth it.')
+    if ctx.optional_absent:
+        notes.append(
+            'Absent from this per_seed.csv, and therefore not reported '
+            'anywhere in these tables: '
+            + '; '.join(f'{col} ({why})' for col, why in ctx.optional_absent)
+            + '. Naming the columns is the point: a table that simply omits a '
+              'verdict reads as a table where the verdict was favourable.')
     legend = env_legend(df['env'])
     if legend:
         notes.append(legend)
     notes.append(SCOPE_CLAUSE)
 
+    extra = ['Headroom is 1 - the cell\'s scratch mean on the normalised '
+             'scale over target-side scratch runs only, where the registered '
+             'threshold is 1']
+    if conv['failing']:
+        extra.append(
+            f'Convergence gate (DESIGN.md 5.2): {len(conv["failing"])} of '
+            f'{conv["n_arms"]} arms were still moving at the budget, so P1 is '
+            f'reported as performance AT BUDGET, not asymptotic performance')
+    if 'source_valid' in df.columns and rejected:
+        extra.append(
+            f'{len(rejected)} run(s) carry a source that fails the '
+            f'DESIGN.md 4.3 validity gate and are excluded from the primary '
+            f'estimand by stats.py --source-policy valid; they are flagged '
+            f'REJECTED in the Source validity column and named in the notes')
+
     caption = build_caption(
         ctx,
         'Descriptive results for every arm: the two co-primary endpoints and '
         'the two secondary endpoints the published manuscript promised and '
-        'never reported',
+        'never reported, with the source-validity verdict and the convergence '
+        'gate that decide how each may be read',
         endpoints=('final_score', 'auc_score', 'episode_length_final100',
                    'within_run_sd'),
         test='No test and no p-value appears in this table; it is descriptive '
              'by role (ANALYSIS_PLAN.md 1)',
-        extra=('Headroom is 1 - the cell\'s scratch mean on the normalised '
-               'scale, where the registered threshold is 1',))
+        extra=tuple(extra))
     return Table('main_results', 'Main results: all arms x all metrics',
-                 caption, cols, rows, tuple(notes), frozenset(rules))
+                 caption, cols, rows, tuple(notes), frozenset(rules),
+                 fontsize='scriptsize')
 
 
 # ===========================================================================
 # 9. Table 2 -- inferential. Every test and every estimate, with the RQ it
 #    addresses and the family it belongs to. The p columns of an
-#    estimation-only row carry an em dash, never a blank: `ANALYSIS_PLAN.md` 7
+#    estimation-only row carry `NO_P_MARKER`, never a blank: `ANALYSIS_PLAN.md` 7
 #    licenses p-values inside exactly one family of eight, so the absence is a
 #    design statement and has to read as one.
 # ===========================================================================
+
+def headroom_by_cell(df: pd.DataFrame) -> dict[str, float]:
+    """Headroom per cell on the TARGET task, for the between-cell rows.
+
+    `DESIGN.md` 2.5 requires headroom beside any between-cell reading and
+    `ANALYSIS_PLAN.md` 3 requires the RQ3 interaction "on the normalised AND
+    headroom-adjusted scales, with agreement required before any wording is
+    used". Neither is possible from a table that does not carry the number.
+    """
+    target = _canon(registry.TARGET_ENV)
+    out: dict[str, float] = {}
+    for env in sorted({str(e) for e in df['env']}):
+        if _canon(env) != target:
+            continue
+        for cell in sorted({str(c) for c in df['cell'] if c}):
+            head, _seeds = scratch_headroom(df, cell, env)
+            if head is not None:
+                out[cell] = head
+    return out
+
 
 def _inf_row(rq: str, family: str, quantity: str, endpoint: str, n: Any,
              test: str, statistic: str, p_raw: str, p_holm: str,
@@ -881,6 +1555,28 @@ def _confirmatory_rows(stats: dict) -> tuple[list[dict], list[str]]:
                 'suppressed: ' + reason))
             footnotes.append(f'{metric}/{cell} suppressed -- {reason}.')
             continue
+        rho = rec.get('rho_pearson')
+        # ANALYSIS_PLAN.md 2.1 pre-commits, before any data exist: "if rho < 0
+        # in a cell, that is reported as evidence the pairing does not hold
+        # there, and the unpaired result is given equal prominence in that
+        # cell". Printing rho as free text inside one companion cell and
+        # changing nothing else is not that. The paired test stays primary,
+        # because 2.1 fixes that too, and fixes it in advance.
+        unpaired_prominent = _isnum(rho) and float(rho) < 0
+        pairing_note = ''
+        if unpaired_prominent:
+            pairing_note = (
+                f'; PAIRING DOES NOT HOLD HERE: rho(scratch, transfer) = '
+                f'{fnum(rho)} < 0, so the unpaired companion row is given '
+                f'equal prominence in this cell (ANALYSIS_PLAN.md 2.1)')
+            footnotes.append(
+                f'{metric}/{cell}: the within-seed correlation is '
+                f'{fnum(rho)}, i.e. negative. ANALYSIS_PLAN.md 2.1 reports '
+                f'that as evidence the pairing does not hold in this cell and '
+                f'gives the unpaired Mann-Whitney result equal prominence '
+                f'here. The paired sign-flip test remains primary, because '
+                f'2.1 fixes that in advance and not after seeing which test '
+                f'gives the smaller p.')
         rows.append(_inf_row(
             'RQ2', 'Confirmatory', quantity, metric, rec.get('n'),
             f'exact sign-flip, {rec.get("signflip_mode", "")}'.rstrip(', '),
@@ -888,25 +1584,51 @@ def _confirmatory_rows(stats: dict) -> tuple[list[dict], list[str]]:
             fmt_p(rec.get('p_signflip')), fmt_p(rec.get('p_holm')),
             'HL ' + fmt_ci(rec.get('hl'), rec.get('ci_lo'), rec.get('ci_hi')),
             ('Holm-significant' if rec.get('significant_holm')
-             else 'not distinguishable at the Holm step')))
+             else 'not distinguishable at the Holm step') + pairing_note))
         rows.append(_inf_row(
             'RQ2', 'Companion', quantity, metric, rec.get('n'),
             'Wilcoxon signed-rank (paired)',
             'W = ' + fnum(rec.get('wilcoxon_W'), 1),
-            fmt_p(rec.get('p_wilcoxon')), EM_DASH,
-            'rho(scratch, transfer) = ' + fnum(rec.get('rho_pearson')),
-            'reported for agreement, not corrected'))
+            fmt_p(rec.get('p_wilcoxon')), NO_P_MARKER,
+            'rho(scratch, transfer) = ' + fnum(rho),
+            'reported for agreement, not corrected'
+            + ('; rho < 0, so this paired companion inherits the same caveat'
+               if unpaired_prominent else '')))
         rows.append(_inf_row(
-            'RQ2', 'Companion', quantity, metric, rec.get('n'),
+            'RQ2',
+            ('Companion (EQUAL PROMINENCE: rho < 0)' if unpaired_prominent
+             else 'Companion'),
+            quantity, metric, rec.get('n'),
             'Mann-Whitney U (unpaired)',
             'U = ' + fnum(rec.get('mannwhitney_U'), 1),
-            fmt_p(rec.get('p_mannwhitney')), EM_DASH,
+            fmt_p(rec.get('p_mannwhitney')), NO_P_MARKER,
             'Spearman rho = ' + fnum(rec.get('rho_spearman')),
-            'reported for comparability with the published test'))
+            ('given EQUAL PROMINENCE with the paired row in this cell because '
+             'the within-seed correlation is negative (ANALYSIS_PLAN.md 2.1); '
+             'the paired test is still primary by pre-registration, not by '
+             'comparison of p-values'
+             if unpaired_prominent
+             else 'reported for comparability with the published test')))
     return rows, footnotes
 
 
-def _estimation_rows(stats: dict) -> list[dict]:
+def _headroom_phrase(headroom: dict[str, float], *cells: Any) -> str:
+    """Headroom for the cells a between-cell row compares.
+
+    `DESIGN.md` 2.5 makes headroom a precondition for reading any between-cell
+    contrast, and the module docstring claims it sits "in the same glance as
+    the effect". It did not: headroom lived only in Table 1 while the contrasts
+    that need it live here, so a reader could take an RQ3 difference without
+    ever meeting the ceiling that partly produces it.
+    """
+    seen = [str(c) for c in cells if c]
+    parts = [f'{c} {fnum(headroom.get(c))}' for c in seen if c in headroom]
+    if not parts:
+        return ''
+    return '; headroom ' + ', '.join(parts) + ' (DESIGN.md 2.5)'
+
+
+def _estimation_rows(stats: dict, headroom: dict[str, float]) -> list[dict]:
     """Everything outside the confirmatory family: interval, no p-value."""
     rows: list[dict] = []
     est = stats.get('s9_estimation', {})
@@ -918,37 +1640,49 @@ def _estimation_rows(stats: dict) -> list[dict]:
     # needs (ANALYSIS_PLAN.md 3).
     for r in est.get('rq1', {}).get('rows', []):
         rows.append(_inf_row(
-            'RQ1', 'Estimation-only',
+            'RQ1', 'Estimation-only (ASSOCIATIONAL)',
             f'scratch {r.get("a")} vs scratch {r.get("b")}', primary,
             min(r.get('n_a') or 0, r.get('n_b') or 0),
-            'Brunner-Munzel relative effect', 'theta = P(X>Y)', EM_DASH,
-            EM_DASH,
+            'Brunner-Munzel relative effect', 'theta = P(X>Y)', NO_P_MARKER,
+            NO_P_MARKER,
             'theta ' + fmt_ci(r.get('theta'), r.get('ci_lo'), r.get('ci_hi')),
             ('theta excludes 0.5'
              if (_isnum(r.get('ci_lo')) and _isnum(r.get('ci_hi'))
                  and (float(r['ci_lo']) > 0.5 or float(r['ci_hi']) < 0.5))
-             else 'covers 0.5: not distinguishable')))
+             else 'covers 0.5: not distinguishable')
+            + _headroom_phrase(headroom, r.get('a'), r.get('b'))
+            + '; associational: cells are different algorithms, not treatments '
+              'assigned to units (DESIGN.md 2.4), and RQ1 is a sanity check, '
+              'not a novel result (DESIGN.md 7)'))
 
     # RQ3 -- effect modification, not causation. MDE ~1.96 sigma_delta, larger
     # than the plausible effect, so it is estimation-only by design (2.4).
     for r in est.get('rq3', {}).get('pairs', []):
         rows.append(_inf_row(
-            'RQ3', 'Estimation-only',
+            'RQ3', 'Estimation-only (EFFECT MODIFICATION)',
             f'delta({r.get("a")}) - delta({r.get("b")})', primary, r.get('n'),
             'difference of paired deltas, joint seed bootstrap',
-            'scales ' + str(r.get('scales', NOT_RECORDED)), EM_DASH, EM_DASH,
+            'scales ' + str(r.get('scales', NOT_RECORDED)), NO_P_MARKER,
+            NO_P_MARKER,
             'HL ' + fmt_ci(r.get('hl'), r.get('ci_lo'), r.get('ci_hi')),
-            verdict_word(r.get('ci_lo'), r.get('ci_hi'))))
+            verdict_word(r.get('ci_lo'), r.get('ci_hi'))
+            + _headroom_phrase(headroom, r.get('a'), r.get('b'))
+            + '; effect modification, i.e. how a causal effect varies across '
+              'populations, NOT "architecture causes the difference" '
+              '(DESIGN.md 2.4)'))
     inter = est.get('rq3', {}).get('interaction', {})
     if inter.get('available'):
         rows.append(_inf_row(
-            'RQ3', 'Estimation-only', '2x2 interaction on delta', primary,
+            'RQ3', 'Estimation-only (EFFECT MODIFICATION)',
+            '2x2 interaction on delta', primary,
             inter.get('n'), 'interaction contrast, joint seed bootstrap',
             ('intensity-confounded' if inter.get('intensity_confounded')
-             else 'intensity-matched'), EM_DASH, EM_DASH,
+             else 'intensity-matched'), NO_P_MARKER, NO_P_MARKER,
             'HL ' + fmt_ci(inter.get('hl'), inter.get('ci_lo'),
                            inter.get('ci_hi')),
-            verdict_word(inter.get('ci_lo'), inter.get('ci_hi'))))
+            verdict_word(inter.get('ci_lo'), inter.get('ci_hi'))
+            + _headroom_phrase(headroom, *sorted(headroom))
+            + '; effect modification, not causation (DESIGN.md 2.4)'))
 
     # RQ5 -- ordered alternative on the shift families. Wind is primary;
     # gravity carries the difficulty caveat of DESIGN.md 5.1.
@@ -957,13 +1691,13 @@ def _estimation_rows(stats: dict) -> list[dict]:
             rows.append(_inf_row(
                 'RQ5', 'Estimation-only', f'shift gradient, {family}', primary,
                 res.get('n'), 'Jonckheere-Terpstra ordered alternative',
-                'not available in this run selection', EM_DASH, EM_DASH,
+                'not available in this run selection', NO_P_MARKER, NO_P_MARKER,
                 NOT_RECORDED, 'no levels present'))
             continue
         rows.append(_inf_row(
             'RQ5', 'Estimation-only', f'shift gradient, {family}', primary,
             res.get('n'), 'Jonckheere-Terpstra ordered alternative',
-            'JT z = ' + fnum(res.get('z'), 2), EM_DASH, EM_DASH,
+            'JT z = ' + fnum(res.get('z'), 2), NO_P_MARKER, NO_P_MARKER,
             'standardised ' + fmt_ci(res.get('effect'), res.get('ci_lo'),
                                      res.get('ci_hi')),
             verdict_word(res.get('ci_lo'), res.get('ci_hi'))))
@@ -975,8 +1709,8 @@ def _estimation_rows(stats: dict) -> list[dict]:
             'RQ6', 'Estimation-only',
             f'delta at the {r.get("prefix")}-episode prefix, {r.get("cell")}',
             primary, r.get('n'), 'paired prefix vs budget, same runs',
-            'delta at budget = ' + fnum(r.get('delta_at_budget')), EM_DASH,
-            EM_DASH, 'delta at prefix = ' + fnum(r.get('delta_at_prefix')),
+            'delta at budget = ' + fnum(r.get('delta_at_budget')), NO_P_MARKER,
+            NO_P_MARKER, 'delta at prefix = ' + fnum(r.get('delta_at_prefix')),
             'single held-out checkpoint vs single final checkpoint'))
 
     # Dispersion. No p-value is interpreted: at n=10 with an SD ratio of ~3 the
@@ -988,7 +1722,7 @@ def _estimation_rows(stats: dict) -> list[dict]:
             f'across-seed SD ratio, transfer/scratch, {r.get("cell")}',
             primary, r.get('n'), 'bootstrap CI on the SD ratio',
             'Brown-Forsythe W = ' + fnum(r.get('brown_forsythe_W'), 3),
-            EM_DASH, EM_DASH,
+            NO_P_MARKER, NO_P_MARKER,
             'ratio ' + fmt_ci(r.get('sd_ratio'), r.get('ci_lo'),
                               r.get('ci_hi')),
             ('excludes 1' if (_isnum(r.get('ci_lo')) and _isnum(r.get('ci_hi'))
@@ -1009,8 +1743,8 @@ def _estimation_rows(stats: dict) -> list[dict]:
             f'{r.get("metric")} delta, {r.get("cell")}',
             str(r.get('metric')), r.get('n'),
             'Hodges-Lehmann paired shift, seed bootstrap',
-            'transfer mean = ' + fnum(r.get('transfer_mean')), EM_DASH,
-            EM_DASH,
+            'transfer mean = ' + fnum(r.get('transfer_mean')), NO_P_MARKER,
+            NO_P_MARKER,
             'HL ' + fmt_ci(r.get('hl_delta'), r.get('ci_lo'), r.get('ci_hi')),
             verdict_word(r.get('ci_lo'), r.get('ci_hi'))))
 
@@ -1021,20 +1755,28 @@ def _estimation_rows(stats: dict) -> list[dict]:
             'RQ2', 'Estimation-only',
             f'delta on source competence, {r.get("cell")}', primary,
             r.get('n'), 'OLS slope, seed bootstrap', 'slope per score unit',
-            EM_DASH, EM_DASH,
+            NO_P_MARKER, NO_P_MARKER,
             fmt_ci(r.get('slope'), r.get('ci_lo'), r.get('ci_hi'), nd=2),
             'descriptive relationship, not a mediation claim'))
 
     # Screens: BH q for orientation only, never as an assertion (7).
     for r in (est.get('screens', {}) or {}).get('rows', []):
+        # The raw p is NOT printed. ANALYSIS_PLAN.md 7 permits screens a
+        # Benjamini-Hochberg q "for orientation only" and nothing else, and 8
+        # forbids a p-value on any ablation quantity outright. Emitting the raw
+        # p put a number below the strictest Holm step into a screen row, which
+        # is exactly the "screen result asserted as a finding" reading the plan
+        # pre-commits against, and falsified this table's own note that
+        # p-values appear inside exactly one family.
         rows.append(_inf_row(
             r.get('rq', 'screen'), 'Screen (BH q, orientation only)',
             str(r.get('level', r.get('quantity', ''))), primary, r.get('n'),
             str(r.get('test', 'per-level estimate')),
-            fnum(r.get('statistic')), fmt_p(r.get('p')),
-            EM_DASH + ' (q = ' + fnum(r.get('q'), 4) + ')',
+            fnum(r.get('statistic')), NO_P_MARKER,
+            'q = ' + fnum(r.get('q'), 4),
             fmt_ci(r.get('estimate'), r.get('ci_lo'), r.get('ci_hi')),
-            'orientation only; selects at most one follow-up'))
+            'orientation only; selects at most one follow-up, never asserted '
+            'as a finding (ANALYSIS_PLAN.md 3, 7)'))
     return rows
 
 
@@ -1046,9 +1788,13 @@ def _equivalence_rows(stats: dict) -> list[dict]:
     margin = sec.get('margin', EQUIVALENCE_MARGIN)
     for r in sec.get('rows', []):
         verdict = str(r.get('verdict', ''))
-        note = verdict
-        if verdict == 'suppressed':
-            note = 'suppressed: ' + str(r.get('reason', ''))
+        # ANALYSIS_PLAN.md 4 pre-commits to reporting, per cell, "either an
+        # equivalence verdict OR the statement that the cell's dispersion makes
+        # equivalence untestable at this sample size". stats.py computes that
+        # statement; rendering the bare token and throwing the reason away left
+        # an UNTESTABLE cell with no statement of why it is untestable.
+        reason = str(r.get('reason', '') or '')
+        note = verdict + (': ' + reason if reason else '')
         lo, hi = r.get('ci_lo'), r.get('ci_hi')
         interval = (f'CI [{float(lo):.3f}, {float(hi):.3f}]'
                     if (_isnum(lo) and _isnum(hi))
@@ -1060,7 +1806,8 @@ def _equivalence_rows(stats: dict) -> list[dict]:
             f'equivalence within ±{margin} score units, {r.get("cell")}',
             str(r.get('metric')), r.get('n'),
             f'containment of the 95% CI in ±{margin} (NOT TOST)',
-            'SD(scratch) = ' + fnum(r.get('sd_scratch')), EM_DASH, EM_DASH,
+            'SD(scratch) = ' + fnum(r.get('sd_scratch')),
+            NO_P_MARKER, NO_P_MARKER,
             interval, note + '; ' + bound))
     return rows
 
@@ -1076,7 +1823,7 @@ def _c4_rows(stats: dict) -> list[dict]:
             'RQ4', 'Estimation-only (pre-registered criterion)',
             f'C4 interface-only delta, {r.get("cell")}', 'final_score',
             r.get('n'), f'HL CI lower bound vs {C4_LOWER_BOUND}',
-            str(r.get('verdict', '')), EM_DASH, EM_DASH,
+            str(r.get('verdict', '')), NO_P_MARKER, NO_P_MARKER,
             'HL ' + fmt_ci(r.get('hl'), r.get('ci_lo'), r.get('ci_hi')),
             str(r.get('reason', r.get('verdict', '')))))
     return rows
@@ -1110,6 +1857,7 @@ def table_inferential(df: pd.DataFrame, ctx: Context,
             'not computed here', 'requires --stats', 'requires --stats',
             'requires --stats', 'no result without stats.py'))
     else:
+        headroom = headroom_by_cell(df)
         conf, footnotes = _confirmatory_rows(stats)
         rows.extend(conf)
         rules.add(len(rows))
@@ -1117,16 +1865,31 @@ def table_inferential(df: pd.DataFrame, ctx: Context,
         rules.add(len(rows))
         rows.extend(_c4_rows(stats))
         rules.add(len(rows))
-        rows.extend(_estimation_rows(stats))
+        rows.extend(_estimation_rows(stats, headroom))
         notes.extend(footnotes)
+        if not headroom:
+            notes.append(
+                'No target-task scratch baseline is present in this input, so '
+                'no headroom could be attached to the between-cell rows. '
+                'DESIGN.md 2.5 requires it before any RQ3 claim is asserted, '
+                'so the absence is stated rather than the rows being shown as '
+                'though the precondition were met.')
 
-    n_no_p = sum(1 for r in rows if r['p_raw'] == EM_DASH)
+    n_no_p = sum(1 for r in rows if r['p_raw'] == NO_P_MARKER)
+    n_p = sum(1 for r in rows if r['p_raw'] not in (NO_P_MARKER, NOT_RECORDED))
+    n_conf = sum(1 for r in rows if r['family'] == 'Confirmatory'
+                 and r['p_raw'] not in (NO_P_MARKER, NOT_RECORDED))
     notes = [
-        f'An em dash ({EM_DASH}) in a p column is not a missing number. It '
+        f'The marker "{NO_P_MARKER}" in a p column is not a missing number. It '
         'means no p-value is defined for that row: ANALYSIS_PLAN.md 7 emits '
         f'p-values inside exactly one family of {FAMILY_SIZE}, and everything '
         f'else is estimation-only. {n_no_p} of {len(rows)} rows below carry no '
         'p-value by design.',
+        f'Counted from this table\'s own body: {n_p} of {len(rows)} rows carry '
+        f'a raw p-value, of which {n_conf} are the confirmatory family and the '
+        f'remainder are the two pre-specified paired/unpaired companions of '
+        f'ANALYSIS_PLAN.md 2. No screen, no secondary, no mechanism and no '
+        f'ablation row carries one, which 8 forbids outright.',
         'Family "Confirmatory": the only confirmatory family in the study -- '
         'the 4 within-cell deltas (transfer - scratch) on each of the 2 '
         f'co-primary endpoints, {FAMILY_SIZE} tests, Holm-Bonferroni over '
@@ -1137,12 +1900,38 @@ def table_inferential(df: pd.DataFrame, ctx: Context,
         'agreement and for comparability with the published paper\'s test. '
         f'They are not members of the Holm family (which has exactly '
         f'{FAMILY_SIZE} members, fixed before launch), so their adjusted-p '
-        'cell carries an em dash. The paired sign-flip test is primary by '
+        'cell carries the no-p marker. The paired sign-flip test is primary by '
         'pre-registration, not by comparison of p-values.',
         'Family "Estimation-only": point estimate and 95% seed-level bootstrap '
         'interval, no p-value. Where a directional statement is wanted the '
         'licensed form is what the interval excludes, not a null '
         '(DESIGN.md 9).',
+        'Inference type is BINDING ON WORDING (DESIGN.md 2.4) and is therefore '
+        'printed in the Family column, not left to the prose: RQ1 is '
+        'ASSOCIATIONAL, because the cells are different algorithms rather than '
+        'treatments assigned to units; RQ2 is causal with respect to the '
+        'protocol, warranted by ceteris paribus at matched seeds and not by '
+        'randomisation; RQ3 is EFFECT MODIFICATION, i.e. how a causal effect '
+        'varies across populations, and never "architecture causes the '
+        'difference".',
+        'RQ1 is a SANITY CHECK, NOT A NOVEL RESULT (DESIGN.md 7). Its '
+        'scratch comparison across three of these four cells has already been '
+        'run at n=100 on these environments (Obando-Ceron and Castro, ICML '
+        '2021, Figure 1, four classic-control tasks, 100 runs per '
+        'configuration, 95% bands), and the pre-registered check is that our '
+        'scratch ordering on LunarLander agrees with theirs IN DIRECTION. The '
+        'endpoint of that check is fixed in advance as AUC score, not final '
+        'score, because their figure plots return against training iteration '
+        'and because the n=1 pilot showed the two candidate endpoints ranking '
+        'the cells differently: leaving the endpoint open would have let the '
+        'check be settled by choosing one.',
+        'Every between-cell row carries the headroom of the cells it compares '
+        '(DESIGN.md 2.5): a cell whose scratch baseline sits near the ceiling '
+        'has less room to gain and more to lose, so a difference of deltas is '
+        'not interpretable without it. ANALYSIS_PLAN.md 3 requires the RQ3 '
+        'interaction on the normalised AND the headroom-adjusted scale, with '
+        'AGREEMENT ACROSS BOTH SCALES before any RQ3 wording is used; where '
+        'the two scales disagree, no RQ3 claim is licensed at all.',
         'Family "Estimation-only (mechanism)": an instrumented signal from '
         'DESIGN.md 5.5, reported so that a mechanism sentence can cite one. It '
         'is not an endpoint and may not be quoted as a result; the report '
@@ -1204,7 +1993,7 @@ def table_control_contrasts(df: pd.DataFrame, ctx: Context,
         Col('n', 'n', 'r'),
         Col('mean', 'mean', 'r'),
         Col('hl', 'HL [95% CI]', 'r'),
-        Col('agree', 'Seeds'),
+        Col('agree', 'Seed agreement'),
         Col('reading', 'Reading'),
         Col('restriction', 'Mechanistic reading requires assuming', 'p', 0.20),
     )
@@ -1213,6 +2002,20 @@ def table_control_contrasts(df: pd.DataFrame, ctx: Context,
     notes: list[str] = []
     if stats is None:
         notes.append(NO_STATS_NOTE)
+        # An explicit placeholder row, as table_inferential and table_power
+        # emit in the same situation. A caption claiming to present the three
+        # control contrasts above a body of zero rows is a table that reads as
+        # "there were none", which is a different statement from "these were
+        # not computed here".
+        rows.append({
+            'cell': 'all four', 'endpoint': 'final_score, auc_score',
+            'contrast': 'C1-C0, C2-C0, C3-C2, C1-C3, C3b',
+            'name': 'not computed here', 'n': NOT_RECORDED,
+            'mean': 'requires --stats', 'hl': 'requires --stats',
+            'agree': NOT_RECORDED,
+            'reading': 'no result without stats.py',
+            'restriction': 'stated per contrast once the estimates exist',
+        })
     else:
         for metric, sec in (stats.get('s7_controls') or {}).items():
             for cell, res in (sec.get('cells') or {}).items():
@@ -1220,14 +2023,31 @@ def table_control_contrasts(df: pd.DataFrame, ctx: Context,
                     rules.add(len(rows))
                 missing = res.get('missing') or []
                 if res.get('suppressed') or not res.get('contrasts'):
+                    # The reason is derived, not typed. The hard-coded
+                    # "n=3 < 3, or a required condition is absent" printed a
+                    # comparison that its own adjacent number falsifies, in a
+                    # module whose central claim is that a generated cell
+                    # cannot contradict its table.
+                    n_here = res.get('n')
+                    reasons: list[str] = []
+                    if _isnum(n_here) and int(n_here) < MIN_N_FOR_INFERENCE:
+                        reasons.append(
+                            f'n={int(n_here)} < {MIN_N_FOR_INFERENCE} '
+                            f'listwise-complete seeds (ANALYSIS_PLAN.md 9)')
+                    if missing:
+                        reasons.append('required condition(s) absent: '
+                                       + ', '.join(missing))
+                    if not reasons:
+                        reasons.append(
+                            str(res.get('reason')
+                                or 'stats.py emitted no contrasts for this '
+                                   'cell and gave no reason'))
                     rows.append({
                         'cell': cell, 'endpoint': metric,
                         'contrast': 'all', 'name': 'not estimated',
                         'n': fint(res.get('n')), 'mean': NOT_RECORDED,
                         'hl': NOT_RECORDED, 'agree': NOT_RECORDED,
-                        'reading': (f'suppressed: n={res.get("n")} '
-                                    f'< {MIN_N_FOR_INFERENCE}, or a required '
-                                    f'condition is absent'),
+                        'reading': 'suppressed: ' + '; '.join(reasons),
                         'restriction': ('conditions absent: '
                                         + (', '.join(missing) or 'none')),
                     })
@@ -1241,7 +2061,7 @@ def table_control_contrasts(df: pd.DataFrame, ctx: Context,
                         'mean': fnum(c.get('mean')),
                         'hl': fmt_ci(c.get('hl'), c.get('ci_lo'),
                                      c.get('ci_hi')),
-                        'agree': str(c.get('unanimous', '')),
+                        'agree': str(c.get('unanimous') or NOT_RECORDED),
                         'reading': verdict_word(c.get('ci_lo'),
                                                 c.get('ci_hi')) + '; '
                                    + exclusion_bound_text(c.get('ci_lo')),
@@ -1291,6 +2111,13 @@ def table_control_contrasts(df: pd.DataFrame, ctx: Context,
         'Estimation-only: no p-value appears in this table at all. C1-C0 is '
         'the one contrast here that is also the confirmatory estimand of '
         'Table 2; its p-value is reported there and only there.',
+        'Seed agreement states whether every listwise-complete seed moved the '
+        'same way on that contrast, or how the seeds split. It is the bar '
+        'ANALYSIS_PLAN.md 2.2 fixes for the confirmatory family at n=10 and is '
+        'shown here for the same reason: a contrast whose seeds are split is a '
+        'different object from one where all of them agree, whatever the '
+        f'interval says. "{NOT_RECORDED}" means stats.py emitted no unanimity '
+        'record for that contrast.',
         'C3b exists because C3 does not preserve the singular-value spectrum, '
         'so C3-C2 also absorbs spectral effects. If C3 and C3b agree, the '
         'spectral caveat is empirically void; if they disagree, the '
@@ -1412,7 +2239,8 @@ def _one(g: pd.DataFrame, col: str, integer: bool = False) -> str:
 TRANSFER_ONLY_FIELDS: frozenset[str] = frozenset({
     'transfer_set', 'input_policy', 'head_policy', 'freeze_group',
     'freeze_updates', 'permute_kind', 'value_recal', 'source_env',
-    'params_copied', 'transferred_param_fraction'})
+    'params_copied', 'transferred_param_fraction',
+    'reinitialised_layer_count'})
 
 #: `permute_kind` describes how a transferred kernel was shuffled, so it means
 #: nothing outside C3/C3b. The Config default it carries elsewhere is not
@@ -1435,6 +2263,7 @@ def table_protocol_summary(df: pd.DataFrame, ctx: Context) -> Table:
         Col('input_policy', 'Input policy'),
         Col('head_policy', 'Head policy'),
         Col('layers', 'Layers c/p/r', 'r'),
+        Col('reinit', 'reinit count', 'r'),
         Col('params_copied', 'Params copied', 'r'),
         Col('frac', 'Fraction', 'r'),
         Col('freeze_group', 'Freeze group'),
@@ -1446,8 +2275,11 @@ def table_protocol_summary(df: pd.DataFrame, ctx: Context) -> Table:
     prev_cell: Optional[str] = None
     layer_names: list[str] = []
     moved: list[str] = []
+    reinit_conflicts: list[str] = []
+    reinit_recorded = 0
     manifests_read = 0
     n_transferring = 0
+    invariant_cols = [c for c in ARM_INVARIANT_FIELDS if c in df.columns]
     for (env, cell, cond, label), g in arm_groups(df):
         if prev_cell is not None and cell != prev_cell:
             rules.add(len(rows))
@@ -1477,9 +2309,16 @@ def table_protocol_summary(df: pd.DataFrame, ctx: Context) -> Table:
             'input_policy': field('input_policy'),
             'head_policy': field('head_policy'),
             'layers': counts if transfers else 'n/a',
+            'reinit': field('reinitialised_layer_count', integer=True),
             'params_copied': field('params_copied', integer=True),
-            'frac': fnum(_series(g, 'transferred_param_fraction').mean(), 3,
-                         missing='n/a' if not transfers else NOT_RECORDED),
+            # Through the same branch every other transfer field takes. The
+            # `missing=` argument was consulted only when the value was NOT a
+            # number, so a scratch row carrying a Config default printed a
+            # treatment intensity for an arm that transferred nothing: the
+            # exact reading TRANSFER_ONLY_FIELDS exists to refuse.
+            'frac': ('n/a' if not transfers
+                     else fnum(_series(g, 'transferred_param_fraction').mean(),
+                               3, missing=NOT_RECORDED)),
             'freeze_group': field('freeze_group'),
             'freeze_updates': field('freeze_updates'),
         }
@@ -1492,8 +2331,40 @@ def table_protocol_summary(df: pd.DataFrame, ctx: Context) -> Table:
                 row[c] = 'n/a'
             else:
                 row[c] = _one(g, c)
-        if transfers and ',' in row['freeze_updates']:
-            moved.append(f'{label} (freeze_updates {row["freeze_updates"]})')
+        # Every declared invariant, not freeze_updates alone. The old check
+        # was hard-wired to one field, so an arm holding two learning rates
+        # produced a column showing both values and no warning at all.
+        moved_here = moved_invariants(g, invariant_cols)
+        if moved_here:
+            moved.append(f'{label}: ' + '; '.join(moved_here))
+        # DESIGN.md 3.1 requires reinitialised_layer_count in every results
+        # table, and gives the expected values (mlp 1 layer, dueling 4). The
+        # manifest's transfer report lists only the layers the copy touched, so
+        # its reinit list can be empty for an arm whose head policy is
+        # "reinit". Printing the manifest count alone therefore asserted that
+        # no layer was reinitialised in a study whose head reinitialisation is
+        # a manipulated component. The two sources are cross-checked here and
+        # any disagreement is named; neither is silently preferred.
+        if transfers:
+            per_seed_reinit = _series(g, 'reinitialised_layer_count').dropna()
+            manifest_reinit = (len(summary.get('layers_reinit') or [])
+                               if summary is not None else None)
+            if len(per_seed_reinit):
+                reinit_recorded += 1
+                values = sorted({int(round(float(v)))
+                                 for v in per_seed_reinit})
+                if manifest_reinit is not None and [manifest_reinit] != values:
+                    reinit_conflicts.append(
+                        f'{label}: per_seed reinitialised_layer_count '
+                        f'{values} vs manifest transfer.summary.layers_reinit '
+                        f'{manifest_reinit}')
+            elif manifest_reinit == 0 and 'reinit' in str(
+                    row.get('head_policy', '')):
+                reinit_conflicts.append(
+                    f'{label}: head policy is '
+                    f'{row.get("head_policy")!r} but the manifest transfer '
+                    f'report lists 0 reinitialised layers and per_seed.csv '
+                    f'records no reinitialised_layer_count')
         rows.append(row)
         if names != NOT_RECORDED and cond != 'scratch':
             layer_names.append(f'{label}: {names}')
@@ -1517,23 +2388,46 @@ def table_protocol_summary(df: pd.DataFrame, ctx: Context) -> Table:
         'transfer_set="matched" is the primary level precisely so that both '
         'architectures sit near 97% (DESIGN.md 3.1).',
         f'per_seed.csv pins reinitialised_layer_count but not '
-        f'{", ".join(MISSING_PER_SEED_COLUMNS)}, so the layer counts and names '
-        f'here are read from the run manifests instead. The missing columns are '
-        f'named rather than approximated. A transfer report was found for '
-        f'{manifests_read} of the {n_transferring} arm(s) that transfer '
-        f'anything; a scratch arm has none by construction and shows n/a.',
+        f'{", ".join(MISSING_PER_SEED_COLUMNS)}, so the layer NAMES and the '
+        f'copied/partial counts here are read from the run manifests instead, '
+        f'while the reinit count column is the pinned per_seed value. The '
+        f'missing columns are named rather than approximated. A transfer '
+        f'report was found for {manifests_read} of the {n_transferring} arm(s) '
+        f'that transfer anything; a scratch arm has none by construction and '
+        f'shows n/a. reinitialised_layer_count is recorded for '
+        f'{reinit_recorded} of them.',
+        'reinit count is reinitialised_layer_count, which DESIGN.md 3.1 '
+        'requires in every results table beside transferred_param_fraction: '
+        'the design tabulates 1 reinitialised layer for mlp (q_out) and 4 for '
+        'dueling (both heads), and an arm whose count does not match its '
+        'transfer set is an arm whose protocol is not the declared one. It is '
+        'the per_seed value, cross-checked against the manifest transfer '
+        'report; the "Layers c/p/r" column is the manifest report, which lists '
+        'only the layers the COPY touched and is therefore not a substitute.',
         'A scratch arm shows n/a for every transfer and freeze field. The '
         'Config defaults it carries are not printed as protocol, because a '
         'methods table that lists a transfer set for an arm that transferred '
         'nothing is the reading the published manuscript invited.',
     ]
+    if reinit_conflicts:
+        notes.append(
+            'reinitialised-layer count disagrees with the manifest transfer '
+            'report, or is absent where the head policy says the head was '
+            'reinitialised, in: ' + ' | '.join(reinit_conflicts)
+            + '. Neither source is silently preferred. The manifest report '
+              'lists only the layers the copy touched, so a 0 there is not '
+              'evidence that nothing was reinitialised, and a table printing '
+              'it alone would assert exactly that.')
     if moved:
         notes.append(
-            'freeze_updates is NOT constant within arm(s) ' + '; '.join(moved)
-            + '. Both values are shown rather than averaged: an arm whose '
-              'freeze window moved is an arm audit.py refuses to aggregate, '
-              'and stats.py suppresses its confirmatory member for the same '
-              'reason (DESIGN.md 8.4). This is a defect in the input data, not '
+            'A declared invariant is NOT constant within arm(s) '
+            + ' | '.join(moved)
+            + '. Every value is shown rather than averaged: an arm whose '
+              'declared invariant moved is an arm audit.py refuses to '
+              'aggregate, and stats.py suppresses its confirmatory member for '
+              'the same reason (DESIGN.md 8.4). The field list is audit.py\'s '
+              'own DISCRIMINATING set, not a copy of it, so this check cannot '
+              'fall behind the audit. This is a defect in the input data, not '
               'a formatting choice.')
     if constant:
         notes.append(
@@ -1819,6 +2713,16 @@ def _powered_phrase(mde_holm: Any) -> str:
     "powered" cell is an absence of effect. The phrase states the smallest
     effect the cell can detect at the corrected alpha, which is the statement
     `ANALYSIS_PLAN.md` 6.3 actually licenses.
+
+    Two boundaries, both pre-registered, neither typed here. `UNPOWERED_MDE` is
+    the plan's "exceeds the whole distance from random play to solved".
+    `MODEST_EFFECT_MDE` is its "approaches": the plan tabulates an MDE of
+    0.568 for the noisy dueling-vanilla scratch cell and says in the same
+    paragraph that "that cell is not powered for a modest effect and will be
+    reported as an estimate with an interval". Against `UNPOWERED_MDE` alone
+    that cell printed "detects effects of 0.568 score units or larger", which
+    reads as the opposite of the pre-registration for the one cell the plan
+    singles out.
     """
     if not _isnum(mde_holm):
         return NOT_RECORDED
@@ -1826,12 +2730,127 @@ def _powered_phrase(mde_holm: Any) -> str:
     if mde >= UNPOWERED_MDE:
         return (f'NOT POWERED: MDE {mde:.3f} reaches {UNPOWERED_MDE} score '
                 f'unit, the whole distance from random play to solved')
-    return f'detects effects of {mde:.3f} score units or larger'
+    if _isnum(MODEST_EFFECT_MDE) and mde >= MODEST_EFFECT_MDE:
+        return (f'NOT POWERED FOR A MODEST EFFECT: MDE {mde:.3f} is at or '
+                f'above {MODEST_EFFECT_MDE:.3f}, the MDE ANALYSIS_PLAN.md 6.3 '
+                f'tabulates for the cell it pre-registers as unpowered. '
+                f'Reported as an estimate with an interval, whatever the '
+                f'p-value says')
+    return (f'detects effects of {mde:.3f} score units or larger at the '
+            f'Holm-corrected alpha')
 
 
 def _alpha_label(kind: str) -> str:
     return (f'{ALPHA}' if kind == 'nominal'
             else f'{ALPHA_STRICTEST:.5f} (Holm over {FAMILY_SIZE})')
+
+
+def _mde_verification(stats: Optional[dict]) -> dict:
+    """`statlib`'s own re-derivation of the `ANALYSIS_PLAN.md` 6.2 multipliers.
+
+    Read, never restated. The note under the power table used to assert
+    "statlib.py --self-test reproduces them from the exact null distribution"
+    as a fixed sentence beside a transcribed table, so when `statlib` moved to
+    1.406 for the unpaired nominal multiplier against a transcribed 1.39, the
+    artefact bound for the paper carried a verification claim the codebase
+    refuted, and nothing in either module could notice. The numbers now come
+    out of `stats.verify_mde_against_statlib`, which calls `statlib.mde_signflip`
+    and `statlib.mde_mann_whitney` at the planned n, so the sentence and the
+    library cannot disagree: whatever `statlib` returns is what is printed.
+
+    Preference order, cheapest first, because the re-derivation is a
+    20,000-replicate power simulation per row:
+
+    1. the `s10_power.verification` block of the stats JSON, if this render was
+       given one and it was produced by the multipliers now in force;
+    2. the in-process result, if `stats.py` already ran the check;
+    3. a fresh call.
+
+    Case 1 carries one extra condition. A stats JSON is a file on disk and can
+    predate a correction to the plan's transcribed table: the archived
+    2026-08-26 bundle records `pre_registered` 1.39 for the unpaired nominal
+    multiplier where the module now holds 1.41. Reprinting the stale pair would
+    reintroduce exactly the divergence this function exists to close, so a
+    verification whose `pre_registered` values do not match the ones this table
+    is computed from is discarded and the check re-run.
+    """
+    live = {f'{k[0]}/{k[1]}': float(v) for k, v in MDE_MULTIPLIERS.items()}
+
+    def usable(block: Any) -> bool:
+        if not isinstance(block, dict) or not block.get('ran'):
+            return False
+        rows = block.get('rows') or []
+        if len(rows) != len(live):
+            return False
+        for row in rows:
+            key = f'{row.get("test")}/{row.get("alpha_level")}'
+            planned = row.get('pre_registered')
+            if key not in live or not _isnum(planned):
+                return False
+            if abs(float(planned) - live[key]) > 1e-12:
+                return False
+        return True
+
+    from_json = (stats or {}).get('s10_power', {}).get('verification')
+    if usable(from_json):
+        return dict(from_json)
+    in_process = getattr(statsmod, 'MDE_VERIFICATION', None)
+    if usable(in_process):
+        return dict(in_process)
+    try:
+        return dict(statsmod.verify_mde_against_statlib())
+    except Exception as exc:                                  # noqa: BLE001
+        return {'ran': False, 'rows': [], 'agree': None,
+                'note': f'the re-derivation could not be run here '
+                        f'({exc.__class__.__name__}), so the pre-registered '
+                        f'multipliers stand unverified in this render'}
+
+
+def _mde_multiplier_note(stats: Optional[dict]) -> str:
+    """The power table's multiplier note, with `statlib`'s numbers in it.
+
+    Three states, all of them stated: agreement, disagreement, and a
+    verification that could not be run. The third is not silence: a table that
+    says nothing about whether the multipliers were checked reads as though
+    they were.
+    """
+    verification = _mde_verification(stats)
+    rows = {f'{r.get("test")}/{r.get("alpha_level")}': r
+            for r in (verification.get('rows') or [])}
+    parts: list[str] = []
+    for key, planned in MDE_MULTIPLIERS.items():
+        row = rows.get(f'{key[0]}/{key[1]}')
+        got = (row or {}).get('statlib')
+        parts.append(
+            f'{key[0]} at alpha = {_alpha_label(key[1])}: {planned} sigma'
+            + (f' (statlib re-derives {float(got):.3f})' if _isnum(got)
+               else ''))
+    head = ('MDE units are normalised score. The multiplier on sigma is '
+            'pre-registered in ANALYSIS_PLAN.md 6.2 and is not re-derived from '
+            'these data, because 6.4 forbids re-tuning the power table after '
+            'seeing results: ' + '; '.join(parts) + '. ')
+    if not verification.get('ran'):
+        return head + str(verification.get('note') or
+                          'the re-derivation did not run in this render, so '
+                          'the multipliers stand unverified here') + '.'
+    n = verification.get('n')
+    where = f' at n={fint(n)}' if n is not None else ''
+    if verification.get('agree'):
+        return (head + f'statlib.py recomputes each of them from the exact '
+                       f'null distribution{where} and agrees to within '
+                       f'{statsmod.MDE_AGREEMENT_TOLERANCE}.')
+    bad = '; '.join(
+        '{}/{}: statlib {}'.format(
+            r.get('test'), r.get('alpha_level'),
+            f'{float(r["statlib"]):.4f}' if _isnum(r.get('statlib'))
+            else 'did not return a value')
+        for r in (verification.get('rows') or []) if not r.get('agree'))
+    return (head + f'statlib.py recomputes them from the exact null '
+                   f'distribution{where} and DISAGREES on {bad}. '
+                   f'ANALYSIS_PLAN.md 6.4 forbids re-tuning the power table '
+                   f'after seeing results, so the pre-registered values above '
+                   f'stand and the disagreement is reported rather than '
+                   f'resolved here.')
 
 
 def table_power(df: pd.DataFrame, ctx: Context,
@@ -1863,7 +2882,7 @@ def table_power(df: pd.DataFrame, ctx: Context,
             'scope': 'planning (ANALYSIS_PLAN.md 6.3)',
             'endpoint': 'final_score', 'cell': f'{cell} {cond}',
             'n': '10', 'sigma_delta': fnum(planned, 3),
-            'sigma_pooled': fnum(planned, 3), 'observed': EM_DASH,
+            'sigma_pooled': fnum(planned, 3), 'observed': NO_P_MARKER,
             'p_nom': fnum(MDE_MULTIPLIERS[('paired', 'nominal')] * planned, 3),
             'p_holm': fnum(p_holm, 3),
             'u_nom': fnum(MDE_MULTIPLIERS[('unpaired', 'nominal')] * planned, 3),
@@ -1925,20 +2944,8 @@ def table_power(df: pd.DataFrame, ctx: Context,
                   '(ANALYSIS_PLAN.md 6.4).')
 
     notes = [
-        'MDE units are normalised score. The multiplier on sigma is '
-        'pre-registered in ANALYSIS_PLAN.md 6.2 and is not re-derived from '
-        'these data, because 6.4 forbids re-tuning the power table after '
-        'seeing results: '
-        + '; '.join(f'{k[0]} at alpha = {_alpha_label(k[1])}: {v} sigma'
-                    for k, v in MDE_MULTIPLIERS.items())
-        + '. statlib.py --self-test reproduces them from the exact null '
-          'distribution.',
-        'sigma(delta) is the SD of the PAIRED delta and scales the paired MDE; '
-        'sigma(pooled) is the root-mean-square of the two arms\' SDs and '
-        'scales the unpaired MDE. The 1.00-versus-1.39 gap in the multipliers '
-        'is why the paired test is primary: at this sample size the '
-        'matched-seed design is worth roughly a 40% reduction in the '
-        'detectable effect (ANALYSIS_PLAN.md 6.2).',
+        _mde_multiplier_note(stats),
+        _PAIRING_NOTE,
         f'A cell is flagged NOT POWERED when its MDE at the Holm-corrected '
         f'alpha reaches {UNPOWERED_MDE} score unit(s) -- which by construction '
         f'of the normalisation is the entire distance from a random policy to '
@@ -1999,7 +3006,7 @@ _RENDER = {'latex': render_latex, 'markdown': render_markdown}
 def build_table(key: str, df: pd.DataFrame, ctx: Context,
                 stats: Optional[dict]) -> Table:
     if key == 'main_results':
-        return table_main_results(df, ctx)
+        return table_main_results(df, ctx, stats)
     if key == 'inferential':
         return table_inferential(df, ctx, stats)
     if key == 'control_contrasts':
@@ -2011,6 +3018,27 @@ def build_table(key: str, df: pd.DataFrame, ctx: Context,
     if key == 'power':
         return table_power(df, ctx, stats)
     raise KeyError(f'unknown table {key!r}; known: {sorted(BUILDERS)}')
+
+
+def scan_latex_mapping(t: Table) -> None:
+    """Run the LaTeX escaper over one whole table, for the record.
+
+    `_UNMAPPED` is populated the first time `latex_escape` meets a character,
+    and `write_table` snapshots it. Written table by table, that made the
+    snapshot order-dependent: a table written before the character was first
+    seen recorded an empty dict while the console said the character had been
+    "recorded in every provenance sidecar". Scanning every table before any is
+    written makes the claim true, and makes it true under `--format markdown`
+    as well, where `latex_escape` would otherwise never be called at all.
+    """
+    latex_escape(t.caption)
+    for col in t.cols:
+        latex_escape(col.header)
+    for row in t.rows:
+        for col in t.cols:
+            latex_escape(row.get(col.key, ''))
+    for note in t.notes:
+        latex_escape(note)
 
 
 def write_table(t: Table, outdir: str, formats: Sequence[str],
@@ -2044,9 +3072,22 @@ def write_table(t: Table, outdir: str, formats: Sequence[str],
             'stats_sha': ctx.stats_sha,
         },
         'arms': ctx.n_arms,
-        'seeds_per_arm': {'min': ctx.min_n, 'max': ctx.max_n},
+        'seeds_per_arm': {'min': ctx.min_n, 'max': ctx.max_n,
+                          'unit': 'distinct seeds, not rows',
+                          'min_on_a_co_primary_endpoint': ctx.min_metric_n},
         'validation_stamp': VALIDATION_STAMP if ctx.validation else None,
+        'plan_hash_in_force': ctx.plan_hashes.get('ANALYSIS_PLAN.md'),
         'plan_hash_in_run_data': list(ctx.plan_hash_in_data),
+        'plan_hash_mismatch': ctx.plan_mismatch,
+        'named_columns_absent_from_input': [c for c, _w in ctx.optional_absent],
+        'audit': {
+            'root': (ctx.audit_root or '').replace(os.sep, '/') or None,
+            'ok': ctx.audit_ok,
+            'override': ctx.audit_override,
+            'override_stamp': (AUDIT_OVERRIDE_STAMP if ctx.audit_override
+                               else None),
+            'failing_checks': list(ctx.audit_failing),
+        },
         'plans': ctx.plan_hashes,
         'git': ctx.git,
         'inference_constants': {
@@ -2093,17 +3134,22 @@ def multiplicity_ledger(stats: Optional[dict], tables: Sequence[Table]) -> str:
         'permitted',
         '  everything else: estimation-only, no p-values emitted',
     ]
-    no_p = 0
-    total = 0
-    for t in tables:
-        if t.key != 'inferential':
-            continue
-        for r in t.rows:
-            total += 1
-            if r.get('p_raw') == EM_DASH:
-                no_p += 1
-    lines.append(f'  analyses carrying NO p-value, as tabulated: {no_p} of '
-                 f'{total} rows in the inferential table')
+    inferential = [t for t in tables if t.key == 'inferential']
+    if not inferential:
+        lines.append('  analyses carrying NO p-value, as tabulated: NOT '
+                     'COUNTED on this invocation, because the inferential '
+                     'table was not among --tables. A count of 0 of 0 rows is '
+                     'not a p-value ledger.')
+    else:
+        no_p = 0
+        total = 0
+        for t in inferential:
+            for r in t.rows:
+                total += 1
+                if r.get('p_raw') == NO_P_MARKER:
+                    no_p += 1
+        lines.append(f'  analyses carrying NO p-value, as tabulated: {no_p} of '
+                     f'{total} rows in the inferential table')
     if stats is not None:
         ledger = stats.get('s11_ledger', {})
         lines.append(f'  stats.py estimation-only sections: '
@@ -2126,7 +3172,7 @@ def multiplicity_ledger(stats: Optional[dict], tables: Sequence[Table]) -> str:
 # ===========================================================================
 # 15. Self-test. Cheap assertions on the two things a table can get silently
 #     wrong: the escaping (a table that does not compile, or a label whose
-#     characters were dropped) and the em-dash convention (a blank read as an
+#     characters were dropped) and the no-p convention (a blank read as an
 #     omission). Also asserts that the compact interval verdict agrees in
 #     direction with `stats.phrase_interval_verdict`, so the two cannot drift.
 # ===========================================================================
@@ -2149,12 +3195,15 @@ def self_test(verbose: bool = True) -> int:
     check('plus-minus becomes a math command',
           latex_escape('1.0 ± 0.2') == '1.0 $' + _BS + 'pm$ 0.2',
           latex_escape('1.0 ± 0.2'))
-    check('the em dash renders as three hyphens',
-          latex_escape(EM_DASH) == '---', latex_escape(EM_DASH))
+    check('the no-p marker renders as an em rule',
+          latex_escape(NO_P_MARKER) == '---', latex_escape(NO_P_MARKER))
+    check('an em dash in the INPUT data is mapped, not rendered as unmapped',
+          latex_escape(chr(0x2014)) == '---' and chr(0x2014) not in _UNMAPPED,
+          latex_escape(chr(0x2014)))
+    _NASTY = 'σ ρ θ Δ × ≥ → § ± ' + chr(0x2014) + ' “x” … 1.0'
     check('no non-ASCII survives escaping',
-          all(ord(c) < 128 for c in latex_escape(
-              'σ ρ θ Δ × ≥ → § ± — “x” … 1.0')),
-          latex_escape('σ ρ θ Δ × ≥ → § ± — “x” … 1.0'))
+          all(ord(c) < 128 for c in latex_escape(_NASTY)),
+          latex_escape(_NASTY))
     before = dict(_UNMAPPED)
     unknown = latex_escape('☃')
     check('an unmapped character is rendered visibly and recorded',
@@ -2166,17 +3215,17 @@ def self_test(verbose: bool = True) -> int:
     check('a markdown cell escapes the delimiter',
           markdown_escape('a|b') == 'a' + _BS + '|b')
 
-    # --- the em-dash convention -------------------------------------------
-    check('a missing p renders as an em dash, never as a blank',
-          fmt_p(None) == EM_DASH and fmt_p(float('nan')) == EM_DASH
-          and fmt_p('') == EM_DASH)
+    # --- the no-p convention ----------------------------------------------
+    check('a missing p renders as the marker, never as a blank',
+          fmt_p(None) == NO_P_MARKER and fmt_p(float('nan')) == NO_P_MARKER
+          and fmt_p('') == NO_P_MARKER)
     check('a real p keeps five decimals',
           fmt_p(0.00195) == '0.00195' and fmt_p(0.05) == '0.05000',
           fmt_p(0.00195))
     check('a p below 1e-4 goes to scientific notation',
           fmt_p(1.08e-5) == '1.08e-05', fmt_p(1.08e-5))
-    check('a missing number is n/r, which is not the em dash',
-          fnum(None) == NOT_RECORDED and NOT_RECORDED != EM_DASH)
+    check('a missing number is n/r, which is not the no-p marker',
+          fnum(None) == NOT_RECORDED and NOT_RECORDED != NO_P_MARKER)
 
     # --- formatting -------------------------------------------------------
     check('no SD is printed at n=1', fmt_mean_sd([0.5]) == '0.500',
@@ -2229,6 +3278,142 @@ def self_test(verbose: bool = True) -> int:
                                tuple(Col(str(i), str(i)) for i in range(7))
                                ).star)
 
+    # --- a p-value is a probability ---------------------------------------
+    check('a value outside [0, 1] is refused as a p-value',
+          fmt_p(1.17).startswith('INVALID') and fmt_p(-0.1).startswith(
+              'INVALID'), fmt_p(1.17))
+    check('the endpoints of [0, 1] are still printed as p-values',
+          not fmt_p(0.0).startswith('INVALID')
+          and fmt_p(1.0) == '1.00000', f'{fmt_p(0.0)}, {fmt_p(1.0)}')
+
+    # --- no affirmative no-harm claim out of a null ------------------------
+    check('a lower bound of exactly zero excludes nothing, and says so',
+          'nothing is excluded' in exclusion_bound_text(0.0)
+          and 'no degradation (' not in exclusion_bound_text(0.0),
+          exclusion_bound_text(0.0))
+    check('a bound that rounds to zero takes the same branch',
+          'nothing is excluded' in exclusion_bound_text(-1e-9),
+          exclusion_bound_text(-1e-9))
+    check('a strictly positive lower bound does exclude every degradation',
+          'every degradation is excluded' in exclusion_bound_text(0.2),
+          exclusion_bound_text(0.2))
+
+    # --- n is a count of seeds --------------------------------------------
+    probe = pd.DataFrame({
+        'run_dir': ['a', 'b', 'c', 'd'],
+        'label': ['scratch-x', 'scratch-x', 'scratch-x', 'c4src-x'],
+        'arm': ['scratch-x', 'scratch-x', 'scratch-x', 'c4src-x'],
+        'cell': ['x', 'x', 'x', 'x'],
+        'condition': ['scratch'] * 4,
+        'env': ['LunarLander-v3'] * 4,
+        'seed': [0, 0, 1, 300],
+        'seed_block': ['CONFIRM', 'CONFIRM', 'CONFIRM', 'C4SRC'],
+        'final_score': [0.4, 0.6, 0.5, 0.0],
+        'auc_score': [0.4, 0.6, float('nan'), 0.0],
+    })
+    scratch_g = probe[probe['label'] == 'scratch-x']
+    check('n counts distinct seeds, not rows',
+          n_seeds(scratch_g) == 2 and len(scratch_g) == 3,
+          f'{n_seeds(scratch_g)} seeds over {len(scratch_g)} rows')
+    check('a duplicated seed is named, not averaged away',
+          duplicate_seed_arms(probe) and 'seed 0 x2' in
+          duplicate_seed_arms(probe)[0], str(duplicate_seed_arms(probe)))
+    check('a cell whose rows outnumber its seeds says so',
+          'rows at 2 seed(s)' in fmt_metric(scratch_g, 'final_score'),
+          fmt_metric(scratch_g, 'final_score'))
+    check('a metric finite on fewer seeds than the arm says so',
+          'of 2 seeds' in fmt_metric(scratch_g, 'auc_score'),
+          fmt_metric(scratch_g, 'auc_score'))
+    check('metric_coverage names the arm and the metric',
+          any('auc_score on 1 of 2 seeds' in s
+              for s in metric_coverage(probe, ('auc_score',))),
+          str(metric_coverage(probe, ('auc_score',))))
+
+    # --- the source-only blocks never reach a target-side estimate ---------
+    check('target_side drops the C4SRC donors',
+          len(target_side(probe)) == 3
+          and 'C4SRC' not in set(target_side(probe)['seed_block']),
+          str(sorted(target_side(probe)['seed_block'])))
+    head, head_seeds = scratch_headroom(probe, 'x', 'LunarLander-v3')
+    check('headroom is computed on the target-side scratch runs only',
+          head is not None and abs(head - 0.5) < 1e-12 and head_seeds == 2,
+          f'headroom {head} on {head_seeds} seed(s); pooling the C4SRC donor '
+          f'would give 0.625')
+
+    # --- the source-validity verdict --------------------------------------
+    src_probe = pd.DataFrame({
+        'label': ['transfer-x', 'transfer-x'],
+        'seed': [0, 1], 'source_valid': [False, False],
+        'source_final_score': [0.599201, 0.599201],
+        'source_seed': [0, 400], 'source_seed_block': ['CONFIRM', 'RESERVE'],
+    })
+    state = source_state(src_probe)
+    check('a rejected source is flagged in the cell, not printed as valid',
+          state['text'].startswith('REJECTED')
+          and str(SOURCE_VALIDITY_GATE) in state['text'], state['text'])
+    check('the rejected source seeds are named (DESIGN.md 4.3)',
+          len(state['rejected']) == 2, str(state['rejected']))
+    check('a RESERVE substitution is named (DESIGN.md 4.3)',
+          len(state['reserve']) == 1 and 'RESERVE seed 400'
+          in state['reserve'][0], str(state['reserve']))
+    check('an arm with no source reads n/a, not "not recorded"',
+          source_state(pd.DataFrame({'source_valid': [float('nan')],
+                                     'seed': [0]}))['text'] == 'n/a')
+
+    # --- a moved invariant is any declared invariant, not freeze_updates ---
+    moved_probe = pd.DataFrame({'lr': [0.0005, 0.001],
+                                'freeze_updates': [150, 150]})
+    check('a moved learning rate is caught, not only a moved freeze window',
+          moved_invariants(moved_probe, ('lr', 'freeze_updates'))
+          == ['lr (0.0005, 0.001)'],
+          str(moved_invariants(moved_probe, ('lr', 'freeze_updates'))))
+    check('the invariant list is audit.py\'s own',
+          ARM_INVARIANT_FIELDS is auditmod.DISCRIMINATING)
+
+    # --- power: the plan's own pre-registered verdict ----------------------
+    check('the plan\'s noisy cell is not reported as powered',
+          _powered_phrase(MODEST_EFFECT_MDE).startswith(
+              'NOT POWERED FOR A MODEST EFFECT'),
+          _powered_phrase(MODEST_EFFECT_MDE))
+    check('a quiet cell still states what it detects',
+          _powered_phrase(0.066).startswith('detects effects'),
+          _powered_phrase(0.066))
+    check('the whole-scale MDE keeps the stronger phrase',
+          _powered_phrase(UNPOWERED_MDE).startswith('NOT POWERED:'),
+          _powered_phrase(UNPOWERED_MDE))
+    # The two figures were pinned here as the literals 28.06 and 39.0, read off
+    # a transcribed unpaired multiplier of 1.39. ANALYSIS_PLAN.md 6.2's table
+    # was subsequently corrected to 1.41, which is what statlib re-derives, and
+    # the pin went stale in the same edit: the check FAILED at 29.08% vs
+    # 41.00% while nothing about the pairing gain had changed. A literal
+    # transcribed from a constant that lives in another module is the defect
+    # this whole file exists to avoid, so what is asserted here is the
+    # RELATION, which no correction to the plan can invalidate: the two
+    # percentages are the two directions of one ratio, they are not
+    # interchangeable, and the note must quote each in its own place.
+    _ratio = (MDE_MULTIPLIERS[('unpaired', 'nominal')]
+              / MDE_MULTIPLIERS[('paired', 'nominal')])
+    check('the pairing reduction and inflation are the two directions of one '
+          'ratio, computed rather than transcribed',
+          abs(_PAIRING_REDUCTION_PCT - 100.0 * (1.0 - 1.0 / _ratio)) < 1e-9
+          and abs(_PAIRING_INFLATION_PCT - 100.0 * (_ratio - 1.0)) < 1e-9,
+          f'{_PAIRING_REDUCTION_PCT:.2f}% vs {_PAIRING_INFLATION_PCT:.2f}% '
+          f'at a multiplier ratio of {_ratio:.4f}')
+    check('the pairing gain is the reduction, not the inflation',
+          _PAIRING_REDUCTION_PCT < _PAIRING_INFLATION_PCT - 5.0,
+          f'{_PAIRING_REDUCTION_PCT:.2f}% vs {_PAIRING_INFLATION_PCT:.2f}%: '
+          f'the two figures are close enough to be confused, so the note '
+          f'cannot demonstrate which one it quotes')
+    check('the note quotes the reduction where it says REDUCES and the '
+          'inflation where it says LARGER',
+          (f'by {_PAIRING_REDUCTION_PCT:.0f}%' in _PAIRING_NOTE
+           and f'{_PAIRING_INFLATION_PCT:.0f}% LARGER' in _PAIRING_NOTE),
+          _PAIRING_NOTE[:200])
+
+    # --- the guards that used to fail open ---------------------------------
+    check('seed_block is required, so the TUNE and donor guards cannot skip',
+          'seed_block' in REQUIRED_COLUMNS)
+
     ok = all(c[1] for c in checks)
     if verbose:
         for name, passed, detail in checks:
@@ -2266,6 +3451,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help='restrict to runs belonging to these experiment ids; '
                         'an exclusion is a selection, so the count excluded is '
                         'printed')
+    p.add_argument('--runs', default=None,
+                   help='run tree to audit before writing anything. Defaults '
+                        'to the directory holding --per-seed.')
+    p.add_argument('--allow-audit-failure', action='store_true',
+                   help='write the tables over a FAILED audit. The override '
+                        'and the failing checks are stamped into every '
+                        'caption and every provenance sidecar (DESIGN.md 8.4).')
     p.add_argument('--self-test', action='store_true',
                    help='run the escaping and formatting assertions and exit')
     return p
@@ -2302,6 +3494,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     if args.experiments:
+        if 'experiments' not in df.columns:
+            print(f'tables.py: --experiments was given but {args.per_seed} has '
+                  f'no "experiments" column, so there is nothing to select on. '
+                  f'aggregate.py writes it; re-run aggregation rather than '
+                  f'tabulating an unfiltered set under a filtered caption.')
+            return 1
         selected = set(args.experiments)
         keep = df['experiments'].fillna('').apply(
             lambda s: bool(set(str(s).split(';')) & selected))
@@ -2329,10 +3527,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   'tabulated from them.')
             return 1
 
+    # DESIGN.md 8.4: "Aggregation and reporting refuse to run on a failed
+    # audit unless overridden, and the override is stamped into the output."
+    # A table is reporting. Without this gate a table produced over a failed
+    # audit was byte-indistinguishable in its provenance from one produced
+    # over a passing audit, on the invocation this module's own docstring
+    # documents.
+    runs_root = (args.runs
+                 or os.path.dirname(os.path.abspath(args.per_seed)) or '.')
+    try:
+        audit_passed, audit_report = auditmod.audit_ok(runs_root)
+        failing = [c.get('name') for c in audit_report.get('checks', [])
+                   if c.get('status') == 'FAIL']
+    except Exception as exc:                                # noqa: BLE001
+        audit_passed, failing = False, [f'audit raised {type(exc).__name__}: '
+                                        f'{exc}']
+    if not audit_passed and not args.allow_audit_failure:
+        print(f'tables.py: the audit of {runs_root} FAILED '
+              f'({", ".join(str(f) for f in failing) or "no check named"}).')
+        print('  DESIGN.md 8.4 refuses reporting on a failed audit unless the '
+              'override is explicit,')
+        print('  because a table is a reported estimate. Re-run with '
+              '--allow-audit-failure to')
+        print('  produce the tables anyway; the override and the failing '
+              'checks are then stamped')
+        print('  into every caption and every provenance sidecar. Point '
+              '--runs at the tree that')
+        print('  produced this per_seed.csv if the default guess is wrong.')
+        return 1
+    if not audit_passed:
+        print(f'{AUDIT_OVERRIDE_STAMP}: {", ".join(str(f) for f in failing)}')
+        print()
+
     ctx = build_context(df, args.per_seed, args.stats,
-                        list(sys.argv if argv is None else ['tables.py', *argv]))
+                        list(sys.argv if argv is None else ['tables.py', *argv]),
+                        audit_root=runs_root, audit_ok=audit_passed,
+                        audit_override=not audit_passed,
+                        audit_failing=[str(f) for f in failing])
     print(f'tables.py -- {ctx.n_runs} runs, {ctx.n_arms} arms, '
-          f'n={ctx.min_n}-{ctx.max_n} seeds per arm')
+          f'n={ctx.min_n}-{ctx.max_n} DISTINCT SEEDS per arm '
+          f'(smallest seed count behind a co-primary endpoint: '
+          f'{ctx.min_metric_n})')
+    dupes = duplicate_seed_arms(df)
+    if dupes:
+        print('  more than one run per seed in: ' + '; '.join(dupes))
+        print('  two runs of one arm at one seed are two configurations, not '
+              'two seeds (DESIGN.md 8.4).')
     if ctx.validation:
         print(f'\n{VALIDATION_STAMP}')
         print('  At least one tabulated arm has n < '
@@ -2353,15 +3593,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               'tables is exploratory until the plan change is recorded in '
               'ANALYSIS_PLAN.md 11.')
 
-    built: list[Table] = []
+    # Built, then scanned, then written. The scan populates the unmapped-
+    # character record for EVERY table before the first sidecar is written, so
+    # the sidecars agree with each other and with the console warning.
+    built: list[Table] = [build_table(key, df, ctx, stats) for key in keys]
+    for t in built:
+        scan_latex_mapping(t)
     print()
-    for key in keys:
-        t = build_table(key, df, ctx, stats)
+    for t in built:
         result = write_table(t, args.outdir, formats, ctx)
-        built.append(t)
         files = ', '.join(v for k, v in result['files'].items()
                           if k != 'provenance')
-        print(f'{key:<20} {result["rows"]:>4} rows -> {files}')
+        print(f'{t.key:<20} {result["rows"]:>4} rows -> {files}')
         print(f'{"":<20} {"":>4}         '
               f'{result["files"]["provenance"]}')
 
