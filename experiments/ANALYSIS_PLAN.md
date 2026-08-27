@@ -110,6 +110,60 @@ front is what stops a marginal result from being narrated into a finding.
 
 ---
 
+### 2.3 The E3 selection rule, pre-registered before E3 was analysed
+
+`DESIGN.md` 3.3 makes an RQ2 or RQ3 conclusion assertable only where the
+common-configuration and per-cell-tuned policies **agree**, and names the
+secondary policy as "each cell's own E3-selected configuration". Neither document
+said *selected how*. Whoever chooses that rule chooses how easily the two
+policies agree, so it is fixed here, in full, before any E3 output was
+aggregated.
+
+**Inputs.** `E3` trains the four cells across `lr` in {1e-4, 3e-4, 5e-4, 1e-3}
+crossed with target update in {hard, soft}, on LunarLander scratch, at the five
+`TUNE` seeds 200 to 204. Eight configurations per cell, five seeds each.
+
+**Criterion.** Mean `auc_score` across the five `TUNE` seeds. Not final score:
+on LunarLander every cell finishes above the solved threshold, so a final-score
+comparison is a comparison of ceilings and cannot express an ordering. This is
+the same reasoning, and the same endpoint, that `DESIGN.md` 7 already fixed for
+the external-validity check.
+
+**Rule.** For each cell independently, let *A* be the a priori configuration
+(`lr` = 5e-4, hard update every 1000 updates) and *B* the configuration with the
+highest mean AUC. Select
+
+> *B* if `mean_AUC(B) - mean_AUC(A) > SE`, where
+> `SE = sqrt(var_A/5 + var_B/5)` is the standard error of that difference across
+> the five `TUNE` seeds. **Otherwise select *A*.**
+
+Ties in "highest mean AUC" are broken, in order, by: higher mean final score,
+then lower `lr`, then `hard` before `soft`. The rule is therefore deterministic
+and reproducible from the stored table.
+
+**Why conservative rather than argmax.** At n=5 the `TUNE` block cannot resolve
+small differences. A plain argmax would chase noise and invent per-cell
+differences that do not exist; those would then appear as a disagreement between
+the two policies and, under 3.3's arbitration, would **block an RQ2 conclusion
+the data actually support**. Requiring one standard error of separation means the
+secondary policy departs from the primary only where there is evidence, which is
+what the fair-baseline objection asks for and no more. The bar is one SE, not
+two: two would switch almost never and make the arbitration a formality that
+always passes, which is a different way of being uninformative.
+
+**Refusals.** A cell in which no configuration reaches the solved threshold has
+no valid tuning and the selection **refuses** rather than returning its least-bad
+option. An incomplete selection, meaning fewer than four cells, is refused. A
+selection computed from any seed outside `TUNE` is refused, because 8 forbids a
+reported estimate drawing on the selection block.
+
+**What this rule is not.** It is not a claim that the selected configuration is
+optimal. At five seeds it is a coarse instrument, and the tuned policy is a
+**robustness condition on asserting a conclusion**, not a tuned result in its own
+right. No number produced under it is reported as a performance claim.
+
+---
+
 ## 3. Estimation-only analyses, and how they are reported
 
 Every analysis below gets a point estimate and a seed-level bootstrap 95 % CI,
@@ -390,6 +444,7 @@ may not be quoted, compared, or used to choose between hypotheses.
 
 | Date | Deviation | Affected results | Re-labelled? |
 |---|---|---|---|
+| 2026-08-27 | **Omission repaired, not a deviation.** §2.3 is new. `DESIGN.md` 3.3 required an E3-selected per-cell configuration and **neither document ever said how to select it**, leaving an open researcher degree of freedom on the primary conclusion, since the arbitration asserts RQ2 only where the two policies agree. The rule is now fixed in full. Written with 51 of E3's 160 runs on disk, **none aggregated and none analysed**; the commit carrying §2.3 timestamps it ahead of any E3 output. The E3 runs are independent of the rule: they train fixed configurations and the rule is an analysis decision applied afterwards. | **None yet.** No selection has been computed and no tuned arm has been run. Note the consequence for provenance: E3 runs produced before this edit carry the previous `ANALYSIS_PLAN.md` hash, so `audit.py` will report a plan-hash split on E3 unless E3 is restarted under the current plan | n/a |
 | 2026-08-26 | **Declared departure, not a deviation.** §9 emits no interval below n=3. `statlib.clopper_pearson` does, because the Beta-quantile interval is **exact at any n** and at n=1 it is very nearly [0, 1], which is a statement about ignorance rather than a claim. Suppressing it would replace an honest very-wide interval with nothing, which reads as less uncertainty rather than more. The returned interval carries a `reason` naming the departure and the n, so a caller stamps the pipeline-validation label over it and it cannot be quoted as a result. | None. `proportion_reached` is estimation-only and carries no p-value | n/a |
 | 2026-08-26 | **Strengthening, recorded for completeness.** `DESIGN.md` §9's guardrail against a directional adjective affirming a null named the bootstrap interval as the enforcement. `statlib` now gates such wording on the interval **and** an exact permutation test, because the interval alone measured a 6.7% false-direction rate against a nominal 5% at the designed configuration. The spec row therefore understates what the code does. | None. It refuses strictly more wording than the plan requires, never less | n/a |
 | 2026-08-26 | **Correction of an error in this plan, not a deviation.** §6.2's table gave the unpaired Mann-Whitney minimum detectable effect as 1.39 sigma at alpha=0.05 and 1.87 sigma under Holm over 8. Both are transcription errors against this plan's own arithmetic: §6.5 pins 1.406 for the identical estimator at the identical n and alpha, §6.2's own paragraph quotes "1.41 against 1.01 sigma", and `statlib.mde_mann_whitney` at n=10 returns 1.406 and 1.880, which round to 1.41 and 1.88. The table now reads 1.41/1.88 and `stats.py`'s `MDE_MULTIPLIERS` matches it, so its agreement check against `statlib` runs at a tolerance of 0.01 rather than the 0.02 that had been widened to admit the one disagreeing row. This is not a re-tuning under §6.4: no confirmatory run exists (§6.6), the correction claims LESS power for the unpaired test rather than more, and it reconciles the plan with itself rather than with any observed result. | None. The unpaired test is not the primary and no MDE is quoted in any result; §6.3's translated table is computed from the paired row, which is unchanged | n/a |
