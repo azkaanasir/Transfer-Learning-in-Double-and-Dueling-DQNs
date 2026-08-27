@@ -114,12 +114,20 @@ from typing import Optional, Sequence
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
+# `experiments/` as well as the repository root. `registry.py` reaches
+# `tuning.py` by absolute import while putting only the root on the path, so
+# without this line every tuned id (`registry.TUNED_OF`) fails to resolve here
+# with ModuleNotFoundError instead of with the refusal that names what to run.
+# `sweep.py` and `aggregate.py` add both already; this file added only the root.
+for _path in (REPO, os.path.join(REPO, 'experiments')):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from experiments import registry as reg                          # noqa: E402
 from src.dqn import envs, provenance                             # noqa: E402
 from src.dqn.config import Config                                # noqa: E402
+
+import tuning                                                    # noqa: E402
 
 THROUGHPUT_FILE = os.path.join(REPO, 'experiments', 'throughput.json')
 THROUGHPUT_SCHEMA = 'throughput-v1'
@@ -885,10 +893,39 @@ class Inventory:
     replacement_draws: dict = field(default_factory=dict)
     #: True when a rejection ledger was found under `out_root`.
     ledger_present: bool = False
+    #: The `tuning.Selection` the tuned arms of DESIGN.md 3.3 were enumerated
+    #: from, or None where the tree holds none and the stage was not priced.
+    selection: object = None
 
     @property
     def naive_total(self) -> int:
         return sum(r.runs_alone for r in self.experiments)
+
+    @property
+    def tuned_experiments(self) -> list[str]:
+        """The tuned ids in this selection, in the order they were priced."""
+        return [r.id for r in self.experiments if r.id in reg.TUNED_OF]
+
+    @property
+    def tuned_only_runs(self) -> list[RunRecord]:
+        """Runs that exist only because the tuned stage is in this selection.
+
+        The sharing property of `DESIGN.md` 3.3 is a de-duplication *across*
+        experiments: a cell whose selection equals the a priori configuration
+        produces run digests identical to its common-policy arms, so one run
+        record ends up claimed by both policies. Counting the tuned stage by
+        summing its experiments' run counts would therefore price those shared
+        cells twice; counting the records no common-policy arm also claims
+        prices what the stage actually adds.
+
+        It is a property of the *selection being priced*, not of the catalogue:
+        pricing `E1t` without `E1` makes every one of its runs tuned-only, which
+        is the honest answer to what that command would launch, and the report
+        says which of the two questions the number answers.
+        """
+        return [r for r in self.runs
+                if r.experiments
+                and all(e in reg.TUNED_OF for e in r.experiments)]
 
     @property
     def total(self) -> int:
@@ -954,7 +991,8 @@ class Inventory:
 def build_inventory(exp_ids: Sequence[str], seeds: Optional[str],
                     out_root: str, overrides: Optional[dict],
                     table: dict[str, dict], table_meta: dict,
-                    allow_factor_overrides: bool = False) -> Inventory:
+                    allow_factor_overrides: bool = False,
+                    selection=None) -> Inventory:
     """Resolve a selection into runs, costs, seed blocks and sharing savings.
 
     The job graph is resolved through the runner's source-replacement ledger, not
@@ -1007,14 +1045,20 @@ def build_inventory(exp_ids: Sequence[str], seeds: Optional[str],
     rows: list[ExperimentRow] = []
     records: dict[str, RunRecord] = {}
     for eid in exp_ids:
-        exp = reg.EXPERIMENTS[eid]
+        # `resolve_experiment` rather than `EXPERIMENTS[eid]`, and the selection
+        # passed rather than re-read: a tuned arm's configuration, and therefore
+        # its run digest, is a function of the selection, so an inventory that
+        # let each call re-resolve it could price one selection's arms against
+        # another's directories if the artifact moved underneath it.
+        exp = reg.resolve_experiment(eid, out_root, selection)
         # `jobs` can emit two arms that resolve to one configuration -- E7's
         # aggregation='mean' scratch arm is E1's scratch arm -- so the count that
         # matters is over run keys, not over jobs.
         alone = {job.key(): job
                  for job in reg.jobs(eid, seeds, out_root, overrides,
                                      allow_factor_overrides,
-                                     source_seeds=replacements)}
+                                     source_seeds=replacements,
+                                     selection=selection)}
         before = len(records)
         seconds_alone = 0.0
         for key, job in alone.items():
@@ -1064,7 +1108,8 @@ def build_inventory(exp_ids: Sequence[str], seeds: Optional[str],
     canonical = {job.key() for job in reg.all_jobs(exp_ids, seeds, out_root,
                                                    overrides,
                                                    allow_factor_overrides,
-                                                   source_seeds=replacements)}
+                                                   source_seeds=replacements,
+                                                   selection=selection)}
     if canonical != set(records):
         warnings.append(
             f'INTERNAL: this inventory and registry.all_jobs disagree on '
@@ -1158,7 +1203,7 @@ def build_inventory(exp_ids: Sequence[str], seeds: Optional[str],
                      out_root=out_root, table=table, table_meta=table_meta,
                      models=models, warnings=warnings,
                      replacements=replacements, replacement_draws=draws,
-                     ledger_present=ledger_present)
+                     ledger_present=ledger_present, selection=selection)
 
 
 # ---------------------------------------------------------------------------
@@ -2160,6 +2205,120 @@ def print_harvest(diag: dict) -> None:
                     indent=' ' * 11, cont=' ' * 11)
 
 
+def tuned_stage_cost(inv: Inventory) -> dict:
+    """What the tuned stage of DESIGN.md 3.3 adds to this selection.
+
+    `added_runs` is the count of run directories no common-policy arm in this
+    same selection also asks for, which is the figure `DESIGN.md` 3.3 calls an
+    upper bound rather than a doubling: a cell whose E3 selection equals the a
+    priori configuration produces identical run digests, so its tuned arms share
+    the directories and add nothing.
+
+    `shared_cells` and `own_cells` come from the stored selection rather than
+    from the run counts, so they are right even when the common-policy arms are
+    not in the selection being priced and every tuned run therefore counts as
+    added.
+    """
+    selection = inv.selection
+    tuned_ids = inv.tuned_experiments
+    added = inv.tuned_only_runs
+    common = [eid for eid in reg.TUNED_OF.values()
+              if eid in {r.id for r in inv.experiments}]
+    out = {
+        'experiments': tuned_ids,
+        'available': selection is not None,
+        'priced': bool(tuned_ids),
+        'policy': reg.TUNED_POLICY,
+        'common_policy_experiments_in_selection': common,
+        'added_runs': len(added),
+        'added_seconds': sum(r.seconds for r in added),
+        'added_runs_pending': sum(1 for r in added if not r.complete),
+        'shared_runs': sum(1 for r in inv.runs
+                           if len(set(r.experiments) & set(reg.TUNED_OF)) > 0
+                           and not set(r.experiments) <= set(reg.TUNED_OF)),
+    }
+    if selection is not None:
+        out.update(
+            selection_id=selection.selection_id,
+            selection_short_id=selection.short_id,
+            rule_id=selection.rule.get('id'),
+            rule_placeholder=bool(selection.is_placeholder),
+            seed_block=selection.seed_block,
+            env=selection.env,
+            source_experiment=selection.source_experiment,
+            shared_cells=list(selection.shared_cells),
+            own_cells=[key for key in sorted(selection.cells)
+                       if key not in set(selection.shared_cells)],
+            cells={key: cell.config.to_dict()
+                   for key, cell in sorted(selection.cells.items())})
+    return out
+
+
+def print_tuned_stage(inv: Inventory) -> None:
+    """The tuned stage's cost, or the one line saying there is not one."""
+    cost = tuned_stage_cost(inv)
+    print('\n' + rule())
+    print('TUNED STAGE: DESIGN.md 3.3 secondary policy, per-cell tuned')
+    print(rule())
+    if not cost['available']:
+        print(f'  no selection at '
+              f'{tuning.selection_path(inv.out_root)}, so E1t and E2t cannot '
+              f'be enumerated')
+        print('  and are not priced above. DESIGN.md 3.3 makes the stage '
+              'sequentially')
+        print('  dependent on E3; ANALYSIS_PLAN.md 6.6 budgets about 31 h for '
+              'it, to be')
+        print('  re-costed here once a selection exists. Under '
+              'ANALYSIS_PLAN.md 2.4 every')
+        print('  arbitration verdict is not-evaluable until it does, so no RQ2 '
+              'or RQ3')
+        print('  conclusion may be asserted from the common policy alone.')
+        return
+    print(f'  selection : {cost["selection_short_id"]}  '
+          f'rule={cost["rule_id"]}'
+          f'{"  PLACEHOLDER" if cost["rule_placeholder"] else ""}')
+    print(f'  stored at : {tuning.selection_path(inv.out_root)}')
+    print(f'  computed  : from {cost["source_experiment"]} on '
+          f'{cost["seed_block"]}, env {cost["env"]}')
+    for key, config in cost['cells'].items():
+        shares = key in cost['shared_cells']
+        print(f'    {key:<16} lr={config["lr"]:g} '
+              f'{config["target_update"]}/{config["target_update_freq"]}  '
+              + ('SHARES the common policy run directories: adds no runs'
+                 if shares else 'own run directories'))
+    if not cost['priced']:
+        print('  not priced: E1t and E2t are available for this tree and are '
+              'not in this')
+        print('  selection. Add them to --experiments, or use --all, to see '
+              'what they cost.')
+        return
+    print(f'  priced    : {", ".join(cost["experiments"])}')
+    alongside = (', '.join(cost['common_policy_experiments_in_selection'])
+                 or 'none selected')
+    print(f'  adds      : {cost["added_runs"]} run directories '
+          f'({hms(cost["added_seconds"])} of single-worker compute), on top of')
+    print(f'              the common-policy arms in this same selection '
+          f'({alongside})')
+    print(f'  shares    : {cost["shared_runs"]} run director(ies) with those '
+          f'arms, which is what')
+    print('              DESIGN.md 3.3 means by an upper bound rather than a '
+          'doubling: a cell')
+    print('              selecting the a priori configuration has identical '
+          'run digests.')
+    if not cost['common_policy_experiments_in_selection']:
+        print('  NOTE      : no common-policy arm is in this selection, so '
+              'every tuned run')
+        print('              counts as added even where the cell shares. To '
+              'see the sharing,')
+        print(f'              price them together: --experiments '
+              f'{" ".join(sorted(set(reg.TUNED_OF.values())))} '
+              f'{" ".join(cost["experiments"])}')
+    print('  sources   : not retuned (DESIGN.md 3.3, ANALYSIS_PLAN.md 2.3), so '
+          'they keep')
+    print('              their base labels and are the same runs the common '
+          'policy uses.')
+
+
 def report(inv: Inventory, jobs_selected: Optional[int], list_runs: bool,
            keep_buffer: bool, disk_measured: Optional[dict],
            residuals: Optional[list[dict]],
@@ -2204,6 +2363,8 @@ def report(inv: Inventory, jobs_selected: Optional[int], list_runs: bool,
             print(f'      reviews: {", ".join(r.review_refs)}')
     print('\n"alone" = runs if that experiment were launched on its own; "new" = '
           'runs it\nadds to this selection, in the order listed above.')
+
+    print_tuned_stage(inv)
 
     # -- sharing ---------------------------------------------------------
     saved = inv.naive_total - inv.total
@@ -2490,6 +2651,7 @@ def to_json(inv: Inventory, jobs_selected: Optional[int],
         },
         'calibration': harvest_diag,
         'checks': checks or {},
+        'tuned_stage': tuned_stage_cost(inv),
         'source_validity': {
             'gate': reg.SOURCE_VALIDITY_GATE,
             'ledger_present': inv.ledger_present,
@@ -2580,9 +2742,48 @@ def parse_overrides(items: Optional[Sequence[str]]) -> dict:
     return out
 
 
+def activate_tuned_stage(out_root: str) -> tuple[object, Optional[str]]:
+    """Install E1t and E2t where the tree holds a selection. Never refuses.
+
+    Implicit, unlike `sweep.py`, and the asymmetry is the point. Costing a stage
+    launches nothing and writes nothing, so the risk `sweep.py` guards against
+    (a catalogue that silently grew two confirmatory experiments and 280 runs)
+    does not exist here; the risk that does exist is the opposite one, a plan
+    that prices a campaign at 125 h while the tree already holds the selection
+    that makes the real figure about 156 h (`ANALYSIS_PLAN.md` 6.6). A cost
+    model that under-reports because nobody passed a flag is the failure this
+    file exists to prevent.
+
+    So a selection is picked up wherever one is resolvable, its absence is
+    silent, and its presence is printed. `select` is what refuses, and only when
+    a tuned id was named explicitly, since that is the one case where continuing
+    would answer a question nobody asked.
+    """
+    if not out_root:
+        return None, 'no --out-root, so there is no tree to read a selection from'
+    try:
+        reg.activate_tuned_arms(out_root=out_root)
+    except tuning.SelectionMissing as exc:
+        return None, str(exc)
+    except tuning.SelectionError as exc:
+        return None, (f'the selection stored at '
+                      f'{tuning.selection_path(out_root)} cannot be used: '
+                      f'{exc}')
+    except ValueError as exc:
+        return None, f'the tuned arms cannot be built from it: {exc}'
+    return reg.active_selection(), None
+
+
 def select(args) -> list[str]:
     if args.experiments:
         unknown = [e for e in args.experiments if e not in reg.EXPERIMENTS]
+        dormant = [e for e in unknown if e in reg.TUNED_OF]
+        if dormant:
+            raise SystemExit(
+                f'{", ".join(dormant)}: E1 and E2 under the secondary tuning '
+                f'policy of DESIGN.md 3.3, which cannot be priced because '
+                f'{args.out_root} holds no selection to build them from. '
+                f'{tuning.missing_message(args.out_root)}')
         if unknown:
             raise SystemExit(f'unknown experiment(s): {", ".join(unknown)}; '
                              f'known: {", ".join(reg.EXPERIMENTS)}')
@@ -2691,6 +2892,9 @@ def main(argv=None) -> int:
                          f'episodes cannot be launched, so pricing one would be '
                          f'a plan for something that will never happen.')
 
+    # The tuned stage of DESIGN.md 3.3, before the selection is resolved:
+    # activating it changes what --experiments, --tier and --all mean.
+    selection, tuned_unavailable = activate_tuned_stage(args.out_root)
     exp_ids = select(args)
     seeds = ' '.join(args.seeds) if args.seeds else None
     if seeds is not None:
@@ -2767,7 +2971,8 @@ def main(argv=None) -> int:
         # calibration is never more expensive than the plan it prices.
         table_now, _ = load_throughput(args.throughput_file)
         probe = build_inventory(exp_ids, seeds, args.out_root, overrides,
-                                table_now, {}, args.allow_factor_overrides)
+                                table_now, {}, args.allow_factor_overrides,
+                                selection=selection)
         keys = sorted({(envs.parse(r.env).canonical(), r.arch)
                        for r in probe.runs})
         print(f'measuring {len(keys)} (env, arch) pair(s) at '
@@ -2792,7 +2997,13 @@ def main(argv=None) -> int:
                 'written': time.strftime('%Y-%m-%dT%H:%M:%S')}
 
     inv = build_inventory(exp_ids, seeds, args.out_root, overrides, table, meta,
-                          args.allow_factor_overrides)
+                          args.allow_factor_overrides, selection=selection)
+    if selection is None and any(eid in reg.TUNED_OF for eid in exp_ids):
+        # Unreachable through `select`, which refuses first. Here because a
+        # caller reaching `main` with a tuned id and no selection would
+        # otherwise price a stage it could not have enumerated.
+        raise SystemExit(f'internal: {exp_ids} names a tuned experiment with no '
+                         f'selection. {tuned_unavailable}')
     checks['anchors'] = anchor_check(table)
     for row in checks['anchors']:
         if not row['ok']:

@@ -37,10 +37,16 @@ hypothetical; each was found, by execution, either in the published study
   secondary one a field such as `lr` varies *between* cells while remaining
   invariant *within* a cell. Adding it to an experiment's `varies` to permit the
   first would drop it from `invariants()` and stop it being checked at the
-  second, so every field in `registry.CORE_INVARIANTS`, varied ones included, is
-  additionally required to be constant within each (arch, target_rule) cell of
-  every non-screen experiment. A screen is exempt, because varying a
-  hyperparameter inside one cell is what a screen is for.
+  second, so every field an experiment declares in `scoped_invariants`, and
+  every `registry.CORE_INVARIANTS` field it declares varied, is additionally
+  required to be constant within each group of runs sharing
+  `registry.scope_key` -- (arch, target_rule, env), which is the cell *on one
+  environment*. The environment belongs in the key: `E1t` and `E2t` carry each
+  cell's selected learning rate on the target task and the common one on the
+  CartPole source runs they share with the primary policy, so a scope keyed on
+  the cell alone would report the structure the design asks for as a violation.
+  A screen is exempt, because varying a hyperparameter inside one cell is what
+  a screen is for.
 
 * **Seed completeness.** One seed was dropped from one published arm with no
   stated rule. The declared arm x seed inventory comes from
@@ -151,6 +157,19 @@ hypothetical; each was found, by execution, either in the published study
   and the derived seed per stream are each required to be present, because a
   provenance block that is half absent is not a reproducibility record.
 
+* **The tuning selection.** The tuned arms of `DESIGN.md` 3.3 are a function of
+  one stored artifact, `<out_root>/_jobs/tuning_selection.json`, so that
+  artifact is a pre-registration record with the standing of the plan hash and
+  fails the same two ways: edited after the runs were enumerated from it, or
+  replaced, which leaves the old runs on disk claimed by no arm while the new
+  arms read as missing. A run recorded under `E1t`/`E2t` is therefore compared
+  field by field against the configuration the artifact selects for its cell,
+  and where it disagrees the archived selections are searched for the one it
+  does match, so the finding names the selection the run actually came from. A
+  placeholder rule, a selection outside the `TUNE` block, a selection covering
+  fewer than four cells, a missing or non-matching archive copy and a stale plan
+  hash on the artifact are each findings in their own right.
+
 * **Robustness of the audit itself.** A checker that dies on one malformed field
   produces no report for any of the other runs, which is worse than the defect
   it choked on: a single non-integer `episodes_completed`, or `freeze_events`
@@ -196,6 +215,7 @@ import dataclasses
 import glob
 import hashlib
 import json
+import math
 import os
 import sys
 from collections import Counter, defaultdict
@@ -210,6 +230,7 @@ for _path in (_REPO, _HERE):
 
 import registry                                              # noqa: E402
 import statlib                                               # noqa: E402
+import tuning                                                # noqa: E402
 from src.dqn import envs, provenance                         # noqa: E402
 from src.dqn.config import (Config, MEASUREMENT_FIELDS,      # noqa: E402
                             TRAJECTORY_FIELDS)
@@ -607,6 +628,27 @@ def _norm(name: str, value: Any) -> Any:
     return value
 
 
+def _scope_label(key: Iterable[Any]) -> str:
+    """A `registry.scope_key` tuple as prose, for a finding a human reads.
+
+    `('mlp', 'vanilla', 'LunarLander-v3')` reads as
+    `cell mlp-vanilla on LunarLander-v3`. The keys are named from
+    `registry.SCOPED_INVARIANT_KEYS` rather than positionally, so adding one to
+    the scope changes this label instead of silently dropping out of it.
+    """
+    parts = list(key)
+    names = list(registry.SCOPED_INVARIANT_KEYS)
+    by_name = dict(zip(names, parts))
+    if set(names) >= {'arch', 'target_rule'}:
+        cell = f'{by_name.get("arch")}-{by_name.get("target_rule")}'
+        rest = [f'{n}={by_name[n]}' for n in names
+                if n not in ('arch', 'target_rule')]
+        return f'cell {cell}' + (' on ' + ', '.join(
+            str(by_name[n]) for n in names
+            if n not in ('arch', 'target_rule')) if rest else '')
+    return ', '.join(f'{n}={by_name[n]}' for n in names)
+
+
 def _run_signature(run: Run) -> dict[str, Any]:
     return {name: _norm(name, run.cfg.get(name, CONFIG_DEFAULTS.get(name)))
             for name in DISCRIMINATING}
@@ -855,44 +897,63 @@ def check_invariants(membership, exps, declared: Declared) -> Check:
         # inside one cell is the whole point of a screen: E3 sweeps four
         # learning rates per cell and E12 two capacities, both by declaration.
         #
-        # Which leaves this scope with nothing to compare on today's catalogue,
-        # and saying so is the point of `cell_scope_dormant` below: E3 and E12
-        # are the only experiments with a `varies` list and both are screens,
-        # so the field set here is empty for every experiment in the catalogue.
-        # The check is correct and it is in force; its coverage is currently
-        # zero, and a check whose coverage is zero must not be reported as
-        # enforcement (DESIGN.md 11 defect 12).
+        # The group is `registry.scope_key`, which is (arch, target_rule, env)
+        # and not the cell alone. The environment belongs in the key because
+        # DESIGN.md 3.3 scopes the secondary policy to "within a cell across
+        # {scratch, transfer, C2, C3}", the four TARGET-task conditions, and the
+        # selection is made on LunarLander. E1t and E2t therefore carry the
+        # cell's selected `lr` on the target runs and the common `lr=5e-4` on
+        # the CartPole source runs they share with the common policy, which is a
+        # single cell holding two learning rates. Grouped by cell alone this
+        # check would report every retuned cell as a violation -- an ERROR on
+        # the structure the design asks for -- so the key is taken from
+        # `registry.SCOPED_INVARIANT_KEYS` rather than restated here, and the
+        # catalogue and the audit cannot drift about what the scope is.
+        #
+        # The field set is the experiment's `scoped_invariants` unioned with
+        # every CORE_INVARIANT it declares varied. The union is deliberate: the
+        # declaration is the catalogue's statement of intent and is checked
+        # because it was made, and the derived set is checked because an
+        # experiment that varies a core field and declares no scope would
+        # otherwise be asserted at neither scope, which is the hole this block
+        # exists to close.
         if exp.family != 'screen':
-            by_cell: dict[str, list[str]] = defaultdict(list)
+            by_scope: dict[tuple, list[str]] = defaultdict(list)
             for rel, run in sorted(runs.items()):
-                by_cell[run.cell].append(rel)
+                by_scope[registry.scope_key(run.cfg)].append(rel)
             declared_invariant = set(exp.invariants())
             varied_core = [f for f in registry.CORE_INVARIANTS
                            if f not in declared_invariant]
+            scoped = list(dict.fromkeys(
+                tuple(exp.scoped_invariants) + tuple(varied_core)))
             cell_scope_experiments += 1
-            cell_scope_comparisons += len(varied_core) * len(by_cell)
-            for cell in sorted(by_cell):
-                for name in varied_core:
+            cell_scope_comparisons += len(scoped) * len(by_scope)
+            for key in sorted(by_scope, key=lambda k: tuple(str(p) for p in k)):
+                where = _scope_label(key)
+                for name in scoped:
                     groups = defaultdict(list)
-                    for rel in by_cell[cell]:
+                    for rel in by_scope[key]:
                         groups[_norm(name, runs[rel].cfg.get(
                             name, CONFIG_DEFAULTS.get(name)))].append(rel)
                     if len(groups) > 1:
                         chk.add(ERROR, 'cell_invariant_violated',
                                 f'{eid}: {name} takes {len(groups)} values '
-                                f'within cell {cell}. {eid} declares {name} '
+                                f'within {where}. {eid} declares {name} '
                                 f'varied, which DESIGN.md 3.3 licenses only '
                                 f'*between* cells: under the per-cell-tuned '
                                 f'policy it is still invariant within one '
                                 f'({", ".join(str(v) for v in groups)})',
                                 runs=[r for rs in groups.values()
                                       for r in rs[:2]],
-                                experiment=eid, field=name, cell=cell,
+                                experiment=eid, field=name, cell=where,
+                                scope_keys=list(registry.SCOPED_INVARIANT_KEYS),
                                 values={str(v): {'n': len(rs),
                                                  'runs': rs[:MAX_LISTED]}
                                         for v, rs in groups.items()})
-            chk.detail[eid]['cells'] = sorted(by_cell)
-            chk.detail[eid]['cell_scope_fields'] = varied_core
+            chk.detail[eid]['cells'] = sorted(
+                _scope_label(k) for k in by_scope)
+            chk.detail[eid]['cell_scope_fields'] = scoped
+            chk.detail[eid]['cell_scope_declared'] = list(exp.scoped_invariants)
 
         # And the second half of the same question: is the value in force the
         # value the catalogue declares? The registry draws the line for us.
@@ -971,16 +1032,22 @@ def check_invariants(membership, exps, declared: Declared) -> Check:
         chk.add(NOTE, 'cell_scope_dormant',
                 f'the DESIGN.md 3.3 secondary scope compared nothing: across '
                 f'{cell_scope_experiments} non-screen experiment(s) it made 0 '
-                f'field x cell comparison(s). It tests a CORE_INVARIANT the '
-                f'experiment declares varied, and no non-screen experiment in '
-                f'the catalogue declares one: E3 and E12 are the only entries '
-                f'with a varies list and both are screens, which this scope '
-                f'exempts. The check is in force and fires the moment the '
-                f'per-cell-tuned policy of 3.3 is adopted for a reported '
+                f'field x scope comparison(s). It tests the fields an '
+                f'experiment declares in `scoped_invariants`, plus any '
+                f'CORE_INVARIANT it declares varied, and no non-screen '
+                f'experiment in this selection declares either: the tuned '
+                f'experiments {sorted(registry.TUNED_OF)} are the only ones '
+                f'that do and they are enumerated only once a tuning '
+                f'selection exists (DESIGN.md 3.3, sequentially dependent on '
+                f'E3). E3 and E12 vary a field and are screens, which this '
+                f'scope exempts. The check is in force and fires the moment '
+                f'the per-cell-tuned policy of 3.3 reaches a reported '
                 f'experiment. Until then it enforces nothing, and this file '
                 f'says so rather than counting it as a guardrail',
                 non_screen_experiments=cell_scope_experiments,
                 comparisons=0,
+                scope_keys=list(registry.SCOPED_INVARIANT_KEYS),
+                tuned_experiments=sorted(registry.TUNED_OF),
                 core_invariants=list(registry.CORE_INVARIANTS))
     return chk
 
@@ -2699,6 +2766,387 @@ def check_provenance(runs: list[Run]) -> Check:
     return chk
 
 
+#: Fields a tuning selection fixes for a cell. Read from `CellConfig` rather
+#: than restated, so a field added to the selected configuration is compared
+#: here without this file being edited: a selected field nobody compares is a
+#: selected field a run may silently disagree with.
+SELECTED_FIELDS: tuple[str, ...] = tuple(
+    sorted(tuning.A_PRIORI_CONFIG.to_dict()))
+
+
+def _selected_mismatch(run: Run, want) -> list[tuple]:
+    """(field, recorded, selected) for each selected field the run disagrees on."""
+    out: list[tuple] = []
+    expect = want.to_dict()
+    for name in SELECTED_FIELDS:
+        got = run.cfg.get(name, CONFIG_DEFAULTS.get(name))
+        target = expect[name]
+        if isinstance(target, float):
+            value = _as_float(got)
+            if value is not None and math.isclose(value, float(target),
+                                                  rel_tol=1e-9, abs_tol=0.0):
+                continue
+        elif _norm(name, got) == _norm(name, target):
+            continue
+        out.append((name, got, target))
+    return out
+
+
+def _archived_selections(out_root: str) -> dict:
+    """Every selection archived under this tree, by id. Unreadable ones skipped.
+
+    The archive is what makes a mismatch diagnosable rather than merely
+    detectable: a tuned run that disagrees with the active selection but agrees
+    with a superseded one was enumerated from that superseded one, which is a
+    different defect from a hand-edited configuration and wants a different
+    repair.
+    """
+    out: dict = {}
+    pattern = os.path.join(glob.escape(os.path.abspath(out_root)),
+                           *tuning.SELECTION_ARCHIVE_RELDIR.split(os.sep),
+                           '*.json')
+    for path in sorted(glob.glob(pattern)):
+        try:
+            with open(path, encoding='utf-8') as fh:
+                out[os.path.splitext(os.path.basename(path))[0]] = \
+                    tuning.Selection.from_dict(json.load(fh))
+        except Exception:                                   # noqa: BLE001
+            continue
+    return out
+
+
+def check_tuning_provenance(runs: list[Run], out_root: str) -> Check:
+    """The secondary policy's runs against the selection they claim to execute.
+
+    `DESIGN.md` 3.3 executes the per-cell-tuned policy as `E1t` and `E2t`, whose
+    arms are a function of one artifact: the tuning selection stored at
+    `<out_root>/_jobs/tuning_selection.json`. That makes the artifact a
+    pre-registration record with the same standing as the plan hash, and it
+    fails in the same two ways. It can be *edited* after the runs were
+    enumerated from it, in which case the runs on disk belong to arms that no
+    longer exist; or it can be *replaced*, in which case the old runs stay in
+    the tree, no arm declares them, and the new arms are reported missing while
+    the old ones read as an unattributed pile. Neither is visible to any other
+    check here: a superseded tuned run has a consistent digest, a valid
+    manifest and a plan hash that matches.
+
+    What is compared, and what is not
+    ---------------------------------
+    A run's manifest records no selection id. It records the `experiment` and
+    `label` the runner was given and the configuration it trained under, and
+    the selection is precisely what determines that configuration for a tuned
+    arm, so the comparison here is over the selected fields: a run recorded
+    under `E1t`/`E2t`, or carrying the tuned label prefix, must hold exactly the
+    configuration the artifact on disk selects for its cell. Where it does not,
+    the archived selections under `_jobs/selections/` are searched for one it
+    *does* match, so the finding says which selection the run came from rather
+    than only that it disagrees with this one.
+
+    That is a reconstruction, and it is weaker than reading a recorded id in
+    one specific way: two selections that agree on a cell are indistinguishable
+    for that cell's runs. They are also indistinguishable in the runs
+    themselves, because the digest is a function of the configuration and such
+    runs are literally the same runs, so the reconstruction is exact wherever
+    two selections differ, which is the only place a difference can exist. A
+    stronger check would read a selection id written into the manifest by the
+    runner, which is a field in `src/dqn/provenance.py` and not this file's to
+    add.
+
+    Source runs are held to the primary policy on purpose. `DESIGN.md` 3.3
+    scopes the secondary policy to the target task, `tuned_experiment` leaves
+    the CartPole source arms unretuned and unrelabelled, and a source run that
+    had drifted onto a selected learning rate would mean the two policies
+    differed in the source as well as in the arm under study, so a disagreement
+    between them could no longer be read as being about the tuning policy.
+    """
+    chk = Check(
+        'TUNING SELECTION',
+        'the tuned arms of DESIGN.md 3.3 are a function of one stored '
+        'artifact, so an edited or a replaced selection silently re-points '
+        'every run enumerated from it and no other check here can see that')
+    prefix = registry.TUNED_LABEL_PREFIX
+    tuned_ids = set(registry.TUNED_OF)
+    marked = [r for r in runs
+              if str(r.cfg.get('experiment') or '') in tuned_ids
+              or str(r.cfg.get('label') or '').startswith(prefix)]
+    active = tuning.selection_path(out_root)
+    chk.detail.update({
+        'artifact': active,
+        'tuned_experiments': sorted(tuned_ids),
+        'tuned_arms_in_catalogue': registry.tuned_arms_active(),
+        'runs_recorded_as_tuned': len(marked),
+        'selected_fields': list(SELECTED_FIELDS)})
+
+    selection = None
+    try:
+        selection = tuning.read_selection(out_root, required=False,
+                                          verify=True, warn_placeholder=False)
+    except Exception as exc:                                # noqa: BLE001
+        # Includes `SelectionCorrupt`, raised when the stored artifact does not
+        # hash to the id it carries -- that is, when it was edited after the
+        # arms were enumerated from it. An error whether or not tuned runs
+        # exist yet, because the file is what the next enumeration reads.
+        chk.add(ERROR, 'selection_unreadable',
+                f'{active} exists and cannot be read as a selection artifact '
+                f'({type(exc).__name__}: {exc}). The tuned arms of DESIGN.md '
+                f'3.3 are enumerated from it, so nothing can say which arms '
+                f'the runs on disk belong to while it is in this state. '
+                f'Recompute it with experiments/tuning.py rather than '
+                f'repairing the file.',
+                runs=[r.rel for r in marked[:MAX_LISTED]])
+        return chk
+
+    if selection is None:
+        if marked:
+            chk.add(ERROR, 'tuned_runs_without_selection',
+                    f'{len(marked)} run(s) are recorded under the tuned '
+                    f'experiments {sorted(tuned_ids)} or carry the '
+                    f'{prefix!r} label prefix, and there is no selection at '
+                    f'{active}. Those runs execute a per-cell configuration '
+                    f'that nothing on disk declares, so no arm claims them and '
+                    f'the tuning policy they ran under is unrecoverable.',
+                    runs=[r.rel for r in marked[:MAX_LISTED]], n=len(marked))
+        else:
+            chk.add(NOTE, 'tuning_stage_not_started',
+                    f'no tuning selection at {active} and no run recorded '
+                    f'under {sorted(tuned_ids)}. The secondary policy of '
+                    f'DESIGN.md 3.3 is sequentially dependent on E3 and has '
+                    f'not been enumerated, so every comparison below made 0 '
+                    f'comparisons. The check is in force and enforces nothing '
+                    f'yet, and this file says so rather than counting it as a '
+                    f'guardrail (DESIGN.md 11 defect 12).')
+        return chk
+
+    chk.detail.update({
+        'selection_id': selection.selection_id,
+        'rule': str(selection.rule.get('id')),
+        'rule_is_placeholder': bool(selection.is_placeholder),
+        'seed_block': selection.seed_block,
+        'seeds': list(selection.seeds),
+        'env': selection.env,
+        'cells': {k: v.config_key for k, v in sorted(selection.cells.items())},
+        'cells_sharing_common_policy_runs': list(selection.shared_cells)})
+
+    # -- the artifact against the design -----------------------------------
+    block = tuple(registry.SEED_BLOCKS[tuning.SELECTION_SEED_BLOCK])
+    if (selection.seed_block != tuning.SELECTION_SEED_BLOCK
+            or tuple(selection.seeds) != block):
+        chk.add(ERROR, 'selection_seed_block_invalid',
+                f'the selection declares block {selection.seed_block!r} at '
+                f'seeds {list(selection.seeds)}; DESIGN.md 3.4 reserves '
+                f'{tuning.SELECTION_SEED_BLOCK} {list(block)} for '
+                f'hyperparameter selection and ANALYSIS_PLAN.md 8 forbids a '
+                f'reported estimate drawing on the selection block. A '
+                f'selection made anywhere else was made on the seeds the '
+                f'confirmatory arms are estimated from.')
+    missing_cells = sorted(registry._tag(*c) for c in registry.CELLS
+                           if registry._tag(*c) not in selection.cells)
+    if missing_cells:
+        chk.add(ERROR, 'selection_cells_incomplete',
+                f'the stored selection covers {sorted(selection.cells)} and '
+                f'not {missing_cells}. ANALYSIS_PLAN.md 2.3 refuses an '
+                f'incomplete selection: the uncovered cells would run under '
+                f'the primary policy while the artifact claimed the secondary '
+                f'one, and the DESIGN.md 3.3 arbitration would be asserted '
+                f'over cells that were never retuned.')
+    if selection.env != registry.TARGET_ENV:
+        chk.add(WARN, 'selection_env_not_target',
+                f'the selection was made on {selection.env} and the target '
+                f'task is {registry.TARGET_ENV}; the tuned arms retune only '
+                f'the runs on the environment the selection names, so every '
+                f'target-task arm would still be running the primary policy',
+                selection_env=selection.env, target_env=registry.TARGET_ENV)
+
+    archive = tuning.archive_path(selection.selection_id, out_root)
+    if not os.path.exists(archive):
+        chk.add(ERROR, 'selection_archive_absent',
+                f'the active selection {selection.short_id} has no immutable '
+                f'copy at {archive}. The archive is what a replaced active '
+                f'pointer is diagnosed against; without it a superseded tuned '
+                f'run cannot be attributed to the selection it was enumerated '
+                f'from.')
+    else:
+        try:
+            with open(archive, encoding='utf-8') as fh:
+                stored = tuning.Selection.from_dict(json.load(fh))
+            archive_agrees = (stored.computed_id() == selection.selection_id)
+        except Exception:                                   # noqa: BLE001
+            archive_agrees = False
+        if not archive_agrees:
+            chk.add(ERROR, 'selection_archive_mismatch',
+                    f'{archive} is named for {selection.short_id} and does not '
+                    f'hash to it. One of the two copies of this selection was '
+                    f'edited, so the content-addressed record no longer says '
+                    f'what the tuned runs were enumerated from.')
+
+    if selection.is_placeholder:
+        chk.add(ERROR if marked else WARN, 'selection_rule_is_placeholder',
+                f'selection {selection.short_id} was computed under '
+                f'{selection.rule.get("id")}, which declares itself a '
+                f'PLACEHOLDER and not the pre-registered criterion of '
+                f'ANALYSIS_PLAN.md 2.3. '
+                + (f'{len(marked)} tuned run(s) already exist under it, so the '
+                   f'secondary leg of the DESIGN.md 3.3 arbitration was run '
+                   f'against a rule the plan does not contain and no number '
+                   f'from it is a result.'
+                   if marked else
+                   'No tuned run exists yet, so this is a warning about what '
+                   'would be launched rather than about what was.'),
+                runs=[r.rel for r in marked[:MAX_LISTED]],
+                rule=str(selection.rule.get('id')))
+
+    current = provenance.plan_hashes()
+    stale = {name: (stored_hash, current.get(name))
+             for name, stored_hash in sorted(selection.plans.items())
+             if stored_hash is not None and stored_hash != current.get(name)}
+    if stale:
+        chk.add(ERROR if marked else WARN, 'selection_plans_stale',
+                f'the selection was computed against {sorted(stale)} as they '
+                f'stood then, and that has changed since. ANALYSIS_PLAN.md 2.3 '
+                f'is the rule this artifact claims to have applied, so a '
+                f'selection whose plan hash no longer matches was made under a '
+                f'criterion the current plan may not contain',
+                documents={k: {'selection': v[0], 'current': v[1]}
+                           for k, v in stale.items()})
+    unrecorded = sorted(k for k, v in selection.plans.items() if v is None)
+    if unrecorded:
+        chk.add(NOTE, 'selection_plans_unrecorded',
+                f'the selection records no hash for {unrecorded}, so it cannot '
+                f'be tied to the plan in force when it was computed',
+                documents=unrecorded)
+
+    # -- the evidence the selection names, against the tree -----------------
+    on_disk = {str(r.run_digest) for r in runs if r.run_digest}
+    named = sorted({d for cell in selection.cells.values()
+                    for d in cell.run_digests})
+    absent = [d for d in named if d not in on_disk]
+    chk.detail['evidence_runs'] = {'named': len(named),
+                                   'present_in_tree': len(named) - len(absent)}
+    if named and absent:
+        chk.add(WARN, 'selection_evidence_absent',
+                f'{len(absent)} of {len(named)} E3 run(s) the selection was '
+                f'computed on are not in this tree. The selection stays valid, '
+                f'being a function of the aggregated table rather than of the '
+                f'directories, but it cannot be recomputed here, so the rule '
+                f'that produced it cannot be re-derived from this tree alone',
+                digests=absent[:MAX_LISTED], n=len(absent))
+
+    # -- every run recorded as tuned, against the artifact ------------------
+    if marked and not registry.tuned_arms_active():
+        chk.add(WARN, 'tuned_arms_not_activated',
+                f'{len(marked)} run(s) are recorded under {sorted(tuned_ids)} '
+                f'and this process did not activate the tuned arms, so the '
+                f'catalogue does not declare them and their completeness, seed '
+                f'blocks and lineage were measured against nothing. Call '
+                f'registry.activate_tuned_arms(out_root=...) before auditing a '
+                f'tree that holds them.',
+                runs=[r.rel for r in marked[:MAX_LISTED]], n=len(marked))
+
+    archived = _archived_selections(out_root)
+    mismatched: dict = {}
+    off_env: list[str] = []
+    unmarked: list[str] = []
+    stray: list[str] = []
+    unknown_cell: list[str] = []
+    compared = 0
+    for run in marked:
+        eid = str(run.cfg.get('experiment') or '')
+        label = str(run.cfg.get('label') or '')
+        env = _norm('env', run.cfg.get('env'))
+        cell_key = run.cell
+        if eid not in tuned_ids:
+            stray.append(run.rel)
+            continue
+        if env == _norm('env', registry.SOURCE_ENV):
+            want = tuning.A_PRIORI_CONFIG            # sources are not retuned
+            if label.startswith(prefix):
+                unmarked.append(run.rel)
+        elif env == _norm('env', selection.env):
+            if cell_key not in selection.cells:
+                unknown_cell.append(run.rel)
+                continue
+            want = selection.config_for(cell_key)
+            if not label.startswith(prefix):
+                unmarked.append(run.rel)
+        else:
+            off_env.append(run.rel)
+            continue
+        compared += 1
+        for name, got, expect in _selected_mismatch(run, want):
+            entry = mismatched.setdefault((cell_key, name), {
+                'recorded': set(), 'selected': str(expect), 'runs': []})
+            entry['recorded'].add(str(got))
+            entry['runs'].append(run.rel)
+    chk.detail['runs_compared_against_selection'] = compared
+
+    for (cell_key, name), entry in sorted(mismatched.items()):
+        culprits = sorted(
+            sid for sid, other in archived.items()
+            if sid != selection.selection_id and cell_key in other.cells
+            and str(other.config_for(cell_key).to_dict().get(name))
+            in entry['recorded'])
+        chk.add(ERROR, 'tuned_selection_mismatch',
+                f'{len(entry["runs"])} tuned run(s) in {cell_key} recorded '
+                f'{name}={sorted(entry["recorded"])} and selection '
+                f'{selection.short_id} selects {entry["selected"]} for that '
+                f'cell. A tuned arm is a function of the selection, so these '
+                f'runs were enumerated from a different one'
+                + (f'; they match the archived selection(s) '
+                   f'{[s[:12] for s in culprits]}, which the active pointer '
+                   f'has replaced. Every one of them is now claimed by no arm '
+                   f'while the arms the current selection declares are '
+                   f'reported missing.'
+                   if culprits else
+                   '. No archived selection matches them either, so the '
+                   'configuration was not produced by any selection this tree '
+                   'has stored.'),
+                runs=entry['runs'][:MAX_LISTED], cell=cell_key, field=name,
+                recorded=sorted(entry['recorded']),
+                selected=entry['selected'], n=len(entry['runs']),
+                matches_archived=[s[:12] for s in culprits])
+    if off_env:
+        chk.add(ERROR, 'tuned_run_off_selection_env',
+                f'{len(off_env)} tuned run(s) are on neither the environment '
+                f'the selection was made on ({selection.env}) nor the source '
+                f'environment ({registry.SOURCE_ENV}). Nothing in DESIGN.md '
+                f'3.3 says what a selection made on one task means for a run '
+                f'on a third, and `registry.tuned_experiment` refuses to build '
+                f'such an arm, so these runs were not produced by the '
+                f'catalogue.',
+                runs=off_env[:MAX_LISTED], n=len(off_env))
+    if unmarked:
+        chk.add(ERROR, 'tuned_arm_label_unmarked',
+                f'{len(unmarked)} run(s) recorded under {sorted(tuned_ids)} '
+                f'carry a label that contradicts what they are: a retuned '
+                f'target-task arm must carry the {prefix!r} prefix and an '
+                f'unretuned source arm must not. plots.py and the aggregated '
+                f'tables select rows by label, so a mislabelled run merges the '
+                f'two policies where they are genuinely different runs, which '
+                f'is the one thing the prefix exists to prevent.',
+                runs=unmarked[:MAX_LISTED], n=len(unmarked))
+    if stray:
+        chk.add(ERROR, 'tuned_label_outside_tuned_experiment',
+                f'{len(stray)} run(s) carry the {prefix!r} label prefix and '
+                f'record an experiment that is not one of {sorted(tuned_ids)}. '
+                f'The prefix is what separates the two policies of DESIGN.md '
+                f'3.3 in every table that groups by label, so a common-policy '
+                f'run wearing it is counted as the secondary policy having '
+                f'been run when it has not.',
+                runs=stray[:MAX_LISTED], n=len(stray))
+    if unknown_cell:
+        chk.add(ERROR, 'tuned_run_outside_selection_cells',
+                f'{len(unknown_cell)} tuned run(s) sit in a cell the selection '
+                f'does not cover, so no configuration was ever selected for '
+                f'what they ran',
+                runs=unknown_cell[:MAX_LISTED], n=len(unknown_cell))
+    if not marked:
+        chk.add(NOTE, 'no_tuned_runs_yet',
+                f'selection {selection.short_id} is stored and no run in this '
+                f'tree is recorded under {sorted(tuned_ids)}. The artifact was '
+                f'checked; the per-run comparison made 0 comparisons.')
+    return chk
+
+
 def check_reference_coverage(runs: list[Run]) -> Check:
     chk = Check(
         'REFERENCE COVERAGE',
@@ -3035,6 +3483,7 @@ def audit(out_root: str, experiments: Iterable[str] | None = None,
         check_transferred_fraction(membership, exps),
         check_plan_hash(scoped),
         check_provenance(scoped),
+        check_tuning_provenance(runs, out_root),
         check_reference_coverage(scoped),
         check_attribution(runs, membership, selected, orphans, everywhere,
                           declared, overrides),

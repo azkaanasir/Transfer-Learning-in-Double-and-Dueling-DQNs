@@ -162,6 +162,7 @@ for _p in (_ROOT, _HERE):
 
 import registry                                          # noqa: E402
 import statlib                                           # noqa: E402
+import tuning                                            # noqa: E402
 from src.dqn import provenance                           # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -599,6 +600,76 @@ def _key(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The tuned stage of DESIGN.md 3.3
+# ---------------------------------------------------------------------------
+def activate_tuned_stage(out_root: str) -> tuple[object, str]:
+    """Install E1t and E2t where the tree holds a selection. Never refuses.
+
+    Implicit, unlike `sweep.py`, and the asymmetry is deliberate. This module
+    reads a run tree and writes a table; it launches nothing, so activating the
+    stage on finding the artifact commits no compute. What it does do is decide
+    whether the tuned runs in the tree are *attributed*: without the tuned ids
+    in the catalogue, a run belonging only to `E1t` resolves to no experiment at
+    all and is exported as unattributed, and one shared with `E1` is exported as
+    E1 alone. Both are silent misattributions of runs that are on disk, and a
+    flag nobody passed is not a good reason to produce either.
+
+    The refusal lives in `main`, and only for an explicitly named tuned id: that
+    is the one case where continuing would answer a question nobody asked.
+    """
+    if not out_root:
+        return None, 'no --out-root, so there is no tree to read a selection from'
+    try:
+        registry.activate_tuned_arms(out_root=out_root)
+    except tuning.SelectionMissing as exc:
+        return None, str(exc)
+    except tuning.SelectionError as exc:
+        return None, (f'the selection stored at '
+                      f'{tuning.selection_path(out_root)} cannot be used: '
+                      f'{exc}')
+    except ValueError as exc:
+        return None, f'the tuned arms cannot be built from it: {exc}'
+    return registry.active_selection(), ''
+
+
+def tuning_selection_record(selection, out_root: str,
+                            unavailable: str) -> dict:
+    """The tuned stage as the provenance sees it, present or absent.
+
+    Written whether or not a selection was found. "This table was built with
+    the tuned arms out of the catalogue" is a fact a consumer needs, because
+    under `ANALYSIS_PLAN.md` 2.4 the arbitration verdict is `not-evaluable`
+    while the tuned leg is absent, and a key that appeared only when the stage
+    was available would make its absence unreadable from the artifact alone.
+    """
+    record = {
+        'available': selection is not None,
+        'active_in_catalogue': bool(registry.tuned_arms_active()),
+        'experiments': sorted(registry.TUNED_OF),
+        'policy': registry.TUNED_POLICY,
+        'path': tuning.selection_path(out_root).replace(os.sep, '/'),
+        'unavailable_because': (unavailable or None) if selection is None
+                               else None,
+        'selection_id': None, 'rule_id': None, 'rule_placeholder': None,
+        'shared_cells': None, 'cells': None, 'selection_plans': None,
+    }
+    if selection is not None:
+        record.update(
+            selection_id=selection.selection_id,
+            rule_id=selection.rule.get('id'),
+            rule_placeholder=bool(selection.is_placeholder),
+            seed_block=selection.seed_block,
+            seeds=list(selection.seeds),
+            env=selection.env,
+            source_experiment=selection.source_experiment,
+            shared_cells=list(selection.shared_cells),
+            cells={key: cell.config.to_dict()
+                   for key, cell in sorted(selection.cells.items())},
+            selection_plans=dict(selection.plans))
+    return record
+
+
+# ---------------------------------------------------------------------------
 # Experiment membership
 # ---------------------------------------------------------------------------
 class Membership:
@@ -650,7 +721,8 @@ class Membership:
     seed, so nothing target-side is declared there.
     """
 
-    def __init__(self, seeds: Sequence[int], out_root: str) -> None:
+    def __init__(self, seeds: Sequence[int], out_root: str,
+                 selection=None) -> None:
         self.by_digest: dict[str, set[str]] = {}
         self.by_label_seed: dict[tuple[str, int], set[str]] = {}
         self.errors: list[str] = []
@@ -658,13 +730,18 @@ class Membership:
                                             'unattributed': 0}
         present = {int(s) for s in seeds}
         reserve = set(registry.SEED_BLOCKS.get('RESERVE', ()))
+        # `EXPERIMENTS` holds the tuned arms of DESIGN.md 3.3 where `main` found
+        # a selection to build them from. A run shared between the two policies
+        # is ONE run belonging to both, and that is how it leaves here: one row
+        # whose `experiments` field names E1 and E1t together.
         for eid, exp in registry.EXPERIMENTS.items():
             declared = set(registry.SEED_BLOCKS.get(exp.seed_block, ()))
             wanted = sorted(present & (declared | reserve))
             if not wanted:
                 continue
             try:
-                jobs = registry.jobs(eid, seeds=wanted, out_root=out_root)
+                jobs = registry.jobs(eid, seeds=wanted, out_root=out_root,
+                                     selection=selection)
             except Exception as exc:                     # noqa: BLE001
                 # A broken catalogue entry must not take the aggregation down;
                 # it must be visible. `audit.py` is what refuses to report.
@@ -1668,9 +1745,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output = args.output or os.path.join(out_root, 'per_seed.csv')
     curves_path = args.curves or os.path.join(out_root, 'curves.csv')
 
+    # The tuned stage of DESIGN.md 3.3, resolved before the experiments are
+    # selected because activating it changes which ids exist.
+    tuning_selection, tuned_unavailable = activate_tuned_stage(out_root)
+    if tuning_selection is not None:
+        print(f'tuning selection {tuning_selection.short_id} '
+              f'(rule {tuning_selection.rule.get("id")}'
+              f'{", PLACEHOLDER" if tuning_selection.is_placeholder else ""}) '
+              f'read from {tuning.selection_path(out_root)}: '
+              f'{", ".join(sorted(registry.TUNED_OF))} of DESIGN.md 3.3 are in '
+              f'the catalogue for this tree, and cells '
+              f'{list(tuning_selection.shared_cells) or "[]"} share the common '
+              f'policy\'s runs.')
+
     if args.experiments:
         selected = [e.strip() for e in args.experiments.split(',') if e.strip()]
         unknown = [e for e in selected if e not in registry.EXPERIMENTS]
+        dormant = [e for e in unknown if e in registry.TUNED_OF]
+        if dormant:
+            print(f'{WARN} {dormant}: E1 and E2 under the secondary tuning '
+                  f'policy of DESIGN.md 3.3, which cannot be enumerated '
+                  f'because this tree holds no selection to build them from. '
+                  f'{tuned_unavailable}')
+            return 2
         if unknown:
             print(f'{WARN} unknown experiment ids: {unknown}. Known: '
                   f'{sorted(registry.EXPERIMENTS)}')
@@ -1702,7 +1799,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         base = os.path.basename(run_dir)
         if base.startswith('s') and base[1:].isdigit():
             seeds_seen.add(int(base[1:]))
-    membership = Membership(sorted(seeds_seen), out_root)
+    membership = Membership(sorted(seeds_seen), out_root,
+                            selection=tuning_selection)
     for err in membership.errors:
         print(f'{WARN} catalogue entry could not be resolved -- {err}')
 
@@ -2149,6 +2247,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         'membership_resolution': mode_counts,
         'membership_resolution_before_selection': modes_before_selection,
         'experiments_selected': selected if args.experiments else 'all',
+        'tuning_selection': tuning_selection_record(
+            tuning_selection, out_root, tuned_unavailable),
         'require_complete_requested': bool(args.require_complete),
         'require_complete_passed': (not (gaps or duplicates)
                                     if args.require_complete else None),

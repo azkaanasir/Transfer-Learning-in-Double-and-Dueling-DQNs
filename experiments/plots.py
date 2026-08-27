@@ -931,6 +931,281 @@ def resolve_selection(per_seed: pd.DataFrame
     return keep, collisions, duplicate_rows
 
 
+# ---------------------------------------------------------------------------
+# The DESIGN.md 3.3 arbitration, READ here and never re-derived.
+#
+# `stats.py` writes two keys onto every confirmatory member:
+# `arbitration_verdict`, the verdict of DESIGN.md 3.3's arbitration between the
+# common-configuration and the per-cell-tuned hyperparameter policies, and
+# `asserted`, the narrower flag saying whether a conclusion may be drawn.
+# `ANALYSIS_PLAN.md` 2.4 closes the loop on the consumer side: "A downstream
+# artifact may not present a confirmatory conclusion from the significance flag
+# alone ... `report.py`, `tables.py` and `plots.py` must read those rather than
+# re-deriving licence from the p-value. A guard the consumer ignores is not a
+# guard."
+#
+# All three modules ignored both keys and derived licence from
+# `significant_holm` alone. On today's data -- where every verdict is
+# `not-evaluable` because the tuned arms have not been run -- that published a
+# confirmatory conclusion for every member of the family, out of a bundle whose
+# own stats.json said that nothing in it was assertable.
+#
+# This block is duplicated verbatim in `report.py`, `tables.py` and `plots.py`,
+# because it is the gate each of them has to pass and none of the three is a
+# natural home for the other two. Each module's `--self-test` asserts the
+# vocabulary against `stats.py`, so a drift is a test failure rather than a
+# silent divergence.
+# ---------------------------------------------------------------------------
+#: The two keys, named once. A consumer that spelled either differently would
+#: read `None` and fail OPEN, so they are constants rather than literals.
+ARBITRATION_KEY = 'arbitration_verdict'
+ASSERTED_KEY = 'asserted'
+
+#: The three verdicts, taken FROM `stats.py` rather than re-listed, so the
+#: vocabulary cannot drift between the module that computes it and the three
+#: that consume it.
+ARBITRATION_VERDICTS: tuple[str, ...] = tuple(stats.ARBITRATION_VERDICTS)
+AGREES = stats.AGREES
+DISAGREES = stats.DISAGREES
+NOT_EVALUABLE = stats.NOT_EVALUABLE
+
+#: `ANALYSIS_PLAN.md` 2.4: "`not-evaluable` is the default, so an unrun tuned
+#: stage cannot silently license a conclusion." A missing key, an unreadable
+#: verdict, a missing flag, and a member contradicting its own arbitration
+#: table all land on this verdict, and every one of them blocks.
+ARBITRATION_DEFAULT = NOT_EVALUABLE
+
+#: What each fail-closed defect means, in the words the artifacts print. They
+#: are named apart because "the tuned leg has not been run" and "the key is
+#: missing from stats.json" are different repairs, and a reader told only that
+#: something is not evaluable cannot tell which one is owed.
+ARBITRATION_MISSING: dict[str, str] = {
+    '': 'the tuned leg has not been run',
+    'key-absent': 'stats.json carries no ' + repr(ARBITRATION_KEY)
+                  + ' on this member',
+    'unparseable': 'the arbitration recorded in stats.json is unreadable',
+    'flag-absent': 'stats.json carries no ' + repr(ASSERTED_KEY)
+                   + ' flag on this member',
+    'flag-contradicts-verdict':
+        'stats.json sets ' + repr(ASSERTED_KEY) + ' on a member whose verdict '
+        'is not ' + repr(AGREES),
+    'inconsistent': 'the member and the arbitration table in stats.json give '
+                    'different verdicts for the same member',
+    'withheld': 'stats.py withheld the assertion although the two policies '
+                'agree',
+}
+
+#: Sentinel for "the key is not in the dict at all", which is a different state
+#: from "the key is present and null". `dict.get` cannot tell them apart, and
+#: the difference is the whole of the deleted-key test.
+_ARB_ABSENT = object()
+
+
+def _arbitration_flag(value: Any) -> Optional[bool]:
+    """A JSON boolean, or None when the value is not a boolean at all.
+
+    `stats.py` round-trips Python bools through `int` on the way into JSON, so
+    `asserted` arrives as 0 or 1 rather than false or true, and both are read.
+    Everything else is refused rather than coerced, because `bool('false')` is
+    True and that coercion is exactly how a hand-edited stats.json would turn
+    into a licence.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, float) and value in (0.0, 1.0):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('true', '1', 'yes'):
+            return True
+        if text in ('false', '0', 'no'):
+            return False
+    return None
+
+
+def read_arbitration(member: Any, row: Any = None) -> dict:
+    """The arbitration state of one confirmatory member. FAILS CLOSED.
+
+    `member` is one element of `s5_confirmatory.members`. `row` is the matching
+    element of `s5_confirmatory.arbitration.rows`, which carries the prose
+    reason; the row is used for that reason and for a consistency check, never
+    as a substitute for the member's own two keys, because the member is what
+    every consumer reads.
+
+    The returned `blocks` is the only thing a caller needs in order to decide
+    whether a conclusion may be presented. Nothing here computes a verdict:
+    `ANALYSIS_PLAN.md` 2.4 requires the consumer to READ the verdict, and a
+    consumer that re-derived one would be a second implementation of the
+    arbitration, free to disagree with the first.
+    """
+    member = member if isinstance(member, dict) else {}
+    row = row if isinstance(row, dict) else {}
+    verdict = ARBITRATION_DEFAULT
+    defect = ''
+    raw = member.get(ARBITRATION_KEY, _ARB_ABSENT)
+    if raw is _ARB_ABSENT:
+        defect = 'key-absent'
+    elif isinstance(raw, str) and raw.strip().lower() in ARBITRATION_VERDICTS:
+        verdict = raw.strip().lower()
+    else:
+        defect = 'unparseable'
+
+    flag_raw = member.get(ASSERTED_KEY, _ARB_ABSENT)
+    parsed = None if flag_raw is _ARB_ABSENT else _arbitration_flag(flag_raw)
+    asserted = bool(parsed)
+    if flag_raw is _ARB_ABSENT:
+        defect = defect or 'flag-absent'
+    elif parsed is None:
+        defect = defect or 'unparseable'
+
+    # The member and the arbitration table have to say the same thing: they are
+    # written by one function in one pass, so a disagreement means the file was
+    # edited or truncated and neither half of it can then be trusted.
+    row_raw = row.get('verdict')
+    if (not defect and isinstance(row_raw, str)
+            and row_raw.strip().lower() in ARBITRATION_VERDICTS
+            and row_raw.strip().lower() != verdict):
+        defect = 'inconsistent'
+    if not defect and asserted and verdict != AGREES:
+        defect = 'flag-contradicts-verdict'
+    if not defect and verdict == AGREES and not asserted:
+        defect = 'withheld'
+
+    blocks = bool(defect) or verdict != AGREES or not asserted
+    why = str(row.get('why') or '').strip()
+    missing = ARBITRATION_MISSING.get(defect, ARBITRATION_MISSING[''])
+
+    if not blocks:
+        label = 'ASSERTED: both policies agree (DESIGN.md 3.3)'
+        blocked_because = ''
+        sentence = ('DESIGN.md 3.3 arbitration: AGREES, and stats.py set '
+                    + ASSERTED_KEY + ', so ANALYSIS_PLAN.md 2.4 licenses a '
+                    'conclusion from this member. The verdict is read from '
+                    'stats.json, not re-derived from the p-value.')
+    elif verdict == DISAGREES and defect in ('', 'flag-contradicts-verdict'):
+        label = ('DISAGREEMENT between the two hyperparameter policies: THIS '
+                 'IS THE FINDING')
+        blocked_because = (
+            'the common-configuration and per-cell-tuned policies of '
+            'DESIGN.md 3.3 reach different conclusions about this member'
+            + (': ' + why if why else ''))
+        sentence = ('DESIGN.md 3.3 arbitration: DISAGREES. '
+                    + blocked_because[0].upper() + blocked_because[1:]
+                    + '. ANALYSIS_PLAN.md 2.4 makes that disagreement the '
+                    'REPORTED FINDING: it may not be suppressed, averaged '
+                    'away, or resolved by preferring one policy, and NO '
+                    'conclusion is asserted from either leg.')
+    else:
+        label = 'not evaluable: ' + missing
+        blocked_because = 'not evaluable: ' + missing + (
+            ' (' + why + ')' if why else '')
+        sentence = ('DESIGN.md 3.3 arbitration: NOT EVALUABLE, because '
+                    + missing + (' (' + why + ')' if why else '')
+                    + '. ANALYSIS_PLAN.md 2.4 makes not-evaluable the default '
+                    'and permits a conclusion only under agrees, so nothing is '
+                    'asserted from this member however small its Holm-adjusted '
+                    'p.')
+    return {
+        'verdict': verdict,
+        'asserted': bool(asserted and not blocks),
+        'verdict_in_json': None if raw is _ARB_ABSENT else raw,
+        'asserted_in_json': None if flag_raw is _ARB_ABSENT else flag_raw,
+        'blocks': bool(blocks),
+        'defect': defect,
+        'missing': missing,
+        'why': why,
+        'label': label,
+        'blocked_because': blocked_because,
+        'sentence': sentence,
+    }
+
+
+def arbitration_index(sj: Any) -> dict:
+    """(metric, cell) -> the arbitration row `stats.py` wrote for that member."""
+    conf = (sj or {}).get('s5_confirmatory') if isinstance(sj, dict) else None
+    rows = ((conf or {}).get('arbitration') or {}).get('rows') or []
+    out: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        if isinstance(row, dict):
+            out[(str(row.get('metric')), str(row.get('cell')))] = row
+    return out
+
+
+def arbitration_summary(sj: Any) -> dict:
+    """The arbitration over the whole confirmatory family, in one block.
+
+    Printed in captions and written into provenance records, so that a table or
+    a figure separated from its bundle still says whether anything in it was
+    assertable. An input carrying no confirmatory family reports that as an
+    absence rather than as nothing to declare, because an empty family is
+    exactly the shape a suppressed one has.
+    """
+    conf = (sj or {}).get('s5_confirmatory') if isinstance(sj, dict) else None
+    members = ((conf or {}).get('members') or []) if isinstance(conf, dict) \
+        else []
+    index = arbitration_index(sj)
+    counts = {v: 0 for v in ARBITRATION_VERDICTS}
+    defects: dict[str, int] = {}
+    asserted = 0
+    disagreements: list[str] = []
+    blocked: list[str] = []
+    for member in members:
+        member = member if isinstance(member, dict) else {}
+        key = (str(member.get('metric')), str(member.get('cell')))
+        arb = read_arbitration(member, index.get(key))
+        counts[arb['verdict']] = counts.get(arb['verdict'], 0) + 1
+        if arb['defect']:
+            defects[arb['defect']] = defects.get(arb['defect'], 0) + 1
+        tag = key[0] + '/' + key[1]
+        if arb['blocks']:
+            blocked.append(tag + ': ' + arb['label'])
+        else:
+            asserted += 1
+        if arb['verdict'] == DISAGREES:
+            disagreements.append(tag + ': ' + (arb['why'] or arb['label']))
+    total = len(members)
+    if not total:
+        sentence = ('DESIGN.md 3.3 arbitration: this input carries no '
+                    'confirmatory family, so there is no verdict to read and '
+                    'nothing here may be presented as a confirmatory '
+                    'conclusion (ANALYSIS_PLAN.md 2.4).')
+    else:
+        sentence = ('DESIGN.md 3.3 arbitration: ' + str(asserted) + ' of '
+                    + str(total) + ' confirmatory member(s) may be asserted ('
+                    + str(counts.get(NOT_EVALUABLE, 0)) + ' not evaluable, '
+                    + str(counts.get(DISAGREES, 0)) + ' disagreeing, '
+                    + str(counts.get(AGREES, 0)) + ' agreeing). '
+                    'ANALYSIS_PLAN.md 2.4 permits a conclusion only where both '
+                    'hyperparameter policies agree, so the other '
+                    + str(total - asserted) + ' carry their statistic and '
+                    'their Holm-adjusted p but NO conclusion.')
+        if disagreements:
+            sentence += (' The ' + str(len(disagreements))
+                         + ' DISAGREEMENT(S) are themselves the reported '
+                         'finding and may not be resolved by preferring one '
+                         'policy: ' + '; '.join(disagreements) + '.')
+        if defects:
+            sentence += (' Fail-closed defects in stats.json: '
+                         + ', '.join(k + ' x' + str(v)
+                                     for k, v in sorted(defects.items()))
+                         + '.')
+    return {
+        'rule': 'DESIGN.md 3.3, ANALYSIS_PLAN.md 2.4: a conclusion is asserted '
+                'only where the common-configuration and per-cell-tuned '
+                'policies agree; not-evaluable is the default and blocks',
+        'members': total,
+        'asserted': asserted,
+        'blocked': total - asserted,
+        'by_verdict': counts,
+        'defects': defects,
+        'disagreements': disagreements,
+        'blocked_members': blocked,
+        'sentence': sentence,
+    }
+
+
 @dataclass
 class Context:
     """Everything a figure function needs, resolved once."""
@@ -960,6 +1235,15 @@ class Context:
     hashes: dict = field(default_factory=dict)
     written: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: The stats.py JSON report, when one was supplied with --stats, and the
+    #: DESIGN.md 3.3 arbitration read out of it. A figure whose caption is
+    #: silent about the arbitration can be read as licensing exactly what the
+    #: table beside it refuses, which is why ANALYSIS_PLAN.md 2.4 binds this
+    #: module too. None means no stats.json was supplied, and that is reported
+    #: as an unread arbitration rather than omitted.
+    stats_path: Optional[str] = None
+    stats_sha: Optional[str] = None
+    arbitration: Optional[dict] = None
     #: One run directory per (label, seed). See `resolve_selection`.
     selected: set[str] = field(default_factory=set)
     #: (label, seed) pairs that resolved to more than one run directory.
@@ -970,6 +1254,47 @@ class Context:
     #: nine-conditions-one-directory defect when a row had merely been repeated.
     duplicate_rows: list[dict] = field(default_factory=list)
     _manifests: dict[str, dict] = field(default_factory=dict)
+    #: The parsed stats.py report, kept beside the summary so a per-cell
+    #: verdict can be looked up without re-reading the file.
+    _stats_report: Optional[dict] = None
+
+    def arbitration_sentence(self) -> str:
+        """The one caption sentence, whatever state the input is in.
+
+        A missing stats.json is not silence: `ANALYSIS_PLAN.md` 2.4 makes
+        not-evaluable the default, so a figure drawn without one says that
+        nothing in it may be read as a confirmatory conclusion rather than
+        leaving the subject out.
+        """
+        if isinstance(self.arbitration, dict) and self.arbitration.get(
+                'sentence'):
+            return str(self.arbitration['sentence'])
+        return ('DESIGN.md 3.3 arbitration: NOT READ, because no stats.json '
+                'was supplied to this invocation (--stats). '
+                'ANALYSIS_PLAN.md 2.4 makes not-evaluable the default, so '
+                'nothing in this figure may be read as a confirmatory '
+                'conclusion.')
+
+    def arbitration_for(self, metric: str, cell: str) -> dict:
+        """One member's arbitration state, or the blocking default.
+
+        The default is what a figure gets when no stats.json was supplied, and
+        it blocks: a per-cell annotation that fell silent where the verdict
+        could not be read would be the figure licensing what the table refuses.
+        """
+        conf = (self.arbitration_source() or {}).get('s5_confirmatory') or {}
+        index = arbitration_index(self.arbitration_source())
+        for member in conf.get('members') or []:
+            if not isinstance(member, dict):
+                continue
+            if (str(member.get('metric')) == str(metric)
+                    and str(member.get('cell')) == str(cell)):
+                return read_arbitration(member, index.get((str(metric),
+                                                           str(cell))))
+        return read_arbitration({}, None)
+
+    def arbitration_source(self) -> Optional[dict]:
+        return self._stats_report
 
     # -- label -> runs ----------------------------------------------------
     def rows_for_labels(self, labels: Iterable[str]) -> pd.DataFrame:
@@ -2021,6 +2346,20 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
         'the 8 tests of ANALYSIS_PLAN.md 2 (4 within-cell deltas x 2 co-primary '
         'endpoints) under Holm-Bonferroni, reported by stats.py; every quantity '
         'drawn here is estimation-only.', 92))
+    # In EVERY caption, not only the forest's. ANALYSIS_PLAN.md 2.4 binds this
+    # module as well, and a figure separated from its bundle carries only its
+    # caption: an interval drawn beside a cell whose arbitration blocks must
+    # not be readable as the conclusion the table refuses.
+    lines.append(textwrap.fill(
+        'Assertion: ' + ctx.arbitration_sentence()
+        + ' Nothing in this figure is a confirmatory conclusion, and an '
+          'interval drawn here licenses one only where that verdict says it '
+          'does.', 92))
+    for item in (ctx.arbitration or {}).get('disagreements') or []:
+        lines.append(textwrap.fill(
+            'POLICY DISAGREEMENT, and under ANALYSIS_PLAN.md 2.4 the '
+            'disagreement is itself the reported finding rather than a caveat '
+            'on one: ' + str(item), 92))
     git = (ctx.prov.get('git') or {})
     lines.append(textwrap.fill(
         f"Source: {os.path.basename(ctx.per_seed_path)} "
@@ -2085,6 +2424,15 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
                                      'SOURCE COMPETENCE (DESIGN.md 4.3), NOT '
                                      'THE PRIMARY ESTIMAND'),
         'analysis_set': ctx.analysis,
+        # DESIGN.md 8.3: the sidecar is how a rendered artifact is checked
+        # against what produced it. Without this a reader holding the PDF could
+        # check the seed count and the plan hash but not whether the study had
+        # licensed a single conclusion behind it.
+        'arbitration': (ctx.arbitration if ctx.arbitration is not None else
+                        {'read': False,
+                         'sentence': ctx.arbitration_sentence()}),
+        'stats_json': ctx.stats_path,
+        'stats_sha': ctx.stats_sha,
         'source_policy': ctx.source_policy,
         'interval_methods': (methods.record() if methods is not None else None),
         'runs_not_used_by_this_figure': dropped or {},
@@ -2348,8 +2696,18 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
             ax.plot([est['estimate']], [y], marker='o', color=_BLUE,
                     markersize=4.2, zorder=4)
             n_by_cell.setdefault(cell, set()).add(p.n)
+            arb = ctx.arbitration_for(endpoint, cell)
+            # On the panel, not only in the record: a row whose interval sits
+            # clear of zero reads as a result, and the reason it is not one has
+            # to be visible on the canvas that gets pasted into a slide.
+            ax.annotate(textwrap.shorten(arb['label'], 58),
+                        xy=(0.02, y - 0.26), xycoords=('axes fraction', 'data'),
+                        fontsize=5.2,
+                        color=('#8A6D3B' if arb['blocks'] else '#3C763D'),
+                        va='center', ha='left', style='italic')
             meta['cells'].setdefault(cell, {})[endpoint] = {
                 'n': p.n, 'seeds': p.seeds,
+                'arbitration': arb,
                 'hodges_lehmann': est['estimate'], 'ci_lo': est['lo'],
                 'ci_hi': est['hi'], 'ci_method': est['method'],
                 'ci_note': est.get('note', ''),
@@ -2384,10 +2742,16 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
     _legend(fig, handles, ncol=3)
 
     verdicts = []
+    arb_lines = []
     for cell in cells:
         rec = (meta['cells'].get(cell) or {}).get('final_score')
         if rec:
             verdicts.append(f"{cell}: {rec['exclusion']}; {rec['equivalence']}")
+        for endpoint in endpoints:
+            row = (meta['cells'].get(cell) or {}).get(endpoint) or {}
+            arb = row.get('arbitration')
+            if arb:
+                arb_lines.append(f"{endpoint}/{cell}: {arb['label']}")
 
     emit(ctx, 'transfer_effect_forest', fig,
          body=('The within-cell transfer effect on each co-primary endpoint: '
@@ -2426,7 +2790,12 @@ def fig_transfer_effect_forest(ctx: Context) -> None:
              'the whole confirmatory family, and their Holm-adjusted p-values '
              'belong in the results table: a forest of significance verdicts '
              'invites the "A avoids negative transfer while B does not" '
-             'comparison that DESIGN.md 9 and ANALYSIS_PLAN.md 8 forbid.'],
+             'comparison that DESIGN.md 9 and ANALYSIS_PLAN.md 8 forbid.',
+             ('DESIGN.md 3.3 arbitration, per row, printed on the panel as '
+              'well as here so that a row lifted into a slide carries it: '
+              + ' | '.join(arb_lines)) if arb_lines else
+             'DESIGN.md 3.3 arbitration: no row of this forest carries an '
+             'estimate, so there is no member to read a verdict for.'],
          meta=meta)
 
 
@@ -4187,6 +4556,86 @@ def self_test(verbose: bool = True) -> int:
           texts and len(texts[0].split(chr(10))) <= ABSENT_NOTE_LINES
           and 'caption' in texts[0], str(len(texts[0].split(chr(10)))))
 
+    # --- the DESIGN.md 3.3 arbitration reaches the captions ---------------
+    # ANALYSIS_PLAN.md 2.4 binds this module too. A figure whose caption says
+    # nothing about the arbitration can be read as licensing exactly what the
+    # results table refuses, and this module drew the whole confirmatory family
+    # as a forest with no verdict anywhere in its caption or its sidecar.
+    check('the verdict vocabulary is stats.py own, not a second copy',
+          ARBITRATION_VERDICTS == tuple(stats.ARBITRATION_VERDICTS)
+          and (AGREES, DISAGREES, NOT_EVALUABLE)
+          == (stats.AGREES, stats.DISAGREES, stats.NOT_EVALUABLE),
+          str(ARBITRATION_VERDICTS))
+    check('not-evaluable is the default', ARBITRATION_DEFAULT == NOT_EVALUABLE)
+
+    def _arb_member(verdict=AGREES, asserted=1, cell='mlp-double',
+                    metric='final_score', **extra):
+        member = {'metric': metric, 'cell': cell,
+                  ARBITRATION_KEY: verdict, ASSERTED_KEY: asserted}
+        member.update(extra)
+        return member
+
+    def _arb_stats(*members, rows=()):
+        return {'s5_confirmatory': {'members': list(members),
+                                    'arbitration': {'rows': list(rows)}}}
+
+    a = read_arbitration(_arb_member())
+    check('agrees plus the asserted flag does not block', not a['blocks'])
+    a = read_arbitration(_arb_member(verdict=NOT_EVALUABLE, asserted=0))
+    check('not-evaluable blocks and names the tuned leg',
+          a['blocks']
+          and a['label'] == 'not evaluable: the tuned leg has not been run',
+          a['label'])
+    a = read_arbitration(_arb_member(verdict=DISAGREES, asserted=0))
+    check('disagrees blocks and renders as the finding',
+          a['blocks'] and 'THIS IS THE FINDING' in a['label'], a['label'])
+    stripped = _arb_member()
+    stripped.pop(ARBITRATION_KEY)
+    a = read_arbitration(stripped)
+    check('a DELETED verdict key blocks and is named',
+          a['blocks'] and a['defect'] == 'key-absent'
+          and ARBITRATION_KEY in a['label'], str(a))
+    a = read_arbitration({})
+    check('a member with neither key blocks', read_arbitration({})['blocks'])
+
+    arb_ctx = Context(
+        per_seed=_probe_frame(), curves=pd.DataFrame(), per_seed_path='x',
+        curves_path=None, outdir='x', formats=('png',), n_boot=10,
+        boot_seed=1, smooth=0, grid_points=8, argv=[])
+    check('a context with NO stats.json says the arbitration was NOT READ',
+          'NOT READ' in arb_ctx.arbitration_sentence()
+          and 'not-evaluable the default' in arb_ctx.arbitration_sentence(),
+          arb_ctx.arbitration_sentence())
+    check('a per-cell lookup with no stats.json still BLOCKS',
+          arb_ctx.arbitration_for('final_score', 'mlp-double')['blocks'])
+
+    report = _arb_stats(
+        _arb_member(cell='mlp-vanilla'),
+        _arb_member(cell='mlp-double', verdict=DISAGREES, asserted=0),
+        _arb_member(cell='dueling-vanilla', verdict=NOT_EVALUABLE, asserted=0),
+        rows=[{'metric': 'final_score', 'cell': 'mlp-double',
+               'verdict': DISAGREES,
+               'why': 'the common configuration concludes transfer ABOVE '
+                      'scratch; the per-cell tuned configuration concludes '
+                      'transfer BELOW scratch'}])
+    arb_ctx = Context(
+        per_seed=_probe_frame(), curves=pd.DataFrame(), per_seed_path='x',
+        curves_path=None, outdir='x', formats=('png',), n_boot=10,
+        boot_seed=1, smooth=0, grid_points=8, argv=[],
+        arbitration=arbitration_summary(report), _stats_report=report)
+    sentence = arb_ctx.arbitration_sentence()
+    check('the caption sentence counts what may be asserted',
+          '1 of 3 confirmatory member(s) may be asserted' in sentence,
+          sentence)
+    check('the caption sentence names the disagreement as the finding',
+          'DISAGREEMENT' in sentence and 'ABOVE' in sentence, sentence)
+    check('a per-cell lookup finds the agreeing member',
+          not arb_ctx.arbitration_for('final_score', 'mlp-vanilla')['blocks'])
+    check('a per-cell lookup finds the disagreeing member',
+          arb_ctx.arbitration_for('final_score', 'mlp-double')['blocks'])
+    check('a cell absent from the family blocks rather than passing',
+          arb_ctx.arbitration_for('final_score', 'dueling-double')['blocks'])
+
     ok = all(c[1] for c in checks)
     if verbose:
         for name, passed, detail in checks:
@@ -4239,6 +4688,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              'same meanings as stats.py, so a figure and the '
                              'table beside it cannot disagree about which runs '
                              'exist')
+    parser.add_argument('--stats', default=None,
+                        help='the stats.py --json report. Read for the '
+                             'DESIGN.md 3.3 arbitration ONLY, which every '
+                             'caption and every provenance sidecar then '
+                             'carries: ANALYSIS_PLAN.md 2.4 binds this module '
+                             'as well as report.py and tables.py, and a '
+                             'caption silent about the verdict can be read as '
+                             'licensing what the results table refuses. No '
+                             'number plotted here comes from it. Without the '
+                             'flag every caption says the arbitration was not '
+                             'read, which blocks rather than omits')
     parser.add_argument('--shift-metrics', default=None,
                         help='JSON mapping environment id -> measured '
                              'divergence, used as the x-axis of '
@@ -4311,6 +4771,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     raw_per_seed, curves = load(args.per_seed, args.curves)
     per_seed, analysis = analysis_set(raw_per_seed, args.source_policy)
 
+    # The arbitration, read once. An unreadable or wrong-shaped file is NOT
+    # treated as an absent one silently: the reason is printed and the captions
+    # then say the arbitration was not read, which blocks. Failing open here
+    # would put an unqualified interval in front of a reader on the strength of
+    # a corrupt JSON file.
+    stats_report: Optional[dict] = None
+    stats_note = ''
+    if args.stats:
+        try:
+            with open(args.stats, 'r', encoding='utf-8') as fh:
+                loaded = json.load(fh)
+            if not isinstance(loaded, dict):
+                stats_note = (f'--stats {args.stats} does not hold a JSON '
+                              f'object')
+            elif 's5_confirmatory' not in loaded:
+                stats_note = (f'--stats {args.stats} has no "s5_confirmatory" '
+                              f'block, so it is not a stats.py report')
+            else:
+                stats_report = loaded
+        except (OSError, ValueError) as exc:
+            stats_note = f'--stats {args.stats}: {type(exc).__name__}: {exc}'
+        if stats_note:
+            print(f'{WARN} {stats_note}. Every caption below will record that '
+                  f'the DESIGN.md 3.3 arbitration could NOT be read, which '
+                  f'blocks a confirmatory reading rather than omitting the '
+                  f'subject (ANALYSIS_PLAN.md 2.4).')
+
     with plt.rc_context(RC):
         ctx = Context(
             per_seed=per_seed, curves=curves,
@@ -4325,6 +4812,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             curve_integrity=curve_integrity(curves),
             arms=resolve_arm_labels(), iface=interface_labels(),
             shifts=shift_labels(),
+            stats_path=args.stats,
+            stats_sha=(provenance.file_hash(args.stats)
+                       if args.stats and os.path.isfile(args.stats) else None),
+            arbitration=(arbitration_summary(stats_report)
+                         if stats_report is not None else None),
+            _stats_report=stats_report,
             prov=provenance.snapshot(['experiments/plots.py'] + argv_list),
             hashes={'per_seed': provenance.file_hash(args.per_seed),
                     'curves': (provenance.file_hash(args.curves)
@@ -4348,6 +4841,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               f'{len(per_seed)} in the analysis set, '
               f'{len(curves)} curve rows, out -> {args.outdir}/')
         print(f'  ANALYSIS_PLAN.md hash now: {plans.get("ANALYSIS_PLAN.md")}')
+        print(f'  {ctx.arbitration_sentence()}')
+        for item in (ctx.arbitration or {}).get('disagreements') or []:
+            print(f'  POLICY DISAGREEMENT, and that is the finding: {item}')
         print_analysis_set(analysis)
         if not len(per_seed):
             print(f'{WARN} the analysis set is EMPTY. Every figure below is '

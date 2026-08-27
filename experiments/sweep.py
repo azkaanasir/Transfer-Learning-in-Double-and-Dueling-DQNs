@@ -200,6 +200,7 @@ for _path in (_ROOT, _HERE):
         sys.path.insert(0, _path)
 
 import registry                                             # noqa: E402
+import tuning                                               # noqa: E402
 from src.dqn.config import (BOOKKEEPING_FIELDS,             # noqa: E402
                             TRANSFER_ONLY_FIELDS, Config)
 
@@ -3031,6 +3032,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="experiment ids from the registry, or 'all'")
     p.add_argument('--tier', type=int, default=None, choices=(1, 2, 3),
                    help='every experiment at this tier (DESIGN.md §7)')
+    p.add_argument('--tuned', action='store_true',
+                   help='make E1t and E2t selectable: E1 and E2 replicated '
+                        'under the secondary per-cell-tuned policy of '
+                        'DESIGN.md 3.3, built from the selection stored at '
+                        '<out-root>/_jobs/tuning_selection.json. Explicit here '
+                        'and implicit in plan.py and aggregate.py, and the '
+                        'asymmetry is deliberate: costing a stage and '
+                        'attributing runs that already exist are free and '
+                        'reversible, whereas activating it in this tool '
+                        'commits about 280 runs and 31 hours. A catalogue that '
+                        'grew two confirmatory experiments because a file had '
+                        'appeared under the run tree would change what this '
+                        'command launches with nothing on the command line '
+                        'saying so')
     p.add_argument('--seeds', nargs='+', default=None,
                    help="block names and/or seeds: 'CONFIRM', '0-9', "
                         "'0-4 10-19'. Default: each experiment's declared block")
@@ -3157,11 +3172,213 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def stored_selection(out_root: str) -> tuple[object, Optional[str]]:
+    """The selection this tree holds, or (None, why it cannot be read).
+
+    Read for the note in `main` and for nothing else: this activates nothing. A
+    selection that cannot be read is reported rather than raised, because the
+    common-policy campaign that is almost always what this command launches does
+    not read it, and killing that launch over an artifact it never touches would
+    be the wrong failure.
+    """
+    try:
+        return tuning.read_selection(out_root, required=False,
+                                     warn_placeholder=False), None
+    except tuning.SelectionError as exc:
+        return None, str(exc)
+
+
+def activate_tuned_stage(out_root: str) -> tuple[object, Optional[str]]:
+    """Install E1t and E2t into the catalogue. Returns (selection, refusal).
+
+    `registry.activate_tuned_arms` mutates `registry.EXPERIMENTS` in place,
+    which is what makes the tuned ids visible to `_select_experiments`,
+    `check_seed_blocks`, `print_plan` and `registry.all_jobs` at once instead of
+    teaching each of them about selections separately.
+
+    Every refusal comes back as text rather than as an exception, because the
+    caller has to print it and exit non-zero: a traceback out of a launcher
+    reads as a broken tool, and what is actually wrong here is the order the
+    campaign is being run in. `DESIGN.md` 3.3 makes the tuned stage sequentially
+    dependent on `E3`, so "there is no selection" is a statement about the
+    campaign and not about the catalogue.
+    """
+    try:
+        registry.activate_tuned_arms(out_root=out_root)
+    except tuning.SelectionMissing as exc:
+        return None, str(exc)
+    except tuning.SelectionError as exc:
+        return None, (f'the selection stored at '
+                      f'{tuning.selection_path(out_root)} cannot be used: '
+                      f'{exc}')
+    except ValueError as exc:
+        return None, f'the tuned arms cannot be built from it: {exc}'
+    return registry.active_selection(), None
+
+
+def _tuned_stage_record(requested: bool, tuned_ids: Sequence[str],
+                        selection, out_root: str) -> dict:
+    """The tuned stage as the invocation record sees it.
+
+    Recorded whether or not the stage was activated. "This launch did not run
+    the secondary policy" is a fact about the campaign that `DESIGN.md` 3.3's
+    arbitration needs, and a key that appeared only when the stage was on would
+    make its absence unreadable from the record alone.
+    """
+    record = {
+        'requested': bool(requested),
+        'active': bool(registry.tuned_arms_active()),
+        'experiments': list(tuned_ids),
+        'policy': registry.TUNED_POLICY,
+        'selection_path': tuning.selection_path(out_root).replace(os.sep, '/'),
+        'selection_id': None, 'rule_id': None, 'rule_placeholder': None,
+        'shared_cells': None, 'cells': None, 'selection_plans': None,
+    }
+    if selection is not None:
+        record.update(
+            selection_id=selection.selection_id,
+            rule_id=selection.rule.get('id'),
+            rule_placeholder=bool(selection.is_placeholder),
+            seed_block=selection.seed_block,
+            seeds=list(selection.seeds),
+            env=selection.env,
+            source_experiment=selection.source_experiment,
+            shared_cells=list(selection.shared_cells),
+            cells={key: cell.config.to_dict()
+                   for key, cell in sorted(selection.cells.items())},
+            selection_plans=dict(selection.plans))
+    return record
+
+
+def print_tuned_stage(selection, tuned_ids: Sequence[str],
+                      out_root: str) -> None:
+    """What the secondary policy is about to run, before it runs it."""
+    print('\n' + '=' * 72)
+    print('[tuned stage] DESIGN.md 3.3 secondary policy: per-cell tuned')
+    print('=' * 72)
+    print('  arms:      '
+          + ', '.join(f'{eid} (= {registry.TUNED_OF[eid]} retuned)'
+                      for eid in tuned_ids))
+    print(f'  selection: {selection.short_id}  '
+          f'rule={selection.rule.get("id")}'
+          f'{"  PLACEHOLDER" if selection.is_placeholder else ""}')
+    print(f'  stored at: {tuning.selection_path(out_root)}')
+    print(f'  computed:  from {selection.source_experiment} on '
+          f'{selection.seed_block} {list(selection.seeds)}, env '
+          f'{selection.env}')
+    for key in sorted(selection.cells):
+        cell = selection.cells[key]
+        mark = ("shares the common policy's run directories"
+                if cell.equals_a_priori else 'own run directories')
+        print(f'    {key:<16} lr={cell.config.lr:g} '
+              f'{cell.config.target_update}/{cell.config.target_update_freq}'
+              f'  ({mark})')
+    shared = ', '.join(selection.shared_cells) or 'none'
+    print(f'  sharing:   {shared}. A cell selecting the a priori configuration '
+          f'produces the')
+    print('             same run digests as its common-policy arms, so it adds '
+          'no runs.')
+    print('  sources:   NOT retuned (DESIGN.md 3.3, ANALYSIS_PLAN.md 2.3). '
+          'They keep their')
+    print('             base labels and their configuration, so the DESIGN.md '
+          '4.3 source-')
+    print('             replacement ledger keys still resolve and the source '
+          'phase below is')
+    print('             the one the common policy runs.')
+    current = _plan_hashes()
+    drift = sorted(name for name, digest in (selection.plans or {}).items()
+                   if current.get(name) not in (None, digest))
+    if drift:
+        print(f'  [warning] the selection was computed under a different '
+              f'{", ".join(drift)} than the')
+        print('            copy on disk now. audit.py is what refuses a result '
+              'under a changed')
+        print('            plan; this line is so the drift is visible before '
+              'the runs exist.')
+
+
+def refuse_placeholder_selection(selection, tuned_ids: Sequence[str],
+                                 out_root: str) -> None:
+    """Print why a placeholder selection may not launch a campaign.
+
+    `tuning.py`'s module docstring states this as a requirement of the runner,
+    and it is a refusal rather than a warning for one reason: under
+    `ANALYSIS_PLAN.md` 2.4 a confirmatory member drawn from a selection computed
+    under a placeholder rule is `not-evaluable`, and nothing is asserted under
+    `not-evaluable`. So every run this would train is a run that cannot enter a
+    conclusion whatever it shows. That is about 280 runs and 31 hours
+    (`ANALYSIS_PLAN.md` 6.6) spent on a number the plan already refuses to read.
+
+    No override flag, and that is the one place this file departs from its own
+    convention that every refusal has one. The other overrides buy something a
+    reader can weigh: a smoke run, a deliberately loosened gate, a seed-block
+    departure whose estimates `audit.py` will then refuse. This one would buy
+    compute that is unassertable by construction, so there is nothing to weigh.
+    What a reader wants at that point is the cost, and `plan.py` prints it
+    without launching anything.
+    """
+    print('\n' + '=' * 72)
+    print('[REFUSED] the tuned stage cannot be launched from a PLACEHOLDER '
+          'selection')
+    print('=' * 72)
+    print(f'  selected:  {", ".join(tuned_ids)}')
+    print(f'  selection: {selection.short_id}, computed under rule '
+          f'{selection.rule.get("id")}')
+    print(f'  stored at: {tuning.selection_path(out_root)}')
+    print('  ANALYSIS_PLAN.md 2.4 makes a confirmatory member drawn from a '
+          'selection computed')
+    print('  under a placeholder rule not-evaluable, and nothing is asserted '
+          'under')
+    print('  not-evaluable. Every run this command would train is therefore a '
+          'run no RQ2 or')
+    print('  RQ3 conclusion may be read from, whatever it shows: about 280 '
+          'runs and 31 hours')
+    print('  (ANALYSIS_PLAN.md 6.6) for a number the plan refuses to read.')
+    print('  ANALYSIS_PLAN.md 2.3 rejects the installed rule by name: a plain '
+          'argmax at n=5')
+    print('  chases noise and invents per-cell differences that do not exist, '
+          'which then')
+    print('  appear as a policy disagreement and block an RQ2 conclusion the '
+          'data support.')
+    print('  The fix, in order:')
+    print('    1. write the pre-registered rule of ANALYSIS_PLAN.md 2.3 into '
+          'tuning.py')
+    print('       (SELECTION_RULE, SELECTION_RULE_ID, and '
+          'SELECTION_RULE_IS_PLACEHOLDER = False)')
+    print(f'    2. python experiments/tuning.py select --out-root {out_root} '
+          f'--write --replace')
+    print('       (--replace only after deciding what happens to any tuned run '
+          'already on')
+    print('       disk: see tuning.write_selection)')
+    print('    3. re-run this command')
+    print('  To price the stage meanwhile, which launches nothing:')
+    print(f'    python experiments/plan.py --out-root {out_root} '
+          f'--experiments E1 E2 {" ".join(tuned_ids)}')
+    print('  There is no override flag: a run made under this selection cannot '
+          'enter a')
+    print('  conclusion under any verdict, so there is nothing an override '
+          'would buy.')
+
+
 def _select_experiments(args: argparse.Namespace) -> list[str]:
     if args.experiments:
         if len(args.experiments) == 1 and args.experiments[0].lower() == 'all':
+            # The catalogue as it stands, which holds the tuned ids only where
+            # --tuned installed them. 'all' cannot mean "and the tuned stage
+            # too" on its own: that would make one habitual command grow by
+            # about 280 runs the first time a selection landed in the tree.
             return list(registry.EXPERIMENTS)
         unknown = [e for e in args.experiments if e not in registry.EXPERIMENTS]
+        dormant = [e for e in unknown if e in registry.TUNED_OF]
+        if dormant:
+            raise SystemExit(
+                f'{dormant}: E1 and E2 under the secondary tuning policy of '
+                f'DESIGN.md 3.3, which this runner does not activate on its '
+                f'own. Pass --tuned as well. It is opt-in even where a '
+                f'selection is already stored, because activating it here '
+                f'commits about 280 runs; plan.py and aggregate.py pick a '
+                f'stored selection up by themselves, since costing a stage and '
+                f'attributing runs that already exist cost nothing.')
         if unknown:
             raise SystemExit(f'unknown experiment(s) {unknown}; known: '
                              f'{list(registry.EXPERIMENTS)}')
@@ -3187,7 +3404,53 @@ def main(argv=None) -> int:
     # identity (src/dqn/config.py, BOOKKEEPING_FIELDS), so this does not change
     # any run digest.
     args.out_root = os.path.abspath(args.out_root)
+
+    # The tuned stage of DESIGN.md 3.3, resolved before the experiments are
+    # selected, because activating it changes what --experiments and --tier mean.
+    tuned_selection = None
+    if args.tuned:
+        tuned_selection, refusal = activate_tuned_stage(args.out_root)
+        if refusal:
+            print(f'[REFUSED] --tuned: {refusal}')
+            return 2
     exp_ids = _select_experiments(args)
+    tuned_ids = [eid for eid in exp_ids if eid in registry.TUNED_OF]
+    if not args.tuned:
+        # A tuned stage nobody launched and nobody mentioned is, afterwards,
+        # indistinguishable from one that ran: DESIGN.md 3.3's arbitration would
+        # be asserted over one policy while the tree held a selection saying
+        # there were two. So its availability is announced whenever the artifact
+        # is there, even though this command is not going to act on it.
+        stored, unreadable_selection = stored_selection(args.out_root)
+        if unreadable_selection:
+            print(f'[warning] {tuning.selection_path(args.out_root)} exists '
+                  f'and cannot be read as a selection: {unreadable_selection}')
+        elif stored is not None:
+            print(f'[note] this tree holds tuning selection {stored.short_id} '
+                  f'(rule {stored.rule.get("id")}'
+                  f'{", PLACEHOLDER" if stored.is_placeholder else ""}), so '
+                  f'E1t and E2t of DESIGN.md 3.3 exist for it and are NOT in '
+                  f'this launch. Pass --tuned to include them.')
+
+    # tuning.py's docstring requires this refusal of the runner, and 2.4 of the
+    # plan is why: a member drawn from a placeholder selection is not-evaluable,
+    # so nothing launched under one can enter a conclusion.
+    placeholder_refused = False
+    if tuned_ids and tuned_selection is not None \
+            and tuned_selection.is_placeholder:
+        placeholder_refused = True
+        refuse_placeholder_selection(tuned_selection, tuned_ids, args.out_root)
+        if not args.dry_run:
+            return 2
+        # A dry run writes nothing and launches nothing, so it is allowed to
+        # continue and show what the refusal is about. The exit code stays
+        # non-zero at the bottom, because a caller that scripted this must not
+        # read "the plan printed" as "the launch is permitted".
+        print('\n[--dry-run] continuing so the plan below can be read. '
+              'Nothing is written,')
+        print('nothing is launched, and this invocation still exits non-zero.')
+    elif tuned_ids:
+        print_tuned_stage(tuned_selection, tuned_ids, args.out_root)
     # A malformed selection is a refusal, not a traceback. `--seeds ''`,
     # `--seeds abc` and `--override num_episodes=0` all used to surface as raw
     # ValueErrors from three different modules.
@@ -3409,6 +3672,10 @@ def main(argv=None) -> int:
             print(f'\n--dry-run: {len(resolved["new_rejections"])} '
                   f'rejection(s) would be appended to {ledger_path}.')
         print('\n--dry-run: nothing written, nothing launched.')
+        if placeholder_refused:
+            print('--dry-run: exiting 2, because the launch this priced is '
+                  'refused (above).')
+            return 2
         return 0
 
     unsound = unsound_runs(records)
@@ -3511,6 +3778,8 @@ def main(argv=None) -> int:
         'source_assignment': {f'{arm}@s{seed}': int(rep) for (arm, seed), rep
                               in sorted(resolved['assignment'].items())},
         'invalid_sources_allowed': bool(args.allow_invalid_sources),
+        'tuned_stage': _tuned_stage_record(args.tuned, tuned_ids,
+                                          tuned_selection, args.out_root),
         'plan_hashes': _plan_hashes(),
     }
     with open(os.path.join(jobs_dir, f'sweep-{args.sweep_id}.json'), 'w',

@@ -35,6 +35,7 @@ import os
 import shutil
 import time
 
+import h5py
 import numpy as np
 import tensorflow as tf
 import keras
@@ -81,6 +82,242 @@ def evaluate(env, agent: Agent, episodes: int, seeds: Seeds, stream: str,
     return float(np.mean([r['return'] for r in rows])), rows
 
 
+# ---------------------------------------------------------------------------
+# Atomic checkpointing
+# ---------------------------------------------------------------------------
+# A checkpoint is five artefacts, and the published writer emitted them in
+# sequence with neither atomicity nor a consistency marker. `open(state, 'w')`
+# truncates in place, so a kill a millisecond later left an empty `state.json`
+# and the next resume died inside `json.load`. That was the visible failure.
+# The silent one is worse: a kill between the replay archive and the state file
+# left weights, replay and optimiser from checkpoint N+1 beside a `state.json`
+# from checkpoint N, and `_maybe_resume` then restored episode N into a network
+# that already held N+1's parameters, replayed those episodes with advanced
+# weights, and produced a wrong trajectory with nothing raised. The existing
+# `trajectory_digest` guard cannot see it: it compares the *configuration*, not
+# the *progress*.
+#
+# What replaces it is a three-phase commit over a generation-stamped set.
+#
+#   1. STAGE   Every artefact is written into `<dir>/.ckpt_staging` with the
+#              checkpoint's GENERATION stamped inside it, and flushed to the
+#              device. Nothing already committed is touched, and this is where
+#              essentially all of the wall clock goes: measured on the campaign
+#              machine, 1.45 s of the 1.46 s a full LunarLander checkpoint
+#              costs. So a kill anywhere in phase 1 leaves the previous
+#              generation exactly as it was, which is the opposite of the
+#              published writer, where a kill during the write destroyed the
+#              checkpoint being overwritten as well as the one being made.
+#   2. COMMIT  Each staged file is moved into place with `os.replace`, which is
+#              atomic on Windows and POSIX for a same-volume rename, and
+#              `state.json` goes LAST. `state.json` is the pointer: until it
+#              names generation N, generation N does not exist.
+#   3. CLEAN   The staging directory is removed.
+#
+# The generation is stamped INSIDE each artefact -- an h5 root attribute for
+# the two Keras weight files, an extra array in the two NumPy archives -- and
+# not into a marker file beside it. A marker is a second file, so a commit
+# killed between an artefact and its marker leaves one of the two stale; both
+# orders fail, and a size check cannot separate them because successive
+# checkpoints of the same network are byte-for-byte the same length. Stamping
+# the artefact makes the artefact and its generation a single `os.replace`, and
+# the set is consistent exactly when all five stamps agree.
+#
+# Phase 2 is the only window in which the committed set can be mixed, and it is
+# five renames wide -- measured at 5.8 ms for the whole set, of which 2.5 ms is
+# the 6.3 MB replay archive -- against a phase 1 of about 1.45 s. Even that
+# window is not merely detectable but repairable: every artefact of generation
+# N is still on disk, committed or staged, so `_recover_checkpoint` finishes
+# the commit rather than discarding the checkpoint. Only a set that can be
+# neither completed nor verified is refused, and it is refused loudly. One lost
+# run costs about half an hour; one silently mixed run costs the result.
+#
+# The whole writer costs +331 ms per checkpoint against the published one
+# (1.46 s against 1.13 s, medians of 13 interleaved pairs on a loaded
+# machine). Almost none of that is the staging or the renames, which measure at
+# the noise floor; it is the two fsyncs' and the two h5 stamps' reopening of a
+# just-written file, which on this Windows volume costs about 20 ms a time
+# whatever is then done with the handle. In run terms it is +1.7 s on a
+# ~1900 s run, or 0.09 per cent, which is why it does not move the cadence.
+#
+# Disk cost: one extra copy of the checkpoint while it is staged, so the peak
+# is 2x, about 13.9 MB against the 6.9 MB steady state (measured at full replay
+# occupancy: 6.35 MB of it is the replay archive), released at phase 3. Six
+# concurrent runs peak at about 83 MB. The catalogue's roughly 1200 stored
+# checkpoints are unaffected: a staging directory never outlives a checkpoint,
+# the replay archive is reaped when the run finishes, and the stamps themselves
+# are eight bytes each.
+
+#: Staged into `<dir>/.ckpt_staging`, then renamed into place one by one.
+CHECKPOINT_ARTEFACTS: tuple[str, ...] = ('online', 'target', 'buffer', 'optim')
+#: Deliberately not named `state.json`: `audit.py` and `aggregate.py` treat any
+#: directory holding a `state.json` as a run directory, so a staging directory
+#: left behind by a kill would otherwise be counted as a run of its own.
+STAGED_STATE_NAME = 'state.json.staged'
+STAGING_DIRNAME = '.ckpt_staging'
+#: The h5 attribute and the NumPy archive key the generation is stamped under.
+GENERATION_KEY = 'ckpt_generation'
+
+
+def _fsync_file(path: str) -> None:
+    """Force one file's bytes to the device before it is renamed into place.
+
+    `os.replace` orders the *rename*; on its own it does not order the data
+    behind it, so a power event can leave the new name pointing at bytes that
+    never landed. Measured cost over the four staged artefacts: +222 ms of the
+    checkpoint's 1.46 s, which is 15 per cent of a checkpoint and 0.06 per cent
+    of a run. Almost all of it is the reopen rather than the flush -- `fsync`
+    itself measures 0.8 ms on the small artefacts and 4.9 ms on the 6.3 MB
+    replay archive, while the first open of a just-written file on this Windows
+    volume costs about 20 ms whatever is done with the handle. Worth paying:
+    the campaign's stated failure modes include a power event, and this is the
+    only part of the writer that addresses one.
+
+    Windows refuses `os.fsync` on a read-only descriptor, so the file is opened
+    for writing.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR | getattr(os, 'O_BINARY', 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path: str) -> None:
+    """Flush the directory entry itself; a no-op where the platform forbids it.
+
+    POSIX needs this for a rename to survive a power event. Windows has no
+    portable equivalent and `os.open` on a directory raises there, so the
+    failure is swallowed rather than reported as a checkpoint error.
+    """
+    try:
+        fd = os.open(path, getattr(os, 'O_DIRECTORY', 0) | os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_json_atomic(path: str, payload, **dump_kwargs) -> None:
+    """Write a JSON document that can never be observed torn or empty.
+
+    `open(path, 'w')` truncates immediately, so a kill before the dump finishes
+    leaves a zero-byte file where the caller believes a document is. The bytes
+    go to a fixed temporary name in the same directory -- fixed, so that an
+    interrupted write is overwritten by the next one rather than accumulating
+    -- are flushed to the device, and are then moved into place by a
+    same-volume `os.replace`.
+    """
+    directory = os.path.dirname(path) or '.'
+    tmp = os.path.join(directory, f'.{os.path.basename(path)}.tmp')
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(payload, fh, **dump_kwargs)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(directory)
+
+
+def _read_json_file(path: str) -> tuple[dict | None, str | None]:
+    """Parse a JSON document, reporting *why* it could not be read.
+
+    A torn `state.json` used to reach `json.load` and end the run with a
+    `JSONDecodeError` traceback. The caller has to tell "absent" (a fresh run,
+    proceed) from "present but unreadable" (refuse), so the reason is returned
+    rather than raised.
+    """
+    if not os.path.exists(path):
+        return None, 'absent'
+    try:
+        size = os.path.getsize(path)
+        with open(path, encoding='utf-8') as fh:
+            text = fh.read()
+    except OSError as exc:
+        return None, f'unreadable ({exc})'
+    if not text.strip():
+        return None, f'empty ({size} bytes)'
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, f'truncated or not valid JSON at {size} bytes ({exc})'
+    if not isinstance(data, dict):
+        return None, f'holds a {type(data).__name__}, not an object'
+    return data, None
+
+
+def _stamp_weights_file(path: str, generation: int) -> None:
+    """Record the generation inside a Keras weights file.
+
+    Keras owns the format, so the stamp is added by reopening the file and
+    setting a root attribute. Measured at +163 ms for the pair against a
+    checkpoint of 1.46 s, nearly all of it the reopen rather than the eight
+    bytes written. A content hash recorded in `state.json` would be cheaper and
+    would detect more, but it could not answer the question the refusal message
+    has to answer -- *which* checkpoint this file came from -- and the stamp
+    also survives the file being copied out of the directory. `load_weights`
+    ignores unknown root attributes; `test_resume_equivalence` is what checks
+    that, since resume would not stay bitwise otherwise.
+    """
+    with h5py.File(path, 'a') as fh:
+        fh.attrs[GENERATION_KEY] = int(generation)
+
+
+def _artefact_state(kind: str, path: str) -> dict:
+    """What is on disk for one artefact: its size and the generation it carries.
+
+    Never raises. Everything reported is either a fact about the file or a
+    named reason the file cannot be trusted, because the caller's job is to
+    write a refusal message, not to stack a second traceback on the first. The
+    two readers below are given a broad `except` for the same reason: h5py and
+    NumPy signal a damaged archive with half a dozen different exception types
+    and the distinction is of no use to the reader of the message.
+    """
+    absent = {'present': False, 'generation': None, 'bytes': None,
+              'note': 'absent'}
+    if not os.path.exists(path):
+        return absent
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return dict(absent, present=True, note=f'unreadable ({exc})')
+    try:
+        if kind in ('online', 'target'):
+            with h5py.File(path, 'r') as fh:
+                raw = fh.attrs.get(GENERATION_KEY)
+        else:
+            with np.load(path) as data:
+                raw = (data[GENERATION_KEY] if GENERATION_KEY in data.files
+                       else None)
+    except Exception as exc:                              # noqa: BLE001
+        return {'present': True, 'generation': None, 'bytes': size,
+                'note': f'unreadable ({type(exc).__name__}: {exc})'}
+    if raw is None:
+        return {'present': True, 'generation': None, 'bytes': size,
+                'note': f'carries no {GENERATION_KEY} stamp'}
+    try:
+        gen = int(np.asarray(raw).reshape(()).item())
+    except (TypeError, ValueError):
+        return {'present': True, 'generation': None, 'bytes': size,
+                'note': f'{GENERATION_KEY} is {raw!r}, not an integer'}
+    return {'present': True, 'generation': gen, 'bytes': size, 'note': None}
+
+
+def _artefact_ok(found: dict, generation, expect_bytes) -> bool:
+    """Is this copy a sound member of generation `generation`?"""
+    return bool(found['present'] and found['note'] is None
+                and found['generation'] == generation
+                and (expect_bytes is None or found['bytes'] == expect_bytes))
+
+
 class Trainer:
     def __init__(self, cfg: Config, argv: list[str] | None = None):
         self.cfg = cfg
@@ -124,6 +361,10 @@ class Trainer:
         self._fp_at_freeze: dict | None = None
         self._diag_baseline: np.ndarray | None = None
         self._last_ckpt = time.time()
+        # Highest checkpoint generation committed under each checkpoint
+        # directory this process has written. Consulted alongside what is on
+        # disk, never instead of it: a resumed process starts with none.
+        self._generations: dict = {}
 
         self._install_diagnostic_states()
         if cfg.is_transfer:
@@ -394,33 +635,316 @@ class Trainer:
                 'target': os.path.join(base, 'target.weights.h5'),
                 'buffer': os.path.join(base, 'buffer.npz'),
                 'optim': os.path.join(base, 'optimizer.npz'),
-                'state': os.path.join(base, 'state.json')}
+                'state': os.path.join(base, 'state.json'),
+                'stage': os.path.join(base, STAGING_DIRNAME)}
+
+    def _write_artefact(self, kind: str, path: str, generation: int) -> None:
+        """Write one artefact to `path`, with `generation` stamped inside it.
+
+        One dispatch, so the staged write cannot drift from the committed one,
+        and so a test can make exactly one artefact fail at exactly one
+        boundary. Keras insists a weights file end in `.weights.h5` and NumPy
+        appends `.npz` to anything that does not already end in it, which is
+        why staging is a directory of correctly named files rather than a set
+        of `*.tmp` siblings.
+        """
+        if kind == 'online':
+            self.agent.online.save_weights(path)
+            _stamp_weights_file(path, generation)
+        elif kind == 'target':
+            self.agent.target.save_weights(path)
+            _stamp_weights_file(path, generation)
+        elif kind == 'buffer':
+            self.agent.buffer.save(path, generation=generation)
+        elif kind == 'optim':
+            opt = self.agent.optimizer_state()
+            np.savez_compressed(
+                path,
+                **{GENERATION_KEY: np.int64(generation)},
+                **{f'v{i}': v for i, v in enumerate(opt['values'])})
+        else:
+            raise KeyError(f'unknown checkpoint artefact {kind!r}')
+
+    def _checkpoint_state(self, episode: int, generation: int,
+                          sizes: dict) -> dict:
+        """The state document, which is also the checkpoint's pointer.
+
+        It is renamed into place last and it names the generation every other
+        artefact of the set must carry, so the set it describes either exists
+        entirely or does not exist at all. The recorded sizes are a second,
+        cheaper guard: a stamp can be read out of an archive whose payload was
+        truncated after it.
+        """
+        return {'episode': episode,
+                'env_steps': self.agent.env_steps,
+                'update_counter': self.agent.update_counter,
+                'clip_events': self.agent.clip_events,
+                'frozen': self._frozen,
+                'trajectory_digest': self.cfg.trajectory_digest(),
+                'rng_states': self.seeds.rng_states(),
+                'generation': generation,
+                'checkpoint_set': {'generation': generation,
+                                   'artefacts': dict(sizes),
+                                   'buffer_reaped': False}}
+
+    def _next_generation(self, p: dict) -> int:
+        """One past the highest generation this directory has ever held.
+
+        Read off disk as well as out of memory: a resumed process starts with
+        no memory of what the previous one wrote, and a generation that went
+        backwards would let a stale artefact pass for a current one.
+        """
+        seen = self._generations.get(p['dir'], 0)
+        for path in (p['state'], os.path.join(p['stage'], STAGED_STATE_NAME)):
+            doc, _why = _read_json_file(path)
+            if doc is not None and isinstance(doc.get('generation'), int):
+                seen = max(seen, int(doc['generation']))
+        for kind in CHECKPOINT_ARTEFACTS:
+            found = _artefact_state(kind, p[kind])
+            if found['generation'] is not None:
+                seen = max(seen, int(found['generation']))
+        return seen + 1
 
     def save_checkpoint(self, episode: int, sub: str = '') -> None:
+        """Write a checkpoint that is either wholly present or wholly absent.
+
+        Phase 1 stages the whole generation-stamped set and touches nothing
+        already committed. Phase 2 renames the set into place with `state.json`
+        last. Phase 3 sweeps the staging directory up. See the module-level
+        note above `CHECKPOINT_ARTEFACTS` for why, and for what a kill in each
+        phase costs.
+        """
         p = self._paths(sub)
         os.makedirs(p['dir'], exist_ok=True)
-        self.agent.online.save_weights(p['online'])
-        self.agent.target.save_weights(p['target'])
-        self.agent.buffer.save(p['buffer'])
-        opt = self.agent.optimizer_state()
-        np.savez_compressed(p['optim'],
-                            **{f'v{i}': v for i, v in enumerate(opt['values'])})
-        with open(p['state'], 'w', encoding='utf-8') as fh:
-            json.dump({'episode': episode,
-                       'env_steps': self.agent.env_steps,
-                       'update_counter': self.agent.update_counter,
-                       'clip_events': self.agent.clip_events,
-                       'frozen': self._frozen,
-                       'trajectory_digest': self.cfg.trajectory_digest(),
-                       'rng_states': self.seeds.rng_states()}, fh)
+        generation = self._next_generation(p)
+
+        # -- phase 1. About 99 per cent of the cost and none of the risk: a
+        # kill anywhere in here loses the new checkpoint and nothing else.
+        shutil.rmtree(p['stage'], ignore_errors=True)
+        os.makedirs(p['stage'], exist_ok=True)
+        sizes: dict = {}
+        for kind in CHECKPOINT_ARTEFACTS:
+            name = os.path.basename(p[kind])
+            staged = os.path.join(p['stage'], name)
+            self._write_artefact(kind, staged, generation)
+            _fsync_file(staged)
+            sizes[name] = os.path.getsize(staged)
+        # Written last, and atomically: its presence with a parsable generation
+        # is the whole of the evidence that phase 1 completed, and therefore
+        # the whole of the licence to roll a half-finished commit forward.
+        _write_json_atomic(os.path.join(p['stage'], STAGED_STATE_NAME),
+                           self._checkpoint_state(episode, generation, sizes))
+
+        # -- phases 2 and 3.
+        self._commit_checkpoint(p)
+        self._generations[p['dir']] = generation
         self._last_ckpt = time.time()
+
+    def _commit_checkpoint(self, p: dict) -> None:
+        """Phases 2 and 3: rename the staged set into place, `state.json` last.
+
+        Idempotent, because this is also how an interrupted commit is finished:
+        every rename whose source has already gone is a rename that already
+        happened.
+        """
+        for kind in CHECKPOINT_ARTEFACTS:
+            self._commit_one(os.path.join(p['stage'],
+                                          os.path.basename(p[kind])), p[kind])
+        self._commit_one(os.path.join(p['stage'], STAGED_STATE_NAME), p['state'])
+        _fsync_dir(p['dir'])
+        shutil.rmtree(p['stage'], ignore_errors=True)
+
+    @staticmethod
+    def _commit_one(src: str, dst: str) -> None:
+        """The only way a file ever appears under a committed name."""
+        if os.path.exists(src):
+            os.replace(src, dst)
+
+    def _save_model_atomic(self, path: str) -> None:
+        """`model.keras` is another run's *input*, so it gets the same treatment.
+
+        A torn source model does not break the run that wrote it; it breaks
+        every transfer arm that later loads it, and it breaks them at a moment
+        when the obvious suspect is the transfer code.
+        """
+        stage = os.path.join(os.path.dirname(path), STAGING_DIRNAME)
+        shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage, exist_ok=True)
+        tmp = os.path.join(stage, os.path.basename(path))
+        self.agent.online.save(tmp)
+        _fsync_file(tmp)
+        os.replace(tmp, path)
+        _fsync_dir(os.path.dirname(path))
+        shutil.rmtree(stage, ignore_errors=True)
+
+    def _reap_buffer(self, sub: str = '') -> None:
+        """Drop a finished checkpoint's replay archive without breaking its set.
+
+        Measured at 6.35 MB for a LunarLander replay at capacity, and a
+        completed run has no use for it; over roughly 1200 runs holding two
+        checkpoints each that is the difference between about 15 GB and about
+        1.6 GB. It cannot simply be unlinked, because the set would then
+        be missing an artefact its own `state.json` declares and the next
+        resume would rightly refuse. `state.json` is rewritten FIRST, at the
+        same generation, declaring the archive reaped; only then is the file
+        removed. A kill between the two leaves a file that nothing claims,
+        which is ignorable, rather than a claim with no file, which is not.
+        """
+        p = self._paths(sub)
+        if not os.path.exists(p['buffer']):
+            return
+        state, _why = _read_json_file(p['state'])
+        if state is not None:
+            cset = dict(state.get('checkpoint_set') or {})
+            artefacts = dict(cset.get('artefacts') or {})
+            artefacts.pop(os.path.basename(p['buffer']), None)
+            cset['artefacts'] = artefacts
+            cset['buffer_reaped'] = True
+            state['checkpoint_set'] = cset
+            _write_json_atomic(p['state'], state)
+        os.remove(p['buffer'])
+
+    def _locate_set(self, p: dict, state: dict) -> dict:
+        """Where a sound copy of each artefact of `state`'s generation is.
+
+        Two places, and they mean different things: a committed copy is an
+        `os.replace` that already happened, a staged copy is one that had not
+        happened yet when the process died.
+        """
+        generation = state.get('generation')
+        cset = state.get('checkpoint_set') or {}
+        ledger = dict(cset.get('artefacts') or {})
+        reaped = bool(cset.get('buffer_reaped'))
+        report: dict = {}
+        for kind in CHECKPOINT_ARTEFACTS:
+            if kind == 'buffer' and reaped:
+                continue
+            name = os.path.basename(p[kind])
+            expect = ledger.get(name)
+            committed = _artefact_state(kind, p[kind])
+            staged = _artefact_state(kind, os.path.join(p['stage'], name))
+            report[kind] = {
+                'name': name,
+                'committed': committed,
+                'staged': staged,
+                'committed_ok': _artefact_ok(committed, generation, expect),
+                'staged_ok': _artefact_ok(staged, generation, expect)}
+        return report
+
+    def _recover_checkpoint(self, p: dict) -> dict | None:
+        """The state of a complete, self-consistent checkpoint, or a refusal.
+
+        `None` means there is no checkpoint here at all, which is a fresh run
+        rather than a fault. Anything else is either a set whose every artefact
+        carries the generation `state.json` names, or a `RuntimeError` that
+        says what was found where.
+        """
+        staged_state, _why = _read_json_file(
+            os.path.join(p['stage'], STAGED_STATE_NAME))
+        if staged_state is not None:
+            report = self._locate_set(p, staged_state)
+            if report and all(e['committed_ok'] or e['staged_ok']
+                              for e in report.values()):
+                # Phase 2 was interrupted. Every artefact of this generation is
+                # still on disk, committed or staged, so the commit is finished
+                # rather than the checkpoint thrown away.
+                self._commit_checkpoint(p)
+                print(f'[checkpoint] finished an interrupted commit of '
+                      f'generation {staged_state.get("generation")} in '
+                      f'{p["dir"]}')
+        if os.path.isdir(p['stage']):
+            # Phase 1 was interrupted: an incomplete set that nothing ever
+            # pointed at. Nothing committed was touched, so it is swept up and
+            # the previous generation stands.
+            shutil.rmtree(p['stage'], ignore_errors=True)
+
+        state, why = _read_json_file(p['state'])
+        if state is None:
+            leftovers = sorted(os.path.basename(p[k])
+                               for k in CHECKPOINT_ARTEFACTS
+                               if os.path.exists(p[k]))
+            if why == 'absent' and not leftovers:
+                return None
+            if why == 'absent':
+                raise RuntimeError(
+                    f'refusing to resume {self.dir}: the directory holds '
+                    f'checkpoint artefacts {leftovers} but no state.json, so '
+                    f'nothing on disk says which episode they belong to. '
+                    f'Starting over would silently discard whatever training '
+                    f'they represent and append episodes from 0 to a metrics '
+                    f'log that may already hold them, which is the duplication '
+                    f'DESIGN.md 8.2(1) exists to prevent. Delete the directory '
+                    f'and restart.')
+            raise RuntimeError(
+                f'refusing to resume {self.dir}: state.json is {why}. A '
+                f'checkpoint whose pointer cannot be read is not a checkpoint. '
+                f'The published writer truncated it in place, so a kill a '
+                f'millisecond later left exactly this; the writer here renames '
+                f'it into position instead, so a torn one now means damage '
+                f'below this process. Delete the directory and restart.')
+
+        generation = state.get('generation')
+        if not isinstance(generation, int):
+            raise RuntimeError(
+                f'refusing to resume {self.dir}: state.json carries no '
+                f'checkpoint generation, so it was written by the pre-atomic '
+                f'writer and the files beside it cannot be shown to be one '
+                f'checkpoint. That writer could leave weights, replay and '
+                f'optimiser from checkpoint N+1 beside a state.json from '
+                f'checkpoint N, which resumes silently and trains a wrong '
+                f'trajectory. Delete the directory and restart.')
+
+        report = self._locate_set(p, state)
+        if not all(entry['committed_ok'] for entry in report.values()):
+            raise RuntimeError(self._mixed_set_message(p, state, report))
+        return state
+
+    def _mixed_set_message(self, p: dict, state: dict, report: dict) -> str:
+        """Name the generation of every artefact found, then say what it costs.
+
+        The message is long on purpose. Its reader is looking at a refusal in
+        the middle of a 1200-run campaign and has to decide, in one glance,
+        whether to delete a directory; "checkpoint mismatch" would not let
+        them.
+        """
+        generation = state.get('generation')
+        lines = []
+        for kind in CHECKPOINT_ARTEFACTS:
+            entry = report.get(kind)
+            if entry is None:
+                lines.append(f'    {os.path.basename(p[kind]):<20s} '
+                             f'not part of this set (reaped after the run)')
+                continue
+            found = entry['committed']
+            if not found['present']:
+                where = 'absent'
+            elif found['generation'] is None:
+                where = f'generation unknown: {found["note"]}'
+            else:
+                where = f'generation {found["generation"]}'
+                if found['note']:
+                    where += f', but {found["note"]}'
+            flag = '' if entry['committed_ok'] else '   <-- does not match'
+            lines.append(f'    {entry["name"]:<20s} {where}{flag}')
+        return (
+            f'refusing to resume {self.dir}: the files here are not one '
+            f'checkpoint.\n'
+            f'  state.json names generation {generation}, at episode '
+            f'{state.get("episode")!r}; on disk:\n'
+            + '\n'.join(lines)
+            + '\n  Resuming would restore that episode into a network already '
+              'holding a different checkpoint\'s parameters, replay those '
+              'episodes with advanced weights, and produce a wrong trajectory '
+              'with nothing raised. That is worse than a crash, because it is '
+              'silent. Delete the directory and restart: one lost run costs '
+              'about half an hour, one silently mixed run costs the result.')
 
     def _maybe_resume(self) -> None:
         p = self._paths()
-        if not os.path.exists(p['state']):
+        st = self._recover_checkpoint(p)
+        if st is None:
             return
-        with open(p['state'], encoding='utf-8') as fh:
-            st = json.load(fh)
+        self._generations[p['dir']] = int(st['generation'])
 
         stored = st.get('trajectory_digest')
         current = self.cfg.trajectory_digest()
@@ -440,9 +964,17 @@ class Trainer:
             self.agent.buffer.load(p['buffer'])
         if os.path.exists(p['optim']):
             d = np.load(p['optim'])
-            self.agent.load_optimizer_state(
-                {'values': [d[f'v{i}'] for i in range(len(d.files))]})
+            # By name, not by count: the archive also carries the generation
+            # stamp, so `range(len(d.files))` would ask for one slot too many.
+            slots = sorted((k for k in d.files
+                            if k.startswith('v') and k[1:].isdigit()),
+                           key=lambda k: int(k[1:]))
+            self.agent.load_optimizer_state({'values': [d[k] for k in slots]})
         else:
+            # Unreachable now that `_recover_checkpoint` verifies the whole set
+            # before anything is loaded, and kept anyway: it is the specific
+            # defect DESIGN.md 8.2 names, and a backstop costing one branch is
+            # cheaper than trusting that the check above never regresses.
             raise RuntimeError(
                 f'{self.dir}: checkpoint has no optimiser state. Resuming would '
                 f'restart Adam from zero moments while claiming to continue the '
@@ -460,7 +992,8 @@ class Trainer:
         dropped_evals = self.evals.drop_where(
             lambda r: int(r.get('checkpoint', -10 ** 9)) >= self.start_episode)
         print(f'[resume] episode {self.start_episode} '
-              f'(dropped {dropped} metric rows, {dropped_evals} eval rows)')
+              f'(generation {st["generation"]}, dropped {dropped} metric rows, '
+              f'{dropped_evals} eval rows)')
 
     # ---- linear probe ----------------------------------------------------
     def _probe_jumpstart(self) -> dict | None:
@@ -661,16 +1194,12 @@ class Trainer:
             self.metrics.close()
 
         self.save_checkpoint(cfg.num_episodes - 1)
-        self.agent.online.save(os.path.join(self.dir, 'model.keras'))
+        self._save_model_atomic(os.path.join(self.dir, 'model.keras'))
         self._finalise(held_out, started, final_eval_episodes)
 
         if not cfg.keep_buffer:
-            # ~5 MB per run, and a completed run has no use for it. At the
-            # catalogue's scale this is the difference between ~10 GB and ~1 GB.
             for sub in ('', *[f'ckpt_ep{e}' for e in cfg.prefix_checkpoints]):
-                path = self._paths(sub)['buffer']
-                if os.path.exists(path):
-                    os.remove(path)
+                self._reap_buffer(sub)
 
         self.env.close()
         self.eval_env.close()
@@ -708,9 +1237,13 @@ class Trainer:
             result.update(_curve_summaries(df, cfg, result['env_steps']))
         self.manifest['result'] = result
 
-        with open(os.path.join(self.dir, 'manifest.json'), 'w',
-                  encoding='utf-8') as fh:
-            json.dump(self.manifest, fh, indent=2, default=str)
+        # `manifest.json` is what every downstream tool reads to decide a
+        # run is finished and sound. Truncating it in place means a kill during
+        # the dump leaves a file that parses as nothing, and a run that reads
+        # as neither complete nor absent, so it goes through the same
+        # write-then-rename as the checkpoint.
+        _write_json_atomic(os.path.join(self.dir, 'manifest.json'),
+                           self.manifest, indent=2, default=str)
         if not integrity['contiguous']:
             print(f'[WARNING] metrics integrity: {integrity["problems"]}')
 

@@ -22,6 +22,14 @@ Three things are declared per experiment and are load-bearing downstream:
 Arms name their source by *label*, and `jobs()` resolves that into a checkpoint
 path and emits jobs in dependency order, so a transfer run can never silently
 load a source that does not exist or belongs to another cell.
+
+One part of the catalogue is *not* static. `DESIGN.md` 3.3's secondary tuning
+policy runs `E1` and `E2` again at each cell's `E3`-selected configuration, so
+those arms cannot be written down until a selection exists. They are built from
+the selection artifact `tuning.py` stores (`TUNED_OF`, `tuned_experiment`), and
+until one exists they refuse to enumerate rather than enumerating empty: a
+tuned stage that quietly produced no jobs would be indistinguishable from a
+tuned stage that had been run.
 """
 from __future__ import annotations
 
@@ -94,6 +102,53 @@ COMMON = dict(lr=5e-4, target_update='hard', target_update_freq=1_000,
               gamma=0.99, batch_size=64, num_episodes=1000,
               epsilon_anneal_episodes=900, hidden=(128, 128), head_units=64)
 
+# ---------------------------------------------------------------------------
+# The secondary tuning policy of DESIGN.md 3.3, executed as its own experiments.
+# ---------------------------------------------------------------------------
+#: Name of the policy the tuned arms execute. Stamped into the selection
+#: artifact so a stored selection says which policy it is a selection *for*.
+TUNED_POLICY = 'secondary-per-cell-tuned'
+
+#: Tuned experiment id -> the common-policy experiment it replicates.
+#:
+#: New ids rather than a policy flag on `E1` and `E2`, and deliberately. The
+#: audit, the seed-block table, `--experiments`, the multiplicity ledger, the
+#: run index and every group-by in the analysis key on the experiment id; a flag
+#: inside the experiment would make "which policy is this row" a fact none of
+#: them could select or group on without first being taught about it, and each
+#: would have to be taught separately. The two policies also have to be
+#: *nameable apart* for `DESIGN.md` 3.3 to work at all: the arbitration asserts a
+#: conclusion only where both agree, which is a statement about two sets of runs
+#: and cannot be made about one set wearing a flag.
+TUNED_OF: dict[str, str] = {'E1t': 'E1', 'E2t': 'E2'}
+
+#: Prefix marking a tuned arm's label. Applied only to the arms the selection
+#: actually retunes, which is why it is a prefix and not a suffix: the house
+#: convention puts the variant first and the cell tag last (`agg-mean-scratch-`,
+#: `shift-w075-scratch-`, `cap64-src-`), and a suffix would break every reader
+#: that takes the tail of a label as the cell.
+#:
+#: The labels have to differ even where the *runs* do not. `plots.py` selects
+#: curve rows by label, so a shared label would silently merge a tuned cell's
+#: curve into its common-policy arm's for the cells where the two are genuinely
+#: different runs. Sharing a run directory is a fact about configuration;
+#: sharing a label would be a claim about arms.
+TUNED_LABEL_PREFIX = 'tuned-'
+
+#: Fields a tuned experiment varies across its runs, so `invariants()` stops
+#: asserting them experiment-wide. They stay invariant at the narrower scope
+#: below, which is where DESIGN.md 3.3 puts them.
+TUNED_VARIES: tuple[str, ...] = ('lr', 'target_update', 'target_update_freq')
+
+#: The scope `Experiment.scoped_invariants` is enforced at: a field named there
+#: must be constant across the runs that share these keys, not across the whole
+#: experiment. DESIGN.md 3.3 makes `lr` invariant "within a cell across
+#: {scratch, transfer, C2, C3}" -- the four *target-task* conditions of 4 -- and
+#: deliberately varying across cells, so the group is (cell, environment) and
+#: not the experiment. Without the environment in the key the scope would also
+#: cover the CartPole source runs, which the secondary policy does not retune.
+SCOPED_INVARIANT_KEYS: tuple[str, ...] = ('arch', 'target_rule', 'env')
+
 # Fields audited for constancy across an experiment's runs unless the experiment
 # declares that it varies one of them.
 CORE_INVARIANTS = ('lr', 'gamma', 'batch_size', 'num_episodes', 'max_steps',
@@ -138,6 +193,14 @@ class Experiment:
     varies: tuple[str, ...] = ()      # fields deliberately varied
     review_refs: tuple[str, ...] = () # reviewer concerns answered
     notes: str = ''
+    # Subset of `varies` that must still be constant within each group of runs
+    # sharing `SCOPED_INVARIANT_KEYS`. Empty for every common-policy experiment:
+    # only the secondary tuning policy needs an invariant narrower than the
+    # experiment but wider than nothing, and `varies` alone cannot express one.
+    # Declaring the field here rather than inferring it in `audit.py` keeps the
+    # scope a property of the catalogue, which is the thing the audit checks
+    # against.
+    scoped_invariants: tuple[str, ...] = ()
 
     def invariants(self) -> tuple[str, ...]:
         """Fields that must be constant across this experiment's runs."""
@@ -606,9 +669,271 @@ EXPERIMENTS: dict[str, Experiment] = {
         review_refs=('C5',)),
 }
 
-TIERS = {1: [e for e in EXPERIMENTS.values() if e.tier == 1],
-         2: [e for e in EXPERIMENTS.values() if e.tier == 2],
-         3: [e for e in EXPERIMENTS.values() if e.tier == 3]}
+TIERS: dict[int, list[Experiment]] = {1: [], 2: [], 3: []}
+
+
+def _rebuild_tiers() -> None:
+    """Recompute `TIERS` after the catalogue changes, in place.
+
+    In place and not by rebinding: `plan.py` and `sweep.py` read
+    `registry.TIERS`, and a caller holding a reference to the old dict would
+    keep enumerating the old catalogue. `E0` is tier 0 and belongs to no tier,
+    exactly as before.
+    """
+    for tier, members in TIERS.items():
+        members[:] = [e for e in EXPERIMENTS.values() if e.tier == tier]
+
+
+_rebuild_tiers()
+
+
+# ---------------------------------------------------------------------------
+# The tuned arms: E1 and E2 under the secondary policy of DESIGN.md 3.3
+# ---------------------------------------------------------------------------
+#: The selection installed by `activate_tuned_arms`, if any. Module state, and
+#: the only module state here, because `EXPERIMENTS` is module state too and the
+#: two must not be able to disagree about which selection the catalogue holds.
+_ACTIVE_SELECTION = None
+
+
+def _tuning():
+    """`tuning.py`, imported late so the two modules may name each other."""
+    import tuning                                            # noqa: PLC0415
+    return tuning
+
+
+def scope_key(cfg) -> tuple:
+    """The group a `scoped_invariants` field is asserted constant within.
+
+    Accepts a `Config` or any mapping with the same field names, so `audit.py`
+    can group manifests and jobs through one definition.
+    """
+    get = (cfg.get if isinstance(cfg, Mapping)
+           else lambda name: getattr(cfg, name))
+    return tuple(get(name) for name in SCOPED_INVARIANT_KEYS)
+
+
+def tuned_experiment(eid: str, selection) -> Experiment:
+    """Build one tuned experiment from a selection.
+
+    Its arms are the base experiment's arms with the cell's selected
+    configuration applied to the runs on the environment the selection was made
+    on, and with nothing else changed. Three properties follow, each deliberate.
+
+    * **A cell that selects the a priori configuration shares its runs.** The
+      overrides then equal `COMMON`'s values, so the `Config` objects are
+      identical, so the run digests are identical, so `all_jobs` de-duplicates
+      the tuned arm onto the common-policy run and that cell costs nothing to
+      run twice. This is what makes the tuned stage an upper bound on cost
+      rather than a flat doubling, and `DESIGN.md` 3.3 names it as such.
+
+    * **Source runs are not retuned.** `DESIGN.md` 3.3 scopes the secondary
+      policy to "within a cell across {scratch, transfer, C2, C3}", which are
+      the four *target-task* conditions of 4, and `E3` selects on LunarLander
+      scratch runs, so the evidence is about the target task alone. Training a
+      CartPole source at a learning rate selected on LunarLander would
+      extrapolate the selection past anything that was measured, and it would
+      make the two policies differ in the *source* as well as in the arm under
+      study -- so a disagreement between them could no longer be read as being
+      about the tuning policy. The source arms therefore keep their labels and
+      their configuration, and are the same runs the common policy uses.
+
+    * **Retuned arms are relabelled, shared runs or not.** Two arms may share a
+      run directory; that is a fact about configuration, and the catalogue is
+      full of it. Sharing a *label* would be a claim about arms, and would merge
+      the two policies' rows wherever they really are different runs.
+    """
+    if eid not in TUNED_OF:
+        raise KeyError(f'{eid!r} is not a tuned experiment; known: '
+                       f'{sorted(TUNED_OF)}')
+    base = EXPERIMENTS[TUNED_OF[eid]]
+    env_of = {arm.label: str(arm.overrides.get('env') or TARGET_ENV)
+              for arm in base.arms}
+    unexpected = sorted({env for env in env_of.values()
+                         if env not in (selection.env, SOURCE_ENV)})
+    if unexpected:
+        raise ValueError(
+            f'{eid}: {TUNED_OF[eid]} has arms on {unexpected}, which is neither '
+            f'the environment the selection was made on ({selection.env}) nor '
+            f'the source environment ({SOURCE_ENV}). DESIGN.md 3.3 scopes the '
+            f'secondary policy to the target task, and nothing says what a '
+            f'selection made on one environment means for a run on a third. '
+            f'Refusing rather than guessing.')
+    renamed = {label: (TUNED_LABEL_PREFIX + label if env == selection.env
+                       else label)
+               for label, env in env_of.items()}
+
+    arms: list[Arm] = []
+    for arm in base.arms:
+        overrides = dict(arm.overrides)
+        retuned = env_of[arm.label] == selection.env
+        note = arm.notes
+        if retuned:
+            cell = (str(arm.overrides['arch']),
+                    str(arm.overrides['target_rule']))
+            cfg = selection.config_for(cell)
+            overrides.update(cfg.overrides())
+            note = (f'secondary tuning policy (DESIGN.md 3.3): lr={cfg.lr:g}, '
+                    f'{cfg.target_update} target update, selected for '
+                    f'{cell[0]}-{cell[1]} from {selection.source_experiment} on '
+                    f'{selection.seed_block}'
+                    + (' (equals the a priori configuration, so this arm shares '
+                       'the common policy\'s run directories)'
+                       if cfg.equals_a_priori else '')
+                    + (f'. {arm.notes}' if arm.notes else ''))
+        arms.append(Arm(label=renamed[arm.label], overrides=overrides,
+                        source_from=(renamed[arm.source_from]
+                                     if arm.source_from else None),
+                        source_seed_block=arm.source_seed_block,
+                        role=arm.role, only_as_source=arm.only_as_source,
+                        notes=note))
+
+    shared = ', '.join(selection.shared_cells) or 'none'
+    return Experiment(
+        eid, f'{base.name}-tuned', tier=base.tier, family=base.family,
+        question=(f'{base.question}; under the per-cell tuned policy, which is '
+                  f'the second leg of the DESIGN.md 3.3 arbitration'),
+        arms=tuple(arms), seed_block=base.seed_block,
+        varies=tuple(dict.fromkeys(tuple(base.varies) + TUNED_VARIES)),
+        review_refs=tuple(dict.fromkeys(tuple(base.review_refs)
+                                        + ('ICANN#5 Q1', 'ICANN#5 Q5'))),
+        scoped_invariants=TUNED_VARIES,
+        notes=(f'{TUNED_OF[eid]} replicated under the secondary policy of '
+               f'DESIGN.md 3.3, from selection {selection.short_id} '
+               f'(rule {selection.rule.get("id")}'
+               f'{", PLACEHOLDER" if selection.is_placeholder else ""}). '
+               f'Cells selecting the a priori configuration and therefore '
+               f'sharing the common policy\'s runs: {shared}. The family is '
+               f'inherited from {TUNED_OF[eid]} because this is that '
+               f'experiment under the other declared policy, not a new '
+               f'question: the arbitration is a conjunction over the same '
+               f'contrasts, so it does not add members to the multiplicity '
+               f'ledger of ANALYSIS_PLAN.md 7.'))
+
+
+def _resolve_selection(eid: str, out_root: str, selection):
+    """The selection a tuned id is built from, or a refusal naming what to run.
+
+    Precedence is explicit argument, then the activated selection, then the one
+    stored in the tree. Where the activated and the stored selection differ the
+    call is refused: the tuned arms' run digests are a function of the
+    selection, so enumerating under one while the tree was populated under
+    another produces runs no arm declares.
+    """
+    tuning = _tuning()
+    if selection is not None:
+        return selection
+    stored = tuning.read_selection(out_root, required=False)
+    active = _ACTIVE_SELECTION
+    if (active is not None and stored is not None
+            and active.selection_id != stored.selection_id):
+        raise ValueError(
+            f'{eid}: the activated selection {active.short_id} and the '
+            f'selection stored at {tuning.selection_path(out_root)} '
+            f'({stored.short_id}) are different. A tuned arm\'s run digest is a '
+            f'function of the selection, so enumerating under one and running '
+            f'against a tree built under the other would write runs that no arm '
+            f'declares and leave the declared arms reported missing. Pass '
+            f'selection=... explicitly, or call '
+            f'activate_tuned_arms(out_root={out_root!r}).')
+    resolved = active if active is not None else stored
+    if resolved is None:
+        raise tuning.SelectionMissing(
+            f'{eid} is E1/E2 under the secondary tuning policy of DESIGN.md '
+            f'3.3, and {tuning.missing_message(out_root)}')
+    return resolved
+
+
+def resolve_experiment(eid: str, out_root: str = 'runs',
+                       selection=None) -> Experiment:
+    """The catalogue entry for an id, tuned experiments included.
+
+    Tuned ids are always rebuilt from the resolved selection rather than read
+    out of `EXPERIMENTS`, so an activated catalogue and an explicitly passed
+    selection cannot silently disagree about what `E1t` is.
+    """
+    if eid in TUNED_OF:
+        return tuned_experiment(eid, _resolve_selection(eid, out_root,
+                                                        selection))
+    return EXPERIMENTS[eid]
+
+
+def catalogue(out_root: str = 'runs', selection=None,
+              include_tuned: Optional[bool] = None) -> dict[str, Experiment]:
+    """The id-keyed catalogue, with the tuned experiments where they exist.
+
+    `include_tuned=None` means "where a selection is resolvable": exactly
+    `EXPERIMENTS` while `E3` is still running, gaining `E1t` and `E2t` the
+    moment a selection is stored. `True` demands them and raises
+    `tuning.SelectionMissing` when there is none, which is what a caller that
+    has decided to run the tuned stage wants -- a tuned stage that enumerated
+    empty would be indistinguishable from one that had been run.
+
+    A pure function: it does not touch `EXPERIMENTS`. `activate_tuned_arms` is
+    the mutating version, for the tools that read the module dict directly.
+    """
+    out = {eid: exp for eid, exp in EXPERIMENTS.items() if eid not in TUNED_OF}
+    if include_tuned is False:
+        return out
+    tuning = _tuning()
+    try:
+        resolved = _resolve_selection('E1t', out_root, selection)
+    except tuning.SelectionMissing:
+        if include_tuned:
+            raise
+        return out
+    for eid in TUNED_OF:
+        out[eid] = tuned_experiment(eid, resolved)
+    return out
+
+
+def activate_tuned_arms(selection=None, out_root: str = 'runs'
+                        ) -> tuple[str, ...]:
+    """Install the tuned experiments into `EXPERIMENTS`. Returns their ids.
+
+    Mutating the module dict is deliberate. `plan.py`, `sweep.py`, `audit.py`
+    and `aggregate.py` all read `registry.EXPERIMENTS` as *the* set of
+    experiment ids, so this is what makes the tuned stage visible to all of them
+    at once rather than teaching each one about selections separately.
+
+    It is off until called, and that is deliberate too. The tuned arms are
+    sequentially dependent on `E3`; a catalogue that grew two experiments at
+    import time because a file happened to exist under the default run tree
+    would change what every one of those tools enumerates, without anybody
+    asking it to, and the change would be invisible in the code.
+
+    The tuned ids are appended last, so `all_jobs` visits a common-policy arm
+    before the tuned arm that may share its run directory and the shared run
+    keeps the common policy's identity.
+    """
+    global _ACTIVE_SELECTION
+    resolved = _resolve_selection('E1t', out_root, selection)
+    for eid in TUNED_OF:
+        EXPERIMENTS.pop(eid, None)
+    for eid in TUNED_OF:
+        EXPERIMENTS[eid] = tuned_experiment(eid, resolved)
+    _ACTIVE_SELECTION = resolved
+    _rebuild_tiers()
+    return tuple(TUNED_OF)
+
+
+def deactivate_tuned_arms() -> tuple[str, ...]:
+    """Remove the tuned experiments again. Returns the ids removed."""
+    global _ACTIVE_SELECTION
+    removed = tuple(eid for eid in TUNED_OF
+                    if EXPERIMENTS.pop(eid, None) is not None)
+    _ACTIVE_SELECTION = None
+    _rebuild_tiers()
+    return removed
+
+
+def tuned_arms_active() -> bool:
+    return all(eid in EXPERIMENTS for eid in TUNED_OF)
+
+
+def active_selection():
+    """The selection `activate_tuned_arms` installed, or None."""
+    return _ACTIVE_SELECTION
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +1140,8 @@ def resolve_seeds(spec: str | Iterable[int] | None,
 def jobs(experiment: str, seeds: str | Iterable[int] | None = None,
          out_root: str = 'runs', overrides: dict | None = None,
          allow_factor_overrides: bool = False,
-         source_seeds: Mapping[tuple[str, int], int] | None = None) -> list[Job]:
+         source_seeds: Mapping[tuple[str, int], int] | None = None,
+         selection=None) -> list[Job]:
     """Resolve one experiment into concrete jobs, sources before their consumers.
 
     Source checkpoints are resolved from the *same seed* and the *same arm
@@ -832,8 +1158,14 @@ def jobs(experiment: str, seeds: str | Iterable[int] | None = None,
     *default* seed, not the current one, so a lineage replaced twice still
     resolves from one entry and re-running is a lookup rather than a fresh
     draw. Passing nothing is the pre-reserve behaviour exactly.
+
+    ``selection`` supplies the tuning selection a tuned id (`TUNED_OF`) is built
+    from; with nothing passed it is read from the run tree. A tuned id with no
+    selection anywhere raises `tuning.SelectionMissing` naming what to run,
+    rather than returning an empty list: the tuned stage is sequentially
+    dependent on `E3`, and an empty enumeration would report it as run.
     """
-    exp = EXPERIMENTS[experiment]
+    exp = resolve_experiment(experiment, out_root, selection)
     seed_list = resolve_seeds(seeds, exp.seed_block)
     extra = dict(overrides or {})
     if experiment == 'E0':
@@ -979,8 +1311,8 @@ def jobs(experiment: str, seeds: str | Iterable[int] | None = None,
 def all_jobs(experiments: Iterable[str], seeds=None, out_root: str = 'runs',
              overrides: dict | None = None,
              allow_factor_overrides: bool = False,
-             source_seeds: Mapping[tuple[str, int], int] | None = None
-             ) -> list[Job]:
+             source_seeds: Mapping[tuple[str, int], int] | None = None,
+             selection=None) -> list[Job]:
     """Jobs for several experiments, de-duplicated by run directory.
 
     De-duplication is the payoff of keying a run by its configuration digest
@@ -993,7 +1325,7 @@ def all_jobs(experiments: Iterable[str], seeds=None, out_root: str = 'runs',
     ordered: list[Job] = []
     for name in experiments:
         for job in jobs(name, seeds, out_root, overrides,
-                        allow_factor_overrides, source_seeds):
+                        allow_factor_overrides, source_seeds, selection):
             prior = seen.get(job.key())
             if prior is not None:
                 # De-duplication is only sound while the two jobs really
@@ -1022,7 +1354,14 @@ def all_jobs(experiments: Iterable[str], seeds=None, out_root: str = 'runs',
 
 
 def summary() -> list[dict]:
-    """One row per experiment, for `plan.py` and the documentation."""
+    """One row per experiment, for `plan.py` and the documentation.
+
+    Reads `EXPERIMENTS`, so the tuned experiments appear here once
+    `activate_tuned_arms` has installed them and not before. Their run counts
+    are the naive per-experiment figures like every other row: the sharing that
+    makes a tuned cell free is a de-duplication across experiments, and
+    `all_jobs` is the only thing that can measure it.
+    """
     rows = []
     for exp in EXPERIMENTS.values():
         n_seeds = len(SEED_BLOCKS[exp.seed_block])
@@ -1039,6 +1378,10 @@ def summary() -> list[dict]:
 
 
 __all__ = ['Arm', 'Experiment', 'Job', 'EXPERIMENTS', 'SEED_BLOCKS', 'CELLS',
+           'TUNED_OF', 'TUNED_POLICY', 'TUNED_LABEL_PREFIX', 'TUNED_VARIES',
+           'SCOPED_INVARIANT_KEYS', 'scope_key', 'tuned_experiment',
+           'resolve_experiment', 'catalogue', 'activate_tuned_arms',
+           'deactivate_tuned_arms', 'tuned_arms_active', 'active_selection',
            'SCALING_FIELDS', 'ENV_PAIRS', 'SOURCE_VALIDITY_GATE',
            'RESERVE_ORDER', 'source_lineage', 'source_arm_labels',
            'source_seed_is_recorded',

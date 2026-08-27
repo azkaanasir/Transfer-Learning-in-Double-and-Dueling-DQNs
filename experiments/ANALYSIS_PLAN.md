@@ -129,6 +129,12 @@ comparison is a comparison of ceilings and cannot express an ordering. This is
 the same reasoning, and the same endpoint, that `DESIGN.md` 7 already fixed for
 the external-validity check.
 
+**`var` is the ddof=1 sample variance.** Named explicitly because at n=5 the
+unbiased and population estimators differ by 25 per cent in the variance and
+about 12 per cent in the standard error, which is enough to move a marginal
+cell, and because a rule that inherits whichever a library happens to default
+to is not a rule.
+
 **Rule.** For each cell independently, let *A* be the a priori configuration
 (`lr` = 5e-4, hard update every 1000 updates) and *B* the configuration with the
 highest mean AUC. Select
@@ -151,16 +157,77 @@ what the fair-baseline objection asks for and no more. The bar is one SE, not
 two: two would switch almost never and make the arbitration a formality that
 always passes, which is a different way of being uninformative.
 
-**Refusals.** A cell in which no configuration reaches the solved threshold has
-no valid tuning and the selection **refuses** rather than returning its least-bad
-option. An incomplete selection, meaning fewer than four cells, is refused. A
-selection computed from any seed outside `TUNE` is refused, because 8 forbids a
-reported estimate drawing on the selection block.
+**Refusals.** Four, and the first was stated wrongly in the first draft of this
+section, which is recorded in 11.
+
+* **Incompetent cell.** A cell is tunable only if its selected candidate reaches
+  a **mean normalised `final_score` of at least 0.6** across the five `TUNE`
+  seeds. Otherwise the selection refuses for that cell rather than returning its
+  least-bad option. Note the floor reads on **final score, not AUC**: AUC
+  integrates the curve from zero and so never reaches 1.0 even for a solved
+  task, as `DESIGN.md` 7's pilot table shows (best cell `auc_score` 0.9640
+  against `final_score` 1.1787), so a floor applied to AUC would refuse every
+  cell. The value 0.6 is not new: it is the competence floor `DESIGN.md` 4.3
+  already declares for source validity, reused rather than a second constant
+  invented here.
+* **Incomplete cell set.** Fewer than four cells is refused.
+* **Incomplete candidate.** Every candidate must be measured at all five `TUNE`
+  seeds. A candidate measured at fewer is compared against its rivals on
+  unequal evidence, and the standard error above is written for n=5. If a
+  `TUNE` run is lost, the fix is to re-run it, not to shrink the denominator.
+* **Wrong block.** A selection computed from any seed outside `TUNE` is refused,
+  because 8 forbids a reported estimate drawing on the selection block.
+
+**Scope of the selected configuration.** It applies to the target-task
+conditions `DESIGN.md` 3.3 enumerates, {scratch, transfer, C2, C3}, on the
+selection environment. The **source runs are not retuned**: `E3` selects on
+LunarLander scratch and says nothing about CartPole, retuning a source would
+confound a policy disagreement with source quality, and `DESIGN.md` 4.3's
+replacement ledger keys on the source arm's label. Invariance is therefore
+enforced at the scope (`arch`, `target_rule`, `env`).
 
 **What this rule is not.** It is not a claim that the selected configuration is
 optimal. At five seeds it is a coarse instrument, and the tuned policy is a
 **robustness condition on asserting a conclusion**, not a tuned result in its own
 right. No number produced under it is reported as a performance claim.
+
+### 2.4 The arbitration, and why it adds no tests
+
+`DESIGN.md` 3.3 asserts an RQ2 or RQ3 conclusion only where both policies agree.
+Four things that rule needs in order to be executable, fixed here.
+
+**The confirmatory family stays at exactly eight members.** The tuned leg runs
+the same eight contrasts under the other policy and adds **no** family members,
+because the arbitration is a **conjunction**: asserting only where both legs
+reject makes the rejection region the *intersection* of the two legs' regions,
+which is never larger than either. The family-wise error rate therefore stays
+bounded by Holm over eight, and 7's ledger continues to report eight. Treating
+the tuned leg as eight further tests would inflate the ledger and change the
+pre-registration for no inferential gain.
+
+**Agreement includes direction.** Two rejections pointing in *opposite*
+directions are a **disagreement**, not an agreement, because a direction is part
+of the conclusion being asserted.
+
+**A replicated null is assertable.** Where neither leg rejects and both
+intervals sit inside the equivalence margin, the null replicates under both
+policies and is assertable as such. That is what licenses 4's exclusion bound;
+without it the arbitration would permit no negative conclusion at all.
+
+**Three verdicts, and one of them blocks.** Per cell and endpoint: `agrees`,
+`disagrees`, or `not-evaluable`. A conclusion may be asserted only under
+`agrees`. Under `disagrees` the disagreement **is** the reported finding and may
+not be suppressed, averaged away, or resolved by preferring one policy. Under
+`not-evaluable`, which is the state whenever the tuned arms are absent,
+incomplete, drawn from a corrupt selection, or drawn from a selection computed
+under a placeholder rule, **nothing is asserted**. `not-evaluable` is the
+default, so an unrun tuned stage cannot silently license a conclusion.
+
+**Every consumer must honour it.** A downstream artifact may not present a
+confirmatory conclusion from the significance flag alone. `stats.py` records the
+verdict and an `asserted` flag on every confirmatory member, and `report.py`,
+`tables.py` and `plots.py` must read those rather than re-deriving licence from
+the p-value. A guard the consumer ignores is not a guard.
 
 ---
 
@@ -430,6 +497,9 @@ may not be quoted, compared, or used to choose between hypotheses.
 6. **The confirmatory family**: 8 tests, raw and Holm-adjusted p, the HL
    estimate and CI, the observed within-seed correlation, and the three tests'
    agreement.
+6b. **The arbitration verdict** of 2.4, per cell and endpoint, with the tuned
+   leg's own statistic beside the common leg's, and the `asserted` flag. No
+   confirmatory conclusion appears anywhere in the report without it.
 7. Equivalence or exclusion statement per cell, per §4.
 8. The three control contrasts with joint intervals and correlations, plus the
    C2-at-K=0 comparison that tests the mechanics term's freeze dependence.
@@ -444,6 +514,7 @@ may not be quoted, compared, or used to choose between hypotheses.
 
 | Date | Deviation | Affected results | Re-labelled? |
 |---|---|---|---|
+| 2026-08-27 | **Correction and completion of §2.3, plus new §2.4.** Four independent agents implementing §2.3 reported that it could not be executed as written, and they were right. (a) The refusal clause read the solved-threshold floor on `auc_score`, which integrates from zero and never reaches 1.0 even for a solved task, so it would have refused **every** cell; the floor now reads on mean normalised `final_score` at the 0.6 competence value `DESIGN.md` 4.3 already declares. (b) `var` is now named as ddof=1: at n=5 the two estimators differ by about 12 per cent in the standard error, enough to move a marginal cell. (c) A candidate missing a `TUNE` seed is refused, since the standard error is written for n=5. (d) The selected configuration's scope is stated: target-task conditions only, sources not retuned. §2.4 additionally fixes what 3.3's arbitration left open: the family stays at eight by a conjunction argument, agreement includes direction, a replicated null is assertable, and `not-evaluable` is the default that blocks assertion. | **None.** No selection has been computed, no tuned arm has been run, and E3 is being restarted so that its evidence is produced entirely under this version of the plan | n/a |
 | 2026-08-27 | **Omission repaired, not a deviation.** §2.3 is new. `DESIGN.md` 3.3 required an E3-selected per-cell configuration and **neither document ever said how to select it**, leaving an open researcher degree of freedom on the primary conclusion, since the arbitration asserts RQ2 only where the two policies agree. The rule is now fixed in full. Written with 51 of E3's 160 runs on disk, **none aggregated and none analysed**; the commit carrying §2.3 timestamps it ahead of any E3 output. The E3 runs are independent of the rule: they train fixed configurations and the rule is an analysis decision applied afterwards. | **None yet.** No selection has been computed and no tuned arm has been run. Note the consequence for provenance: E3 runs produced before this edit carry the previous `ANALYSIS_PLAN.md` hash, so `audit.py` will report a plan-hash split on E3 unless E3 is restarted under the current plan | n/a |
 | 2026-08-26 | **Declared departure, not a deviation.** §9 emits no interval below n=3. `statlib.clopper_pearson` does, because the Beta-quantile interval is **exact at any n** and at n=1 it is very nearly [0, 1], which is a statement about ignorance rather than a claim. Suppressing it would replace an honest very-wide interval with nothing, which reads as less uncertainty rather than more. The returned interval carries a `reason` naming the departure and the n, so a caller stamps the pipeline-validation label over it and it cannot be quoted as a result. | None. `proportion_reached` is estimation-only and carries no p-value | n/a |
 | 2026-08-26 | **Strengthening, recorded for completeness.** `DESIGN.md` §9's guardrail against a directional adjective affirming a null named the bootstrap interval as the enforcement. `statlib` now gates such wording on the interval **and** an exact permutation test, because the interval alone measured a 6.7% false-direction rate against a nominal 5% at the designed configuration. The spec row therefore understates what the code does. | None. It refuses strictly more wording than the plan requires, never less | n/a |

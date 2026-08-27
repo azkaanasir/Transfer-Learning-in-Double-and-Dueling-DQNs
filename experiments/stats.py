@@ -47,6 +47,17 @@ What this file is defending against, defect by defect:
   contrast whose transferred-parameter fractions differ by more than
   `INTENSITY_TOLERANCE` is refused unless `--allow-intensity-confound` is
   passed, and the override is stamped into the output (`DESIGN.md` §3.1).
+* **A conclusion asserted under one of the two policies the design
+  requires.** `DESIGN.md` 3.3 declares a common configuration and a per-cell
+  tuned one, and asserts an RQ2 or RQ3 conclusion only where BOTH hold. The
+  second policy had no runs behind it until 2026-08-26 and no code here ever,
+  so eight Holm-significant members printed as confirmed effects while the
+  second leg of the pre-registered condition was absent from the report as
+  well as from the data. Sections 5d and 9t compute both legs through the same
+  estimator, report a per-cell verdict, and make `not-evaluable` -- the state
+  whenever the tuned arms have not been run -- block the assertion instead of
+  passing silently. Where the two policies disagree, that disagreement is
+  printed as the finding and is not averaged away.
 * **A single-seed number quoted as a result.** With n<3 no test, no interval,
   no proportion and no generated between-arm sentence is emitted, and the
   output is stamped `PIPELINE VALIDATION - NOT A RESULT` (`ANALYSIS_PLAN.md`
@@ -97,6 +108,11 @@ returns (§10.3):
 
 Section 10, power, is this module's own addition: `ANALYSIS_PLAN.md` §6 asks
 for a stated minimum detectable effect and §10's list has no slot for it.
+Sections 5d and 9t are the other addition, for the same reason: `DESIGN.md`
+3.3's arbitration between the two hyperparameter policies is a condition on
+asserting the primary confirmatory conclusion, and §10's twelve items -- written
+before that policy had any runs behind it -- have no slot for it either. Both
+omissions are recorded in §12 rather than resolved by leaving the section out.
 
     python experiments/stats.py --per-seed runs/per_seed.csv
     python experiments/stats.py --per-seed runs/per_seed.csv --json out.json
@@ -105,6 +121,8 @@ for a stated minimum detectable effect and §10's list has no slot for it.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import os
@@ -1217,6 +1235,12 @@ class Ledger:
     other_suppressed: list[str] = field(default_factory=list)
     screen_q: list[str] = field(default_factory=list)
     estimation: list[str] = field(default_factory=list)
+    #: The DESIGN.md 3.3 arbitration's own entries. A separate compartment,
+    #: and for the same reason `other_suppressed` is one: the arbitration
+    #: re-tests the SAME eight hypotheses under the secondary policy and adds
+    #: no members to the family, so its entries must not be able to reach the
+    #: count that ANALYSIS_PLAN.md 7 fixes at eight before launch.
+    arbitration: list[str] = field(default_factory=list)
     refusals: list[str] = field(default_factory=list)
     deviations: list[str] = field(default_factory=list)
     tensions: list[str] = field(default_factory=list)
@@ -1259,6 +1283,15 @@ class Options:
     #: reported, and this one was visible only in the JSON).
     tune_runs_excluded: int = 0
     tune_seeds_excluded: tuple[int, ...] = ()
+    #: Explicit path to the DESIGN.md 3.3 tuning-selection artifact. Empty
+    #: means "the one stored under the run tree", which is where `tuning.py`
+    #: writes it and where `registry.py` enumerates the tuned arms from.
+    selection_path: str = ''
+    #: Rows carrying a tuned arm label, removed from the primary analysis set
+    #: in `main` before any section runs and reported in the arbitration
+    #: section instead. Counted here so 10.2's "exclusions reported" covers
+    #: this one too.
+    tuned_rows_set_aside: int = 0
 
 
 def load_per_seed(path: str, ledger: Ledger) -> pd.DataFrame:
@@ -1591,6 +1624,392 @@ def paired_refusal(pair: dict, metric: str, name_a: str = 'transfer',
     if dup:
         return '; '.join(dup)
     return incomplete_arm_reason(pair, name_a, name_b)
+
+
+# ---------------------------------------------------------------------------
+# 4.1 The two hyperparameter policies of `DESIGN.md` 3.3, and the arbitration
+#     that section pre-registers between them.
+#
+# 3.3 declares two policies and then makes an assertion conditional on both:
+#
+#   * PRIMARY, the common configuration: one learning rate and target-update
+#     rule for all four cells, fixed a priori at lr=5e-4, hard update every
+#     1000 updates. This is the setting in which "identical hyperparameters"
+#     is a verified fact.
+#   * SECONDARY, per-cell tuned: each cell's own E3-selected configuration.
+#     `lr` is invariant WITHIN a cell across {scratch, transfer, C2, C3} and
+#     deliberately varies ACROSS cells.
+#   * "an RQ2 or RQ3 conclusion is asserted only if it holds under BOTH
+#     policies. Where they disagree, that disagreement is the finding, and it
+#     is reported as one."
+#
+# Until 2026-08-26 the secondary policy had no runs behind it: only E3 varied
+# `lr` anywhere in the catalogue. The arbitration was therefore unsatisfiable
+# and RQ2, the study's primary confirmatory question, could not have been
+# asserted at all -- and this module asserted it anyway, because the
+# arbitration existed in the design and nowhere in the code. A Holm-significant
+# member printed as a confirmed effect with nothing in the output saying that
+# the second leg of the pre-registered condition had never been run. That is
+# the defect closed here, and `not-evaluable` is the default state.
+#
+# What is deliberately NOT done: the tuned leg does not add members to the
+# confirmatory family. The arbitration is a CONJUNCTION over the same eight
+# hypotheses, not sixteen tests of sixteen hypotheses. Asserting a conclusion
+# only where both legs reject makes the rejection region the INTERSECTION of
+# the two legs' regions, and an intersection is never larger than either of
+# them, so the family-wise error rate of the conjunction is bounded by that of
+# either leg alone -- which Holm over eight already controls at 0.05. Counting
+# the tuned leg as eight further members would correct twice for a procedure
+# that is at most as liberal as one leg, and it would change the family size
+# `ANALYSIS_PLAN.md` 7 fixes before launch, which is the thing that stops a
+# result being rescued by relocating it. `section_ledger` asserts the count.
+# ---------------------------------------------------------------------------
+
+#: The two policies, named once so the output cannot call them two things.
+POLICY_COMMON = 'common'
+POLICY_TUNED = 'tuned'
+POLICY_NAMES: dict[str, str] = {
+    POLICY_COMMON: 'common configuration (PRIMARY, DESIGN.md 3.3)',
+    POLICY_TUNED: 'per-cell tuned (SECONDARY, DESIGN.md 3.3)',
+}
+
+#: The three arbitration verdicts. `NOT_EVALUABLE` is the default and is what
+#: the absence of tuned runs produces; it BLOCKS an assertion rather than
+#: permitting one, which is the direction the pre-registration requires.
+AGREES = 'agrees'
+DISAGREES = 'disagrees'
+NOT_EVALUABLE = 'not-evaluable'
+ARBITRATION_VERDICTS: tuple[str, ...] = (AGREES, DISAGREES, NOT_EVALUABLE)
+
+#: What one leg of the arbitration can conclude about an RQ2 member. The two
+#: directional values are distinguished because two policies that both reject
+#: while pointing opposite ways do not agree, and a verdict computed from the
+#: reject/do-not-reject bit alone would call that agreement.
+CONCLUSION_UP = 'effect-positive'
+CONCLUSION_DOWN = 'effect-negative'
+CONCLUSION_NULL = 'not-distinguishable'
+CONCLUSION_NONE = 'none'
+
+#: Read through `getattr` so this module still imports against a registry that
+#: predates the tuned catalogue: the arbitration then reports itself as
+#: not-evaluable, which is true, instead of failing at import.
+TUNED_LABEL_PREFIX: str = str(getattr(registry, 'TUNED_LABEL_PREFIX',
+                                      'tuned-'))
+TUNED_POLICY_NAME: str = str(getattr(registry, 'TUNED_POLICY',
+                                     'secondary-per-cell-tuned'))
+
+
+def tuned_experiment_ids() -> frozenset[str]:
+    """Experiment ids that execute the secondary policy (`E1t`, `E2t`)."""
+    return frozenset(getattr(registry, 'TUNED_OF', {}) or {})
+
+
+def tuned_label_mask(df: pd.DataFrame) -> pd.Series:
+    """Rows whose arm label marks them as retuned.
+
+    The label is the primary signal rather than the `experiments` column,
+    because it is written by the run itself: a tuned arm that shares a run
+    directory with its common-policy counterpart has no label of its own at
+    all (`registry.all_jobs` de-duplicates onto the arm it saw first, which
+    `activate_tuned_arms` guarantees is the common one), and a tuned arm that
+    does NOT share a directory always has one.
+    """
+    if 'label' not in df.columns:
+        return pd.Series(False, index=df.index, dtype=bool)
+    return df['label'].fillna('').astype(str).str.startswith(
+        TUNED_LABEL_PREFIX)
+
+
+def claims_tuned_experiment(df: pd.DataFrame) -> pd.Series:
+    """Rows the catalogue attributes to a tuned experiment.
+
+    This is the second signal, and it is the only one that can see a SHARED
+    run: a cell whose E3 selection equals the a priori configuration produces
+    digests identical to its common-policy arms, so `aggregate.py` resolves
+    that one run to both `E1` and `E1t` and the row's label stays the common
+    one. Without this the shared cells would be reported as having no tuned
+    arms, which is the opposite of the truth.
+    """
+    ids = tuned_experiment_ids()
+    if not ids or 'experiments' not in df.columns:
+        return pd.Series(False, index=df.index, dtype=bool)
+    return df['experiments'].fillna('').map(
+        lambda s: bool(ids & set(str(s).split(';'))))
+
+
+def common_policy_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """The primary analysis set: everything that is not a retuned arm.
+
+    A shared run stays here, and belongs here: it is the common policy's run,
+    and it is the tuned policy's run as well because the two configurations
+    coincide in that cell. Removing it would delete the common-policy arm.
+    """
+    return df[~tuned_label_mask(df)]
+
+
+def tuned_policy_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows that exist only because the secondary policy was run."""
+    return df[tuned_label_mask(df)]
+
+
+def _config_summary(rows: pd.DataFrame, opts: 'Options') -> dict:
+    """The (lr, target_update) a set of target-task rows was trained at.
+
+    Read off the runs rather than taken from the selection artifact, so a
+    selection that does not describe the runs on disk shows up as a
+    disagreement instead of being assumed away.
+    """
+    out: dict[str, Any] = {}
+    frame = rows
+    if 'env' in rows.columns:
+        frame = target_side(rows[rows['env'] == opts.target_env])
+    for col in ('lr', 'target_update', 'target_update_freq'):
+        if col not in frame.columns:
+            out[col] = ()
+            continue
+        vals = [v for v in frame[col].tolist() if not pd.isna(v)]
+        seen: list[str] = []
+        for v in vals:
+            text = f'{float(v):g}' if isinstance(v, (int, float, np.number)) \
+                and not isinstance(v, bool) else str(v)
+            if text not in seen:
+                seen.append(text)
+        out[col] = tuple(sorted(seen))
+    return out
+
+
+def _config_text(cfg: dict) -> str:
+    """One line naming a policy's configuration in a cell."""
+    lr = '/'.join(cfg.get('lr') or ()) or '?'
+    upd = '/'.join(cfg.get('target_update') or ()) or '?'
+    freq = '/'.join(cfg.get('target_update_freq') or ())
+    return f'lr={lr} {upd}' + (f'/{freq}' if freq else '')
+
+
+@dataclass
+class TunedPolicy:
+    """Where the secondary policy's runs are, cell by cell, and whether.
+
+    Built once in `main` and passed down, so the confirmatory section and the
+    arbitration section cannot disagree about which runs are the second leg.
+    """
+
+    frames: dict[str, pd.DataFrame] = field(default_factory=dict)
+    cells: dict[str, dict] = field(default_factory=dict)
+    selection: Any = None
+    selection_note: str = ''
+    placeholder: bool = False
+    rows_labelled: int = 0
+    notes: list[str] = field(default_factory=list)
+    #: Non-empty when an assertion is blocked for a reason that is not a
+    #: per-cell verdict: no selection artifact, or a placeholder rule.
+    assertion_block: str = ''
+
+    def state(self, cell: str) -> str:
+        return str(self.cells.get(cell, {}).get('state', 'absent'))
+
+    def reason(self, cell: str) -> str:
+        return str(self.cells.get(cell, {}).get('reason', ''))
+
+    def config(self, cell: str) -> dict:
+        return dict(self.cells.get(cell, {}).get('config') or {})
+
+    def cell_frame(self, cell: str) -> pd.DataFrame:
+        return self.frames.get(cell, pd.DataFrame())
+
+    def frame(self) -> pd.DataFrame:
+        """Every cell's tuned-leg rows in one table, for the RQ3 leg."""
+        parts = [f for f in (self.frames.get(c) for c in CELL_ORDER)
+                 if f is not None and len(f)]
+        if not parts:
+            return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+        return pd.concat(parts, ignore_index=False)
+
+    @property
+    def evaluable_cells(self) -> tuple[str, ...]:
+        return tuple(c for c in CELL_ORDER
+                     if self.state(c) in ('own-runs', 'shared'))
+
+    @property
+    def available(self) -> bool:
+        return bool(self.evaluable_cells)
+
+
+def read_tuning_selection(opts: 'Options') -> tuple[Any, str]:
+    """The stored selection artifact, or `(None, why not)`.
+
+    Never recomputes one and never writes one. `tuning.read_selection`
+    re-verifies the content address on every read, so an artifact edited after
+    the tuned runs were enumerated from it is refused rather than believed;
+    that refusal arrives here as the reason string and is reported.
+    """
+    try:
+        from experiments import tuning                     # noqa: PLC0415
+    except Exception as exc:                               # noqa: BLE001
+        return None, (f'tuning.py could not be imported '
+                      f'({exc.__class__.__name__}: {exc}), so the DESIGN.md '
+                      f'3.3 selection artifact cannot be read')
+    root = opts.audit_root or os.path.dirname(
+        os.path.abspath(opts.per_seed)) or '.'
+    path = opts.selection_path or None
+    try:
+        selection = tuning.read_selection(root, path=path, required=False,
+                                          verify=True, warn_placeholder=False)
+    except Exception as exc:                               # noqa: BLE001
+        return None, f'{exc.__class__.__name__}: {exc}'
+    if selection is None:
+        return None, tuning.missing_message(root, path=path)
+    return selection, ''
+
+
+def resolve_tuned_policy(common: pd.DataFrame, tuned: pd.DataFrame,
+                         opts: 'Options', ledger: Ledger) -> TunedPolicy:
+    """Find the secondary policy's runs per cell, or say why there are none.
+
+    Three states per cell, and the third is the default:
+
+    * **own-runs** -- the cell's E3 selection differs from the a priori
+      configuration, so its tuned arms are their own run directories carrying
+      their own `tuned-` labels.
+    * **shared** -- the cell's selection equals the a priori configuration, so
+      `lr` being a trajectory field makes the tuned arms' digests identical to
+      the common-policy arms' and the two share run directories. The second leg
+      of the arbitration in that cell is then the SAME RUNS as the first, the
+      two legs agree by construction, and that is a fact about the selection
+      rather than a result.
+    * **absent** -- there are no tuned runs for this cell. `DESIGN.md` 3.3's
+      arbitration cannot be evaluated, so nothing about RQ2 or RQ3 is asserted
+      there. This is today's state for every cell: E3 has not finished, so no
+      selection exists and the tuned stage has not run.
+    """
+    out = TunedPolicy(rows_labelled=int(len(tuned)))
+    selection, why = read_tuning_selection(opts)
+    out.selection = selection
+    out.selection_note = why
+    if selection is not None:
+        out.placeholder = bool(getattr(selection, 'is_placeholder', False))
+
+    if selection is None:
+        out.assertion_block = (
+            'no DESIGN.md 3.3 selection artifact could be read, so the '
+            'configuration the tuned arms claim to execute cannot be checked '
+            'against the pre-registered per-cell selection')
+    elif out.placeholder:
+        rule = str((selection.rule or {}).get('id'))
+        out.assertion_block = (
+            f'the selection was computed under {rule!r}, a PLACEHOLDER rule, '
+            f'not the criterion ANALYSIS_PLAN.md 2.3 pre-registers. Arms '
+            f'enumerated from it test the pipeline; they are not the '
+            f'secondary policy, so they cannot license an assertion')
+
+    for cell in CELL_ORDER:
+        own = tuned[tuned['cell'] == cell] if 'cell' in tuned.columns \
+            else tuned.iloc[0:0]
+        base = common[common['cell'] == cell] if 'cell' in common.columns \
+            else common.iloc[0:0]
+        equals_a_priori: Optional[bool] = None
+        if selection is not None:
+            try:
+                equals_a_priori = bool(selection.equals_a_priori(cell))
+            except Exception:                              # noqa: BLE001
+                equals_a_priori = None
+                out.notes.append(
+                    f'{cell}: the selection artifact carries no entry for '
+                    f'this cell, so it cannot say whether the tuned arms '
+                    f'share the common policy\'s runs')
+        attributed = base[claims_tuned_experiment(base)] if len(base) \
+            else base
+
+        if len(own):
+            frame, state = own, 'own-runs'
+            reason = ''
+            if equals_a_priori:
+                # The selection says this cell reselected the a priori
+                # configuration, so `all_jobs` should have de-duplicated its
+                # tuned arms onto the common-policy runs and no `tuned-` label
+                # should exist. Both cannot be true; the runs win, and the
+                # contradiction is reported rather than resolved silently.
+                out.notes.append(
+                    f'{cell}: the selection says the tuned configuration '
+                    f'equals the a priori one, so the tuned arms should SHARE '
+                    f'the common policy\'s run directories and carry no '
+                    f'{TUNED_LABEL_PREFIX!r} label; {len(own)} row(s) carry '
+                    f'one anyway. The runs on disk are used and the '
+                    f'contradiction is reported, not resolved')
+                ledger.deviations.append(
+                    f'DESIGN.md 3.3: {cell} has {len(own)} tuned-labelled '
+                    f'run(s) although the stored selection marks it as '
+                    f'sharing the common policy\'s runs')
+        elif equals_a_priori:
+            frame, state = base, 'shared'
+            reason = ''
+        elif equals_a_priori is None and len(attributed):
+            frame, state = attributed, 'shared'
+            reason = ''
+            out.notes.append(
+                f'{cell}: no selection artifact was read, but '
+                f'{len(attributed)} run(s) are attributed to a tuned '
+                f'experiment by run digest, which is what a cell sharing the '
+                f'common policy\'s runs looks like')
+        else:
+            frame, state = base.iloc[0:0], 'absent'
+            if equals_a_priori is False:
+                reason = (
+                    'the selection gives this cell a configuration of its '
+                    f'own ({_config_text(_selection_config(selection, cell))}'
+                    '), so its tuned arms are their own runs -- and none of '
+                    'them is in the analysis set. The tuned stage has not '
+                    'been run for this cell')
+            elif selection is None:
+                reason = ('no tuned run and no selection artifact: the '
+                          'secondary policy of DESIGN.md 3.3 has not been '
+                          'executed for this cell')
+            else:
+                reason = ('the selection artifact does not cover this cell '
+                          'and no tuned run is present')
+
+        cfg = _config_summary(frame, opts) if len(frame) else {}
+        entry: dict[str, Any] = {
+            'cell': cell, 'state': state, 'reason': reason,
+            'rows': int(len(frame)), 'config': cfg,
+            'config_text': _config_text(cfg) if cfg else '-',
+            'shares_common_runs': bool(state == 'shared'),
+        }
+        if selection is not None:
+            sel_cfg = _selection_config(selection, cell)
+            entry['selected'] = _config_text(sel_cfg) if sel_cfg else '-'
+            entry['equals_a_priori'] = equals_a_priori
+            if len(frame) and sel_cfg and cfg:
+                mismatch = [k for k in ('lr', 'target_update')
+                            if cfg.get(k) and sel_cfg.get(k)
+                            and tuple(cfg[k]) != tuple(sel_cfg[k])]
+                if mismatch:
+                    entry['config_mismatch'] = mismatch
+                    ledger.deviations.append(
+                        f'DESIGN.md 3.3: {cell}\'s tuned runs were trained at '
+                        f'{_config_text(cfg)} but the stored selection names '
+                        f'{_config_text(sel_cfg)} (fields {mismatch}). The '
+                        f'runs are not the selection they claim to execute')
+        out.cells[cell] = entry
+        out.frames[cell] = frame
+    return out
+
+
+def _selection_config(selection: Any, cell: str) -> dict:
+    """The stored selection's configuration for a cell, in `_config_summary`
+    shape, so the selection and the runs are compared in one vocabulary."""
+    if selection is None:
+        return {}
+    try:
+        cfg = selection.config_for(cell)
+    except Exception:                                      # noqa: BLE001
+        return {}
+    out = {'lr': (f'{float(cfg.lr):g}',),
+           'target_update': (str(cfg.target_update),)}
+    freq = getattr(cfg, 'target_update_freq', None)
+    if str(cfg.target_update) == 'hard' and freq is not None:
+        out['target_update_freq'] = (f'{float(freq):g}',)
+    return out
 
 
 def transferred_fraction(df: pd.DataFrame) -> float:
@@ -2510,8 +2929,485 @@ def _paired_delta(df: pd.DataFrame, cell: str, metric: str, opts: Options
             'delta': pair['a'] - pair['b']}
 
 
+def _confirmatory_member(df: pd.DataFrame, cell: str, metric: str,
+                         opts: Options) -> dict:
+    """One member of the confirmatory family, computed from one policy's runs.
+
+    Lifted out of `section_confirmatory` unchanged, so that the second leg of
+    the `DESIGN.md` 3.3 arbitration is computed by the SAME code as the first
+    and a difference between the two legs cannot be an artefact of a second
+    implementation. This module already refuses to hold two definitions of one
+    number (`verify_primitives_against_statlib` exists for that reason); the
+    arbitration is a comparison, so a second definition here would corrupt the
+    very thing being compared.
+
+    Returns the record. It carries `suppressed` and no estimate where the arm
+    cannot support one, exactly as before: `ANALYSIS_PLAN.md` 9 forbids
+    quoting a suppressed member's point estimate, not only its test. The
+    caller owns the ledger and the family membership; nothing here touches
+    either, which is what keeps the tuned leg out of the family of eight.
+    """
+    pd_ = _paired_delta(df, cell, metric, opts)
+    d = pd_['delta']
+    n = len(d)
+    rec: dict[str, Any] = {
+        'metric': metric, 'cell': cell, 'n': n,
+        'seeds': pd_['seeds'],
+        # Rows and distinct usable seeds, both, and each named for what
+        # it is. `n_transfer_rows` used to hold a seed count.
+        'n_transfer_rows': pd_['rows_a'],
+        'n_scratch_rows': pd_['rows_b'],
+        'n_transfer_seeds': pd_['n_a'],
+        'n_scratch_seeds': pd_['n_b'],
+        'duplicated_transfer_seeds': pd_['dup_a'],
+        'duplicated_scratch_seeds': pd_['dup_b'],
+        'seeds_without_metric': pd_['metric_missing'],
+        'unpaired_transfer_seeds': pd_['only_a'],
+        'unpaired_scratch_seeds': pd_['only_b'],
+        'transfer_labels': pd_['transfer_labels'],
+        'freeze_updates_observed': pd_['freeze_updates_observed'],
+    }
+    if len(pd_['transfer_labels']) > 1:
+        rec['suppressed'] = (
+            'ambiguous primary arm: labels '
+            f'{pd_["transfer_labels"]} all match registry.PROTOCOL')
+    elif len(pd_['freeze_updates_observed']) > 1:
+        rec['suppressed'] = (
+            'freeze_updates is not constant across the arm '
+            f'({pd_["freeze_updates_observed"]}); DESIGN.md §8.4 '
+            'refuses to aggregate runs that differ in an invariant')
+    elif pd_['dup_a'] or pd_['dup_b']:
+        rec['suppressed'] = '; '.join(
+            pairing_problems(pd_, metric)) or 'duplicated rows'
+    elif pd_['n_a'] == 0 or pd_['n_b'] == 0:
+        # The cause is READ OFF the data rather than asserted. The
+        # previous text hard-coded "under --source-policy valid this
+        # happens when every source fails the gate", and printed that
+        # diagnosis for any empty arm: on a table whose final_score
+        # column was entirely NaN, with every source valid, four
+        # members were suppressed with a false explanation.
+        empty = 'transfer' if pd_['n_a'] == 0 else 'scratch'
+        rows_present = (pd_['rows_a'] if empty == 'transfer'
+                        else pd_['rows_b'])
+        if rows_present == 0:
+            why = ('no run in the analysis set in force matches that '
+                   'arm at all. Under --source-policy valid this is '
+                   'what a cell whose sources all fail the DESIGN.md '
+                   '§4.3 gate looks like, but the filter that emptied '
+                   'it is named in §2d and in the analysis-set note, '
+                   'not guessed at here')
+        elif not _clean(df[metric]).size:
+            why = (f'the arm has {rows_present} run(s) and the '
+                   f'{metric} column is empty for EVERY run in the '
+                   'table, so the endpoint itself is missing from '
+                   'this dataset')
+        else:
+            why = (f'the arm has {rows_present} run(s) but no finite '
+                   f'{metric} value among them')
+        rec['suppressed'] = (
+            f'the {empty} arm is empty in the analysis set in force: '
+            f'{why}. Nothing is substituted for it')
+    elif pd_['only_a'] or pd_['only_b']:
+        rec['suppressed'] = (
+            f'incomplete arm: seeds {pd_["only_a"]} appear only in '
+            f'transfer, {pd_["only_b"]} only in scratch. A partial arm '
+            'is refused (DESIGN.md §8.4); no seed is dropped to '
+            'rescue the test')
+    elif n < MIN_N_FOR_INFERENCE:
+        rec['suppressed'] = (
+            f'n={n} < {MIN_N_FOR_INFERENCE}: no test and no interval '
+            '(ANALYSIS_PLAN.md §9)')
+    if 'suppressed' in rec:
+        # A suppressed member's point estimate is withheld too, not
+        # only its test, and that holds at EVERY n. The version this
+        # replaces withheld it only below n=3, so a member refused as
+        # an incomplete arm (9 of 10 seeds) or refused because
+        # freeze_updates was not constant across the arm still had its
+        # mean delta printed in the results table: the silently
+        # seed-dropped number quoted after all, and the aggregate that
+        # DESIGN.md §8.4 had just refused to compute printed anyway.
+        rec.update({'mean_delta': None, 'p_signflip': None})
+        return rec
+
+    idx = boot_indices(n, opts.n_boot, opts.boot_seed)
+    hl = bootstrap_statistic(d, hodges_lehmann_paired, opts.n_boot,
+                             opts.boot_seed, idx=idx, vec=hl_vec)
+    sf = sign_flip_test(d, seed=opts.boot_seed)
+    try:
+        w_stat, w_p = sps.wilcoxon(d, zero_method='wilcox',
+                                   alternative='two-sided',
+                                   method='exact' if n <= 25 else 'auto')
+    except ValueError as exc:                     # all-zero differences
+        w_stat, w_p = float('nan'), None
+        rec['wilcoxon_note'] = str(exc)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        u_stat, u_p = sps.mannwhitneyu(pd_['a'], pd_['b'],
+                                       alternative='two-sided')
+    r_pear = correlation('pearson', pd_['a'], pd_['b'])
+    r_spear = correlation('spearman', pd_['a'], pd_['b'])
+    rec.update({
+        'mean_delta': float(np.mean(d)),
+        'median_delta': float(np.median(d)),
+        'sd_delta': sd(d),
+        'transfer_mean': float(np.mean(pd_['a'])),
+        'scratch_mean': float(np.mean(pd_['b'])),
+        'hl': hl['estimate'], 'ci_lo': hl['lo'], 'ci_hi': hl['hi'],
+        'ci_method': hl['method'], 'ci_note': hl.get('note', ''),
+        'degenerate_interval': bool(hl.get('degenerate')),
+        # The paired values themselves, so §10's unpaired sigma is
+        # computed on the same seeds the test used rather than on the
+        # whole arm.
+        'transfer_values': [float(v) for v in pd_['a']],
+        'scratch_values': [float(v) for v in pd_['b']],
+        'p_signflip': sf['p'], 'signflip_mode': sf['mode'],
+        'min_attainable_p': sf['min_attainable_p'],
+        'wilcoxon_W': float(w_stat), 'p_wilcoxon': w_p,
+        'mannwhitney_U': float(u_stat), 'p_mannwhitney': float(u_p),
+        'rho_pearson': r_pear, 'rho_spearman': r_spear,
+        'unanimous': phrase_unanimity(d),
+        'deltas': [float(x) for x in d],
+    })
+    return rec
+
+
+def _member_conclusion(rec) -> str:
+    """What one policy's leg concludes about one RQ2 member.
+
+    Direction is part of the conclusion, not decoration. Two policies that
+    both reject while pointing opposite ways have not agreed about anything,
+    and a verdict computed from the reject / do-not-reject bit alone would
+    call that agreement and license the sentence.
+    """
+    if not rec or 'suppressed' in rec or rec.get('p_holm') is None:
+        return CONCLUSION_NONE
+    if not rec.get('significant_holm'):
+        return CONCLUSION_NULL
+    for name in ('hl', 'mean_delta'):
+        value = rec.get(name)
+        if value is None:
+            continue
+        f = float(value)
+        if np.isfinite(f) and f != 0.0:
+            return CONCLUSION_UP if f > 0.0 else CONCLUSION_DOWN
+    # Rejected with a location estimate of exactly zero. The sign-flip test
+    # cannot produce that, so it means the estimate is degenerate; the
+    # conclusion has no direction, and an undirected rejection is not
+    # something the other leg can be compared against.
+    return CONCLUSION_NONE
+
+
+CONCLUSION_TEXT: dict[str, str] = {
+    CONCLUSION_UP: 'transfer ABOVE scratch, Holm-significant',
+    CONCLUSION_DOWN: 'transfer BELOW scratch, Holm-significant',
+    CONCLUSION_NULL: 'not distinguishable from zero',
+    CONCLUSION_NONE: 'no conclusion: the member carries no test',
+}
+
+
+def _arbitrate(common: str, tuned: str, evaluable: bool,
+               reason: str) -> tuple[str, str]:
+    """One verdict, from the two legs' conclusions. Returns (verdict, why)."""
+    if not evaluable:
+        return NOT_EVALUABLE, reason
+    if tuned == CONCLUSION_NONE:
+        return NOT_EVALUABLE, ('the tuned arms exist but the member is '
+                               'suppressed under the secondary policy, so '
+                               'the second leg has no conclusion to compare')
+    if common == CONCLUSION_NONE:
+        return NOT_EVALUABLE, ('the common-policy member is suppressed, so '
+                               'there is no first-leg conclusion to arbitrate')
+    if common == tuned:
+        return AGREES, ''
+    return DISAGREES, (f'the common configuration concludes '
+                       f'{CONCLUSION_TEXT[common]}; the per-cell tuned '
+                       f'configuration concludes {CONCLUSION_TEXT[tuned]}')
+
+
+def section_rq2_arbitration(members: list[dict], metrics: Sequence[str],
+                            tuned: Optional[TunedPolicy], opts: Options,
+                            ledger: Ledger) -> dict:
+    """5d -- the `DESIGN.md` 3.3 arbitration on RQ2, and the assertion gate.
+
+    The second leg is the same eight hypotheses recomputed on the per-cell
+    tuned arms through `_confirmatory_member`, adjusted by Holm over the same
+    pre-registered family size of eight. It is a *replication of the family
+    under the other declared policy*, not an extension of it: the assertion
+    rule is the conjunction "both legs reject", whose rejection region is the
+    intersection of the two legs' regions and therefore never larger than
+    either, so the family-wise error rate stays bounded by the Holm-over-8 of
+    a single leg. Adding these to the ledger as eight further members would
+    correct twice for a procedure that is already at most as liberal as one
+    leg, and would change the family size `ANALYSIS_PLAN.md` 7 fixes before
+    launch.
+
+    With no tuned runs -- today's state, because `E3` has not finished and no
+    selection exists -- every verdict is `not-evaluable` and NOTHING is
+    asserted. That is the point: before this section existed, a Holm-adjusted
+    p below 0.05 in 5a was the end of the matter, and the second leg of the
+    pre-registered condition was absent from the code as well as from the
+    data.
+    """
+    tuned = tuned if tuned is not None else TunedPolicy()
+    h2('5d. THE DESIGN.md 3.3 ARBITRATION -- may any of the eight be '
+       'asserted?')
+    print('  DESIGN.md 3.3 declares two hyperparameter policies and asserts '
+          'an RQ2 or RQ3')
+    print('  conclusion ONLY where both hold. 5a is the FIRST leg: the common '
+          'configuration,')
+    print('  one lr and target-update rule for all four cells, fixed a '
+          'priori. The SECOND leg')
+    print('  is the same eight hypotheses on each cell\'s own E3-selected '
+          'configuration')
+    print('  (registry E1t/E2t), computed by the same code at the same '
+          'CONFIRM seeds.')
+    print()
+    print(f'  The family stays {CONFIRMATORY_FAMILY_SIZE}. The arbitration is '
+          'a CONJUNCTION over the same eight')
+    print('  hypotheses, not sixteen tests: "both legs reject" has as its '
+          'rejection region the')
+    print('  INTERSECTION of the two legs\', which is never larger than '
+          'either, so the FWER is')
+    print(f'  bounded by Holm over {CONFIRMATORY_FAMILY_SIZE} on one leg. '
+          'Nothing below is a member of the family,')
+    print('  nothing below enters the multiplicity ledger as one, and 11 '
+          'asserts that count.')
+
+    # -- where the second leg's runs are, cell by cell ----------------------
+    print()
+    print('  the secondary policy\'s runs:')
+    cell_rows = []
+    for cell in CELL_ORDER:
+        entry = tuned.cells.get(cell, {})
+        cell_rows.append({
+            'cell': cell,
+            'tuned_arms': entry.get('state', 'absent'),
+            'runs': entry.get('rows', 0),
+            'trained_at': entry.get('config_text', '-'),
+            'selected': entry.get('selected', '-'),
+            'shares_common_runs': entry.get('shares_common_runs', False),
+        })
+    print(table(cell_rows, ('cell', 'tuned_arms', 'runs', 'trained_at',
+                            'selected', 'shares_common_runs')))
+    if tuned.selection is not None:
+        sel = tuned.selection
+        print(f'  selection           : {sel.short_id}  rule '
+              f'{(sel.rule or {}).get("id")!r}  block {sel.seed_block} '
+              f'seeds {list(sel.seeds)}')
+    else:
+        print('  selection           : NONE READABLE')
+        for line in str(tuned.selection_note).splitlines():
+            print(f'    {line}')
+    for note in tuned.notes:
+        print(f'  NOTE: {note}')
+    print('  A cell whose selection equals the a priori configuration '
+          'produces run digests')
+    print('  identical to its common-policy arms and SHARES those run '
+          'directories, so its two')
+    print('  legs are the same runs and agree by construction. That is a '
+          'fact about the')
+    print('  selection, not a replication, and the table above says which '
+          'cells it is true of.')
+
+    # -- the second leg ----------------------------------------------------
+    tuned_members: list[dict] = []
+    tuned_pvals: dict[tuple[str, str], float] = {}
+    for metric in metrics:
+        for cell in CELL_ORDER:
+            state = tuned.state(cell)
+            if state == 'absent':
+                rec = {'metric': metric, 'cell': cell, 'policy': POLICY_TUNED,
+                       'n': 0, 'mean_delta': None, 'p_signflip': None,
+                       'suppressed': tuned.reason(cell)
+                       or 'no tuned run for this cell'}
+            else:
+                rec = _confirmatory_member(tuned.cell_frame(cell), cell,
+                                           metric, opts)
+                rec['policy'] = POLICY_TUNED
+                rec['runs_shared_with_common'] = bool(state == 'shared')
+            tuned_members.append(rec)
+            if rec.get('p_signflip') is not None:
+                tuned_pvals[(metric, cell)] = float(rec['p_signflip'])
+    adj = holm_adjust(tuned_pvals, CONFIRMATORY_FAMILY_SIZE)
+    for rec in tuned_members:
+        key = (rec['metric'], rec['cell'])
+        rec['p_holm'] = adj.get(key)
+        rec['significant_holm'] = (rec['p_holm'] is not None
+                                   and rec['p_holm'] < ALPHA)
+
+    common_by_key = {(m['metric'], m['cell']): m for m in members}
+    tuned_by_key = {(m['metric'], m['cell']): m for m in tuned_members}
+
+    rows: list[dict] = []
+    for metric in metrics:
+        for cell in CELL_ORDER:
+            key = (metric, cell)
+            cm = common_by_key.get(key)
+            tm = tuned_by_key.get(key)
+            state = tuned.state(cell)
+            c_conc = _member_conclusion(cm)
+            t_conc = _member_conclusion(tm)
+            verdict, why = _arbitrate(
+                c_conc, t_conc, state != 'absent', tuned.reason(cell)
+                or 'the secondary policy has not been run for this cell')
+            blocked = ''
+            if verdict == AGREES and tuned.assertion_block:
+                blocked = tuned.assertion_block
+            assertable = bool(verdict == AGREES and not blocked
+                              and c_conc != CONCLUSION_NONE)
+            row = {
+                'metric': metric, 'cell': cell,
+                'tuned_arms': state,
+                'shares_common_runs': bool(state == 'shared'),
+                'n_common': (cm or {}).get('n'),
+                'n_tuned': (tm or {}).get('n'),
+                'hl_common': (cm or {}).get('hl'),
+                'hl_tuned': (tm or {}).get('hl'),
+                'holm_rejects_common': bool((cm or {}).get(
+                    'significant_holm')),
+                'holm_rejects_tuned': bool((tm or {}).get(
+                    'significant_holm')),
+                'conclusion_common': c_conc,
+                'conclusion_tuned': t_conc,
+                'verdict': verdict,
+                'assertable': assertable,
+                'why': why or blocked,
+            }
+            rows.append(row)
+            ledger.arbitration.append(
+                f'RQ2 {metric}/{cell}: {verdict}'
+                + (f' ({row["why"]})' if row['why'] else ''))
+
+    print()
+    print(table(rows, ('metric', 'cell', 'tuned_arms', 'n_common', 'n_tuned',
+                       'hl_common', 'hl_tuned', 'conclusion_common',
+                       'conclusion_tuned', 'verdict', 'assertable')))
+
+    print('  The tuned leg is Holm-adjusted over the same pre-registered '
+          'family size even where')
+    print('  fewer than that many of its members exist, exactly as the '
+          'common leg is. A leg with')
+    print('  fewer evaluable members is therefore corrected MORE strictly, '
+          'which is the')
+    print('  conservative direction and keeps a missing tuned arm from '
+          'making the second leg')
+    print('  easier to satisfy than the first.')
+
+    n_asserted = sum(1 for r in rows if r['assertable'])
+    n_dis = sum(1 for r in rows if r['verdict'] == DISAGREES)
+    n_ne = sum(1 for r in rows if r['verdict'] == NOT_EVALUABLE)
+    print()
+    print(f'  assertable: {n_asserted} of {len(rows)}   disagreements: '
+          f'{n_dis}   not evaluable: {n_ne}')
+
+    # A disagreement is a FINDING, and is printed as one before anything else
+    # in this subsection. It is not averaged with the agreeing cells, not
+    # resolved towards the primary policy, and not left implicit in a column.
+    if n_dis:
+        print()
+        print('  ' + '*' * 70)
+        print('  THE TWO POLICIES DISAGREE. Under DESIGN.md 3.3 that '
+              'disagreement IS the')
+        print('  finding and is reported as one. No conclusion is asserted '
+              'for these members,')
+        print('  and neither leg is preferred over the other:')
+        for r in rows:
+            if r['verdict'] != DISAGREES:
+                continue
+            print(f'    {r["metric"]}/{r["cell"]}: {r["why"]}.')
+            print(f'      common HL {fmt(r["hl_common"])}, tuned HL '
+                  f'{fmt(r["hl_tuned"])}')
+            ledger.refusals.append(
+                f'RQ2 {r["metric"]}/{r["cell"]}: the common and per-cell '
+                f'tuned policies DISAGREE, so DESIGN.md 3.3 asserts no '
+                f'conclusion; the disagreement is the finding')
+        print('  ' + '*' * 70)
+
+    if n_ne == len(rows) and rows:
+        print()
+        print('  ' + '*' * 70)
+        print('  NO RQ2 CONCLUSION IS ASSERTED IN THIS REPORT.')
+        print('  The per-cell tuned policy has no runs in the analysis set, '
+              'so the second leg')
+        print('  of the pre-registered arbitration cannot be evaluated. '
+              'DESIGN.md 3.3 makes an')
+        print('  RQ2 conclusion assertable only where BOTH policies hold, so '
+              'a Holm-adjusted p')
+        print('  below 0.05 in 5a is a result under the common configuration '
+              'and NOT a')
+        print('  confirmatory conclusion of this study. To make it one, run '
+              'the tuned stage:')
+        for line in str(tuned.selection_note or '').splitlines():
+            print(f'    {line}')
+        if not tuned.selection_note:
+            print('    python experiments/sweep.py --experiments E1t E2t')
+        print('  ' + '*' * 70)
+        ledger.refusals.append(
+            f'RQ2: all {len(rows)} member(s) are not-evaluable under the '
+            f'DESIGN.md 3.3 arbitration because the per-cell tuned policy has '
+            f'no runs in the analysis set; no RQ2 conclusion is asserted')
+    elif n_ne:
+        print()
+        for r in rows:
+            if r['verdict'] != NOT_EVALUABLE:
+                continue
+            print(f'  {r["metric"]}/{r["cell"]}: not evaluable -- '
+                  f'{r["why"]}. No conclusion is asserted.')
+            ledger.refusals.append(
+                f'RQ2 {r["metric"]}/{r["cell"]}: the DESIGN.md 3.3 '
+                f'arbitration is not evaluable ({r["why"]}), so no conclusion '
+                f'is asserted')
+
+    if tuned.assertion_block and tuned.available:
+        print()
+        print('  ASSERTION BLOCKED FOR EVERY MEMBER, whatever the verdict '
+              'above:')
+        print(f'    {tuned.assertion_block}.')
+        ledger.deviations.append(
+            f'DESIGN.md 3.3 arbitration: {tuned.assertion_block}, so no RQ2 '
+            f'or RQ3 conclusion is asserted from the tuned leg in this report')
+
+    if n_asserted:
+        print()
+        print('  ASSERTABLE under DESIGN.md 3.3 (both policies hold):')
+        for r in rows:
+            if not r['assertable']:
+                continue
+            print(f'    {r["metric"]}/{r["cell"]}: '
+                  f'{CONCLUSION_TEXT[r["conclusion_common"]]}'
+                  + ('  [the two legs are the same runs: this cell\'s '
+                     'selection equals the a priori configuration]'
+                     if r['shares_common_runs'] else ''))
+
+    sel_info: dict[str, Any] = {
+        'policy': TUNED_POLICY_NAME,
+        'readable': tuned.selection is not None,
+        'note': tuned.selection_note,
+        'placeholder': bool(tuned.placeholder),
+        'assertion_block': tuned.assertion_block,
+    }
+    if tuned.selection is not None:
+        sel_info.update({
+            'selection_id': tuned.selection.selection_id,
+            'short_id': tuned.selection.short_id,
+            'rule': dict(tuned.selection.rule or {}),
+            'seed_block': tuned.selection.seed_block,
+            'seeds': list(tuned.selection.seeds),
+            'env': tuned.selection.env,
+            'shared_cells': list(tuned.selection.shared_cells),
+        })
+    return {'rows': rows, 'tuned_members': tuned_members,
+            'cells': cell_rows, 'selection': sel_info,
+            'family_size': CONFIRMATORY_FAMILY_SIZE,
+            'adds_family_members': 0,
+            'notes': list(tuned.notes),
+            'counts': {'assertable': n_asserted, 'disagrees': n_dis,
+                       'not_evaluable': n_ne, 'members': len(rows)}}
+
+
 def section_confirmatory(df: pd.DataFrame, opts: Options,
-                         ledger: Ledger) -> dict:
+                         ledger: Ledger,
+                         tuned: Optional[TunedPolicy] = None) -> dict:
     """§10.6 -- THE confirmatory family: exactly 8 tests, and nothing else.
 
     `ANALYSIS_PLAN.md` §2. Membership is fixed by the plan, computed from this
@@ -2558,133 +3454,14 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                 'exist in this dataset (DESIGN.md §5.2 declares it '
                 'co-primary)')
         for cell in CELL_ORDER:
-            pd_ = _paired_delta(df, cell, metric, opts)
-            key = (metric, cell)
-            d = pd_['delta']
-            n = len(d)
-            rec: dict[str, Any] = {
-                'metric': metric, 'cell': cell, 'n': n,
-                'seeds': pd_['seeds'],
-                # Rows and distinct usable seeds, both, and each named for what
-                # it is. `n_transfer_rows` used to hold a seed count.
-                'n_transfer_rows': pd_['rows_a'],
-                'n_scratch_rows': pd_['rows_b'],
-                'n_transfer_seeds': pd_['n_a'],
-                'n_scratch_seeds': pd_['n_b'],
-                'duplicated_transfer_seeds': pd_['dup_a'],
-                'duplicated_scratch_seeds': pd_['dup_b'],
-                'seeds_without_metric': pd_['metric_missing'],
-                'unpaired_transfer_seeds': pd_['only_a'],
-                'unpaired_scratch_seeds': pd_['only_b'],
-                'transfer_labels': pd_['transfer_labels'],
-                'freeze_updates_observed': pd_['freeze_updates_observed'],
-            }
-            if len(pd_['transfer_labels']) > 1:
-                rec['suppressed'] = (
-                    'ambiguous primary arm: labels '
-                    f'{pd_["transfer_labels"]} all match registry.PROTOCOL')
-            elif len(pd_['freeze_updates_observed']) > 1:
-                rec['suppressed'] = (
-                    'freeze_updates is not constant across the arm '
-                    f'({pd_["freeze_updates_observed"]}); DESIGN.md §8.4 '
-                    'refuses to aggregate runs that differ in an invariant')
-            elif pd_['dup_a'] or pd_['dup_b']:
-                rec['suppressed'] = '; '.join(
-                    pairing_problems(pd_, metric)) or 'duplicated rows'
-            elif pd_['n_a'] == 0 or pd_['n_b'] == 0:
-                # The cause is READ OFF the data rather than asserted. The
-                # previous text hard-coded "under --source-policy valid this
-                # happens when every source fails the gate", and printed that
-                # diagnosis for any empty arm: on a table whose final_score
-                # column was entirely NaN, with every source valid, four
-                # members were suppressed with a false explanation.
-                empty = 'transfer' if pd_['n_a'] == 0 else 'scratch'
-                rows_present = (pd_['rows_a'] if empty == 'transfer'
-                                else pd_['rows_b'])
-                if rows_present == 0:
-                    why = ('no run in the analysis set in force matches that '
-                           'arm at all. Under --source-policy valid this is '
-                           'what a cell whose sources all fail the DESIGN.md '
-                           '§4.3 gate looks like, but the filter that emptied '
-                           'it is named in §2d and in the analysis-set note, '
-                           'not guessed at here')
-                elif not _clean(df[metric]).size:
-                    why = (f'the arm has {rows_present} run(s) and the '
-                           f'{metric} column is empty for EVERY run in the '
-                           'table, so the endpoint itself is missing from '
-                           'this dataset')
-                else:
-                    why = (f'the arm has {rows_present} run(s) but no finite '
-                           f'{metric} value among them')
-                rec['suppressed'] = (
-                    f'the {empty} arm is empty in the analysis set in force: '
-                    f'{why}. Nothing is substituted for it')
-            elif pd_['only_a'] or pd_['only_b']:
-                rec['suppressed'] = (
-                    f'incomplete arm: seeds {pd_["only_a"]} appear only in '
-                    f'transfer, {pd_["only_b"]} only in scratch. A partial arm '
-                    'is refused (DESIGN.md §8.4); no seed is dropped to '
-                    'rescue the test')
-            elif n < MIN_N_FOR_INFERENCE:
-                rec['suppressed'] = (
-                    f'n={n} < {MIN_N_FOR_INFERENCE}: no test and no interval '
-                    '(ANALYSIS_PLAN.md §9)')
+            rec = _confirmatory_member(df, cell, metric, opts)
+            rec['policy'] = POLICY_COMMON
+            members.append(rec)
             if 'suppressed' in rec:
-                # A suppressed member's point estimate is withheld too, not
-                # only its test, and that holds at EVERY n. The version this
-                # replaces withheld it only below n=3, so a member refused as
-                # an incomplete arm (9 of 10 seeds) or refused because
-                # freeze_updates was not constant across the arm still had its
-                # mean delta printed in the results table: the silently
-                # seed-dropped number quoted after all, and the aggregate that
-                # DESIGN.md §8.4 had just refused to compute printed anyway.
-                rec.update({'mean_delta': None, 'p_signflip': None})
-                members.append(rec)
                 ledger.suppressed.append(
                     f'{metric}/{cell}: {rec["suppressed"]}')
                 continue
-
-            idx = boot_indices(n, opts.n_boot, opts.boot_seed)
-            hl = bootstrap_statistic(d, hodges_lehmann_paired, opts.n_boot,
-                                     opts.boot_seed, idx=idx, vec=hl_vec)
-            sf = sign_flip_test(d, seed=opts.boot_seed)
-            try:
-                w_stat, w_p = sps.wilcoxon(d, zero_method='wilcox',
-                                           alternative='two-sided',
-                                           method='exact' if n <= 25 else 'auto')
-            except ValueError as exc:                     # all-zero differences
-                w_stat, w_p = float('nan'), None
-                rec['wilcoxon_note'] = str(exc)
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                u_stat, u_p = sps.mannwhitneyu(pd_['a'], pd_['b'],
-                                               alternative='two-sided')
-            r_pear = correlation('pearson', pd_['a'], pd_['b'])
-            r_spear = correlation('spearman', pd_['a'], pd_['b'])
-            rec.update({
-                'mean_delta': float(np.mean(d)),
-                'median_delta': float(np.median(d)),
-                'sd_delta': sd(d),
-                'transfer_mean': float(np.mean(pd_['a'])),
-                'scratch_mean': float(np.mean(pd_['b'])),
-                'hl': hl['estimate'], 'ci_lo': hl['lo'], 'ci_hi': hl['hi'],
-                'ci_method': hl['method'], 'ci_note': hl.get('note', ''),
-                'degenerate_interval': bool(hl.get('degenerate')),
-                # The paired values themselves, so §10's unpaired sigma is
-                # computed on the same seeds the test used rather than on the
-                # whole arm.
-                'transfer_values': [float(v) for v in pd_['a']],
-                'scratch_values': [float(v) for v in pd_['b']],
-                'p_signflip': sf['p'], 'signflip_mode': sf['mode'],
-                'min_attainable_p': sf['min_attainable_p'],
-                'wilcoxon_W': float(w_stat), 'p_wilcoxon': w_p,
-                'mannwhitney_U': float(u_stat), 'p_mannwhitney': float(u_p),
-                'rho_pearson': r_pear, 'rho_spearman': r_spear,
-                'unanimous': phrase_unanimity(d),
-                'deltas': [float(x) for x in d],
-            })
-            pvals[key] = float(sf['p'])
-            members.append(rec)
+            pvals[(metric, cell)] = float(rec['p_signflip'])
             ledger.confirmatory.append(f'{metric}/{cell} sign-flip')
 
     adj = holm_adjust(pvals, CONFIRMATORY_FAMILY_SIZE)
@@ -2695,6 +3472,14 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                                    and rec['p_holm'] < ALPHA)
 
     h2('5a. the eight tests')
+    print('  A Holm-adjusted p below alpha in this table is the verdict '
+          'under the COMMON')
+    print('  configuration ALONE. DESIGN.md 3.3 asserts an RQ2 conclusion '
+          'only where the')
+    print('  per-cell tuned policy agrees; 5d is that arbitration and is '
+          'what says whether')
+    print('  any of these may be asserted. Read 5a with 5d or not at all.')
+    print()
     print(table(members, ('metric', 'cell', 'n', 'scratch_mean',
                           'transfer_mean', 'mean_delta', 'hl', 'ci_lo',
                           'ci_hi', 'ci_method', 'p_signflip', 'p_holm',
@@ -2848,8 +3633,24 @@ def section_confirmatory(df: pd.DataFrame, opts: Options,
                   'that disagreement is')
             print('    the finding, and the pre-registered primary is the '
                   'sign-flip test.')
+
+    # DESIGN.md 3.3's arbitration, and the reason it is HERE rather than in a
+    # section of its own: it is the gate on everything 5a prints. A reader who
+    # stopped at the table would otherwise take a Holm-adjusted p below 0.05
+    # as this study's confirmatory conclusion, which it is not until the
+    # second policy agrees.
+    arb = section_rq2_arbitration(members, computed, tuned, opts, ledger)
+    by_key = {(r['metric'], r['cell']): r for r in arb['rows']}
+    for rec in members:
+        row = by_key.get((rec['metric'], rec['cell']), {})
+        rec['arbitration_verdict'] = row.get('verdict', NOT_EVALUABLE)
+        # `significant_holm` keeps its meaning exactly: the common policy's
+        # Holm verdict. `asserted` is the new and narrower thing, and it is
+        # what a conclusion may be drawn from.
+        rec['asserted'] = bool(row.get('assertable'))
     return {'members': members, 'family_size': CONFIRMATORY_FAMILY_SIZE,
-            'alpha': ALPHA, 'alpha_strictest': ALPHA_STRICTEST}
+            'alpha': ALPHA, 'alpha_strictest': ALPHA_STRICTEST,
+            'arbitration': arb}
 
 
 def section_equivalence(conf: dict, df: pd.DataFrame, opts: Options,
@@ -3555,29 +4356,24 @@ def sub_rq1(df: pd.DataFrame, opts: Options, ledger: Ledger,
     return {'rows': rows}
 
 
-def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
-            gate: list[dict]) -> dict:
-    """RQ3 -- between-cell contrast of deltas and the 2x2 interaction.
+def _rq3_compute(df: pd.DataFrame, opts: Options, metric: str,
+                 gate: list[dict]) -> dict:
+    """RQ3's between-cell contrasts and 2x2 interaction, computed not printed.
 
-    Effect modification, not "architecture causes the difference"
-    (`DESIGN.md` §2.4). Explicitly underpowered: the plan puts the interaction's
-    MDE at about 2.7 sigma, so this is an interval and nothing else. Reported
-    on both the normalised and the headroom-adjusted scale, because a cell near
-    the ceiling has less room to gain -- agreement across the two scales is
-    required before any wording is used (`ANALYSIS_PLAN.md` §3).
+    Split out of `sub_rq3` for one reason: `DESIGN.md` 3.3 requires the same
+    contrasts under the per-cell tuned policy, and a second implementation of
+    them would make a disagreement between the two policies indistinguishable
+    from a disagreement between two pieces of code. Every refusal below is the
+    one `sub_rq3` already applied; `status` records which branch a row took so
+    the printer can say the same thing it always said.
     """
-    h2('9b. RQ3 -- between-cell contrast of deltas and the 2x2 interaction')
-    ledger.est('RQ3 between-cell delta contrasts and interaction')
     deltas, delta_refusals = _cell_deltas(df, opts, metric)
-    for cell, reason in delta_refusals.items():
-        print(f'  {cell}: no paired delta is computed. {reason}')
-        ledger.refusals.append(f'RQ3 {cell} on {metric}: {reason}')
     headroom = {}
     for cell in CELL_ORDER:
-        # Seeds, not rows, and the same refusal §3b applies. This recomputed
-        # §3b's headroom independently as `np.mean` over `_clean(...[metric])`,
+        # Seeds, not rows, and the same refusal 3b applies. This recomputed
+        # 3b's headroom independently as `np.mean` over `_clean(...[metric])`,
         # a ROW mean: one duplicated scratch row at final_score=99 moved this
-        # cell's headroom_a column from -0.1635 to -9.0577 while §3b beside it
+        # cell's headroom_a column from -0.1635 to -9.0577 while 3b beside it
         # was already refusing the arm. The headroom feeds RQ3's pre-registered
         # two-scale agreement gate, so a row mean standing in for a seed mean
         # decided which wording was licensed.
@@ -3600,12 +4396,14 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
         common = sorted(set(da) & set(db))
         rec: dict[str, Any] = {'a': a, 'b': b, 'n': len(common)}
         if (a, b) in blocked:
+            rec['status'] = 'intensity-blocked'
             rec['note'] = ('REFUSED: intensity-confounded cross-architecture '
                            'contrast (DESIGN.md §3.1)')
             rows.append(rec)
             continue
         gone = [c for c in (a, b) if c in delta_refusals]
         if gone:
+            rec['status'] = 'cell-refused'
             rec['note'] = ('REFUSED: ' + '; '.join(
                 f'{c}: {delta_refusals[c]}' for c in gone))
             rows.append(rec)
@@ -3615,6 +4413,7 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
         # between-cell contrast, and dropping it silently is the same fault
         # one level up.
         if set(da) != set(db):
+            rec['status'] = 'seeds-differ'
             rec['note'] = (
                 f'REFUSED: incomplete pairing across cells. Seeds '
                 f'{sorted(set(da) - set(db))} have a delta in {a} only and '
@@ -3622,11 +4421,9 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
                 f'refused (DESIGN.md §8.4) and no seed is dropped after '
                 f'it has run (ANALYSIS_PLAN.md §8)')
             rows.append(rec)
-            ledger.refusals.append(
-                f'RQ3 {a} vs {b} on {metric}: the two cells do not share one '
-                'seed set, so the contrast is not computed')
             continue
         if len(common) < MIN_N_FOR_INFERENCE:
+            rec['status'] = 'n-too-small'
             rec['note'] = f'n={len(common)}: suppressed'
             rows.append(rec)
             continue
@@ -3664,12 +4461,105 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
             agree = ''
         conf_note = ('INTENSITY-CONFOUNDED (override in force)'
                      if (a, b) in confounded_pairs else '')
-        rec.update({'hl': raw['estimate'], 'ci_lo': raw['lo'],
+        rec.update({'status': 'computed',
+                    'hl': raw['estimate'], 'ci_lo': raw['lo'],
                     'ci_hi': raw['hi'], 'hl_headroom_adj': adj['estimate'],
                     'adj_lo': adj['lo'], 'adj_hi': adj['hi'],
                     'headroom_a': ha, 'headroom_b': hb, 'scales': agree,
                     'note': conf_note})
         rows.append(rec)
+
+    inter: dict[str, Any] = {'available': False, 'status': 'not-all-cells'}
+    want = ['mlp-vanilla', 'mlp-double', 'dueling-vanilla', 'dueling-double']
+    unequal = (len({tuple(sorted(deltas.get(w, {}))) for w in want}) > 1
+               if all(w in deltas and deltas[w] for w in want) else False)
+    if unequal:
+        inter = {'available': False, 'status': 'seeds-differ',
+                 'seeds_by_cell': {w: sorted(deltas.get(w, {}))
+                                   for w in want}}
+    elif all(w in deltas and deltas[w] for w in want):
+        common = sorted(set.intersection(*[set(deltas[w]) for w in want]))
+        arch_pairs = {('mlp-vanilla', 'dueling-vanilla'),
+                      ('mlp-double', 'dueling-double')}
+        confounded = any(pr in confounded_pairs for pr in arch_pairs)
+        if any(pr in blocked for pr in arch_pairs):
+            inter = {'available': False, 'status': 'intensity-blocked'}
+        elif len(common) < MIN_N_FOR_INFERENCE:
+            inter = {'available': False, 'status': 'n-too-small',
+                     'n': len(common)}
+        else:
+            mat = np.column_stack([[deltas[w][s] for s in common]
+                                   for w in want])
+
+            def interaction(m: np.ndarray) -> float:
+                # (double - vanilla | dueling) - (double - vanilla | mlp)
+                return hodges_lehmann_paired(
+                    (m[:, 3] - m[:, 2]) - (m[:, 1] - m[:, 0]))
+
+            res = bootstrap_statistic(
+                mat, interaction, opts.n_boot, opts.boot_seed,
+                vec=lambda S: hl_vec((S[..., 3] - S[..., 2])
+                                     - (S[..., 1] - S[..., 0])))
+            hs = [headroom.get(w, float('nan')) for w in want]
+            scales_ok = all(np.isfinite(h) and h > 0 for h in hs)
+            if scales_ok:
+                hh = np.asarray(hs, dtype=float)
+                adj_res = bootstrap_statistic(
+                    mat / hh, interaction, opts.n_boot, opts.boot_seed,
+                    vec=lambda S: hl_vec((S[..., 3] - S[..., 2])
+                                         - (S[..., 1] - S[..., 0])))
+                raw_excl = res['lo'] > 0 or res['hi'] < 0
+                adj_excl = adj_res['lo'] > 0 or adj_res['hi'] < 0
+                inter_scales = 'agree' if raw_excl == adj_excl else 'DISAGREE'
+            else:
+                adj_res = {'estimate': float('nan'), 'lo': float('nan'),
+                           'hi': float('nan')}
+                inter_scales = 'UNAVAILABLE'
+            inter = {'available': True, 'status': 'computed',
+                     'n': len(common),
+                     'hl': res['estimate'], 'ci_lo': res['lo'],
+                     'ci_hi': res['hi'],
+                     'hl_headroom_adj': adj_res['estimate'],
+                     'adj_lo': adj_res['lo'], 'adj_hi': adj_res['hi'],
+                     'scales': inter_scales,
+                     'wording_licensed': bool(inter_scales == 'agree'),
+                     'intensity_confounded': bool(confounded)}
+    return {'pairs': rows, 'interaction': inter, 'headroom': headroom,
+            'deltas': {c: dict(v) for c, v in deltas.items()},
+            'cell_refusals': dict(delta_refusals)}
+
+
+def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
+            gate: list[dict]) -> dict:
+    """RQ3 -- between-cell contrast of deltas and the 2x2 interaction.
+
+    Effect modification, not "architecture causes the difference"
+    (`DESIGN.md` §2.4). Explicitly underpowered: the plan puts the interaction's
+    MDE at about 2.7 sigma, so this is an interval and nothing else. Reported
+    on both the normalised and the headroom-adjusted scale, because a cell near
+    the ceiling has less room to gain -- agreement across the two scales is
+    required before any wording is used (`ANALYSIS_PLAN.md` §3).
+
+    Everything here is the COMMON configuration. `DESIGN.md` 3.3 asserts an RQ3
+    conclusion only where the per-cell tuned policy agrees, and that
+    arbitration is section 9t; this section licenses wording under the two
+    scales and no more.
+    """
+    h2('9b. RQ3 -- between-cell contrast of deltas and the 2x2 interaction')
+    ledger.est('RQ3 between-cell delta contrasts and interaction')
+    computed = _rq3_compute(df, opts, metric, gate)
+    rows = computed['pairs']
+    inter = computed['interaction']
+    headroom = computed['headroom']
+    deltas = computed['deltas']
+    for cell, reason in computed['cell_refusals'].items():
+        print(f'  {cell}: no paired delta is computed. {reason}')
+        ledger.refusals.append(f'RQ3 {cell} on {metric}: {reason}')
+    for r in rows:
+        if r.get('status') == 'seeds-differ':
+            ledger.refusals.append(
+                f'RQ3 {r["a"]} vs {r["b"]} on {metric}: the two cells do not '
+                'share one seed set, so the contrast is not computed')
     print(table(rows, ('a', 'b', 'n', 'hl', 'ci_lo', 'ci_hi',
                        'hl_headroom_adj', 'adj_lo', 'adj_hi', 'headroom_a',
                        'headroom_b', 'scales', 'note')))
@@ -3709,111 +4599,79 @@ def sub_rq3(df: pd.DataFrame, opts: Options, ledger: Ledger, metric: str,
                 f'{fmt(r["headroom_b"])}), so the two-scale agreement check of '
                 'ANALYSIS_PLAN.md §3 cannot be met and no wording is licensed')
 
-    inter: dict[str, Any] = {'available': False}
-    want = ['mlp-vanilla', 'mlp-double', 'dueling-vanilla', 'dueling-double']
-    unequal = (len({tuple(sorted(deltas.get(w, {}))) for w in want}) > 1
-               if all(w in deltas and deltas[w] for w in want) else False)
-    if unequal:
+    status = inter.get('status')
+    if status == 'seeds-differ':
         print()
         print('  2x2 interaction: REFUSED. The four cells do not share one '
               'seed set, so the')
         print('  interaction would be computed on the seeds that happen to '
               'appear in all four.')
-        for w in want:
-            print(f'    {w}: seeds {sorted(deltas.get(w, {}))}')
+        for w, seeds in (inter.get('seeds_by_cell') or {}).items():
+            print(f'    {w}: seeds {seeds}')
         print('  A partial arm is refused (DESIGN.md §8.4) and no seed is '
               'dropped after it has')
         print('  run (ANALYSIS_PLAN.md §8).')
         ledger.refusals.append(
             f'RQ3 2x2 interaction on {metric} refused: the four cells do not '
             'share one seed set')
-    elif all(w in deltas and deltas[w] for w in want):
-        common = sorted(set.intersection(*[set(deltas[w]) for w in want]))
-        arch_pairs = {('mlp-vanilla', 'dueling-vanilla'),
-                      ('mlp-double', 'dueling-double')}
-        confounded = any(pr in confounded_pairs for pr in arch_pairs)
-        if any(pr in blocked for pr in arch_pairs):
-            print()
-            print('  2x2 interaction: REFUSED. It mixes both architectures, '
-                  'whose transferred')
-            print('  fractions differ by more than the tolerance, so the '
-                  'interaction would be')
-            print('  confounded with treatment intensity (DESIGN.md §3.1).')
-            ledger.refusals.append('2x2 interaction refused: '
-                                   'intensity-confounded across arch')
-        elif len(common) < MIN_N_FOR_INFERENCE:
-            print(f'  2x2 interaction: n={len(common)}, suppressed.')
+    elif status == 'intensity-blocked':
+        print()
+        print('  2x2 interaction: REFUSED. It mixes both architectures, '
+              'whose transferred')
+        print('  fractions differ by more than the tolerance, so the '
+              'interaction would be')
+        print('  confounded with treatment intensity (DESIGN.md §3.1).')
+        ledger.refusals.append('2x2 interaction refused: '
+                               'intensity-confounded across arch')
+    elif status == 'n-too-small':
+        print(f'  2x2 interaction: n={inter.get("n")}, suppressed.')
+    elif status == 'computed':
+        inter_scales = inter['scales']
+        print()
+        print(f'  2x2 interaction (target_rule effect on delta, dueling '
+              f'minus mlp), n={inter["n"]}:')
+        print(f'    HL {inter["hl"]:+.4f}   95% CI '
+              f'[{inter["ci_lo"]:+.4f}, {inter["ci_hi"]:+.4f}]')
+        print(f'    headroom-adjusted HL {fmt(inter["hl_headroom_adj"])}   '
+              f'95% CI [{fmt(inter["adj_lo"])}, {fmt(inter["adj_hi"])}]   '
+              f'scales: {inter_scales}')
+        if inter_scales == 'agree':
+            print('    ' + phrase_interval_verdict(inter['ci_lo'],
+                                                   inter['ci_hi'],
+                                                   'the interaction'))
         else:
-            mat = np.column_stack([[deltas[w][s] for s in common]
-                                   for w in want])
-
-            def interaction(m: np.ndarray) -> float:
-                # (double - vanilla | dueling) - (double - vanilla | mlp)
-                return hodges_lehmann_paired(
-                    (m[:, 3] - m[:, 2]) - (m[:, 1] - m[:, 0]))
-
-            res = bootstrap_statistic(
-                mat, interaction, opts.n_boot, opts.boot_seed,
-                vec=lambda S: hl_vec((S[..., 3] - S[..., 2])
-                                     - (S[..., 1] - S[..., 0])))
-            hs = [headroom.get(w, float('nan')) for w in want]
-            scales_ok = all(np.isfinite(h) and h > 0 for h in hs)
-            if scales_ok:
-                hh = np.asarray(hs, dtype=float)
-                adj_res = bootstrap_statistic(
-                    mat / hh, interaction, opts.n_boot, opts.boot_seed,
-                    vec=lambda S: hl_vec((S[..., 3] - S[..., 2])
-                                         - (S[..., 1] - S[..., 0])))
-                raw_excl = res['lo'] > 0 or res['hi'] < 0
-                adj_excl = adj_res['lo'] > 0 or adj_res['hi'] < 0
-                inter_scales = 'agree' if raw_excl == adj_excl else 'DISAGREE'
-            else:
-                adj_res = {'estimate': float('nan'), 'lo': float('nan'),
-                           'hi': float('nan')}
-                inter_scales = 'UNAVAILABLE'
-            print()
-            print(f'  2x2 interaction (target_rule effect on delta, dueling '
-                  f'minus mlp), n={len(common)}:')
-            print(f'    HL {res["estimate"]:+.4f}   95% CI '
-                  f'[{res["lo"]:+.4f}, {res["hi"]:+.4f}]')
-            print(f'    headroom-adjusted HL {fmt(adj_res["estimate"])}   '
-                  f'95% CI [{fmt(adj_res["lo"])}, {fmt(adj_res["hi"])}]   '
-                  f'scales: {inter_scales}')
-            if inter_scales == 'agree':
-                print('    ' + phrase_interval_verdict(res['lo'], res['hi'],
-                                                       'the interaction'))
-            else:
-                print('    NO WORDING IS LICENSED for the interaction: the '
-                      'headroom-adjusted scale')
-                print(f'    {"disagrees with" if inter_scales == "DISAGREE" else "does not exist for"} '
-                      'the normalised one, and ANALYSIS_PLAN.md §3 requires '
-                      'agreement')
-                print('    across both scales before an RQ3 statement is '
-                      'made. The interval stands as')
-                print('    an estimate and nothing is said about its '
-                      'direction.')
-                ledger.refusals.append(
-                    f'RQ3 2x2 interaction: two-scale agreement '
-                    f'{inter_scales}, so no wording is licensed '
-                    '(ANALYSIS_PLAN.md §3)')
-            print('    MDE for this contrast is ~2.7 sigma '
-                  '(ANALYSIS_PLAN.md §6), larger than any')
-            print('    plausible effect, so this is an interval by design and '
-                  'carries no p-value.')
-            if opts.allow_intensity_confound and confounded:
-                print('    LABELLED INTENSITY-CONFOUNDED (override in force).')
-            inter = {'available': True, 'n': len(common),
-                     'hl': res['estimate'], 'ci_lo': res['lo'],
-                     'ci_hi': res['hi'],
-                     'hl_headroom_adj': adj_res['estimate'],
-                     'adj_lo': adj_res['lo'], 'adj_hi': adj_res['hi'],
-                     'scales': inter_scales,
-                     'wording_licensed': bool(inter_scales == 'agree'),
-                     'intensity_confounded': bool(confounded)}
+            print('    NO WORDING IS LICENSED for the interaction: the '
+                  'headroom-adjusted scale')
+            print(f'    {"disagrees with" if inter_scales == "DISAGREE" else "does not exist for"} '
+                  'the normalised one, and ANALYSIS_PLAN.md §3 requires '
+                  'agreement')
+            print('    across both scales before an RQ3 statement is '
+                  'made. The interval stands as')
+            print('    an estimate and nothing is said about its '
+                  'direction.')
+            ledger.refusals.append(
+                f'RQ3 2x2 interaction: two-scale agreement '
+                f'{inter_scales}, so no wording is licensed '
+                '(ANALYSIS_PLAN.md §3)')
+        print('    MDE for this contrast is ~2.7 sigma '
+              '(ANALYSIS_PLAN.md §6), larger than any')
+        print('    plausible effect, so this is an interval by design and '
+              'carries no p-value.')
+        if opts.allow_intensity_confound and inter.get('intensity_confounded'):
+            print('    LABELLED INTENSITY-CONFOUNDED (override in force).')
     else:
         print('  2x2 interaction: not all four cells have paired deltas; not '
               'computed.')
-    return {'pairs': rows, 'interaction': inter, 'headroom': headroom}
+    print()
+    print('  DESIGN.md 3.3: nothing above is an RQ3 conclusion on its own. '
+          'A between-cell')
+    print('  contrast is asserted only where the per-cell tuned policy agrees '
+          'with the common')
+    print('  one, and that arbitration is section 9t. What this section '
+          'licenses is wording')
+    print('  under the two-scale check; what 9t licenses is an assertion.')
+    return {'pairs': rows, 'interaction': inter, 'headroom': headroom,
+            'deltas': deltas, 'cell_refusals': computed['cell_refusals']}
 
 
 def sub_rq5(df: pd.DataFrame, opts: Options, ledger: Ledger,
@@ -4853,6 +5711,389 @@ def section_estimation(df: pd.DataFrame, opts: Options, ledger: Ledger,
     return out
 
 
+#: The statement a between-cell contrast licenses under one policy. One
+#: vocabulary for the pairwise contrasts and for the 2x2 interaction, because
+#: the arbitration compares them the same way.
+RQ3_POSITIVE = 'positive'
+RQ3_NEGATIVE = 'negative'
+RQ3_NULL = 'not-distinguishable'
+RQ3_NO_WORDING = 'no-wording-licensed'
+RQ3_NOT_COMPUTED = 'not-computed'
+
+RQ3_STATEMENT_TEXT: dict[str, str] = {
+    RQ3_POSITIVE: 'the interval excludes zero from above',
+    RQ3_NEGATIVE: 'the interval excludes zero from below',
+    RQ3_NULL: 'the interval contains zero',
+    RQ3_NO_WORDING: ('no wording is licensed: the normalised and '
+                     'headroom-adjusted scales do not agree, or the adjusted '
+                     'scale does not exist'),
+    RQ3_NOT_COMPUTED: 'the contrast is not computed',
+}
+
+
+def _interval_statement(lo: Any, hi: Any) -> str:
+    if lo is None or hi is None:
+        return RQ3_NOT_COMPUTED
+    flo, fhi = float(lo), float(hi)
+    if not (np.isfinite(flo) and np.isfinite(fhi)):
+        return RQ3_NOT_COMPUTED
+    if flo > 0:
+        return RQ3_POSITIVE
+    if fhi < 0:
+        return RQ3_NEGATIVE
+    return RQ3_NULL
+
+
+def _rq3_statement(rec: Optional[dict]) -> str:
+    """What one policy's leg licenses about one between-cell contrast.
+
+    The two-scale agreement check of `ANALYSIS_PLAN.md` 3 comes first: a
+    contrast whose scales disagree licenses no wording under that policy, so
+    there is nothing for the other policy to agree or disagree with, and the
+    arbitration reports that rather than comparing two intervals it has just
+    been told not to read directionally.
+    """
+    if not rec or rec.get('status') != 'computed':
+        return RQ3_NOT_COMPUTED
+    if rec.get('scales') != 'agree':
+        return RQ3_NO_WORDING
+    return _interval_statement(rec.get('ci_lo'), rec.get('ci_hi'))
+
+
+def _interaction_statement(inter: Optional[dict]) -> str:
+    if not inter or not inter.get('available'):
+        return RQ3_NOT_COMPUTED
+    if not inter.get('wording_licensed'):
+        return RQ3_NO_WORDING
+    return _interval_statement(inter.get('ci_lo'), inter.get('ci_hi'))
+
+
+def _arbitrate_statements(common: str, tuned: str, evaluable: bool,
+                          reason: str) -> tuple[str, str]:
+    """The verdict for one RQ3 contrast, from the two legs' statements."""
+    if not evaluable:
+        return NOT_EVALUABLE, reason
+    if tuned == RQ3_NOT_COMPUTED:
+        return NOT_EVALUABLE, ('the contrast is not computed under the '
+                               'per-cell tuned policy')
+    if common == RQ3_NOT_COMPUTED:
+        return NOT_EVALUABLE, ('the contrast is not computed under the common '
+                               'configuration, so there is nothing to '
+                               'arbitrate')
+    if RQ3_NO_WORDING in (common, tuned):
+        which = ('both policies license'
+                 if common == tuned == RQ3_NO_WORDING
+                 else ('the common configuration licenses'
+                       if common == RQ3_NO_WORDING
+                       else 'the per-cell tuned policy licenses'))
+        return NOT_EVALUABLE, (f'{which} no wording for this contrast '
+                               f'(ANALYSIS_PLAN.md 3\'s two-scale check), so '
+                               f'no RQ3 conclusion exists to assert')
+    if common == tuned:
+        return AGREES, ''
+    return DISAGREES, (f'under the common configuration '
+                       f'{RQ3_STATEMENT_TEXT[common]}; under the per-cell '
+                       f'tuned policy {RQ3_STATEMENT_TEXT[tuned]}')
+
+
+def _cross_cell_confound(tuned: TunedPolicy, a: str,
+                         b: str) -> tuple[Any, str]:
+    """Whether a tuned-leg contrast between two cells adds a hyperparameter.
+
+    `DESIGN.md` 3.3 makes `lr` invariant WITHIN a cell and deliberately varying
+    ACROSS cells, so under the secondary policy two cells can differ in their
+    learning rate as well as in the factor under study. Returns
+    `(True | False | None, note)`; `None` is "not knowable from these runs".
+    """
+    ca, cb = tuned.config(a), tuned.config(b)
+    keys = ('lr', 'target_update')
+    if not ca or not cb or any(not ca.get(k) or not cb.get(k) for k in keys):
+        return None, ('the configurations of one or both cells are not '
+                      'recorded in these runs, so the extra confound cannot '
+                      'be checked')
+    differing = [k for k in keys if tuple(ca[k]) != tuple(cb[k])]
+    if not differing:
+        return False, (f'both cells were tuned to {_config_text(ca)}, so this '
+                       f'contrast carries no hyperparameter difference beyond '
+                       f'the common policy\'s')
+    return True, (f'{a} at {_config_text(ca)} against {b} at '
+                  f'{_config_text(cb)}: the two cells differ in '
+                  f'{", ".join(differing)} as well as in the factor under '
+                  f'study')
+
+
+def section_arbitration(tuned: Optional[TunedPolicy], opts: Options,
+                        ledger: Ledger, conf: dict,
+                        est_by_metric: dict, gate: list[dict]) -> dict:
+    """9t -- the whole of `DESIGN.md` 3.3's arbitration, RQ2 and RQ3 together.
+
+    `ANALYSIS_PLAN.md` 10 has no slot for this section: its twelve items were
+    written before 3.3's secondary policy had runs behind it, and the plan
+    still describes no place where the two policies are compared. The section
+    is emitted anyway, and its absence from 10 is recorded in 12, because the
+    alternative is a report that satisfies the letter of 10 while omitting the
+    condition 3.3 attaches to its primary conclusion. Section 10 (power) is
+    already in this module on the same footing.
+
+    RQ2's leg is computed in 5d, where it belongs: it is the gate on the eight
+    tests and a reader who stopped at 5a must not be able to miss it. It is
+    restated here so the arbitration can be read in one place.
+    """
+    tuned = tuned if tuned is not None else TunedPolicy()
+    h1('9t. THE DESIGN.md 3.3 ARBITRATION -- COMMON vs PER-CELL-TUNED POLICY')
+    print('  DESIGN.md 3.3 declares two hyperparameter policies and '
+          'pre-registers an')
+    print('  arbitration between them:')
+    print(f'    PRIMARY   {POLICY_NAMES[POLICY_COMMON]}: one lr and '
+          'target-update rule for')
+    print('              all four cells, fixed a priori at lr=5e-4, hard '
+          'update every 1000.')
+    print(f'    SECONDARY {POLICY_NAMES[POLICY_TUNED]}: each cell\'s own '
+          'E3-selected')
+    print('              configuration, run as registry E1t/E2t at the same '
+          'CONFIRM seeds.')
+    print('    RULE      an RQ2 or RQ3 conclusion is asserted ONLY where both '
+          'hold. Where')
+    print('              they disagree, that disagreement IS the finding and '
+          'is reported as')
+    print('              one: it is not averaged away and neither leg is '
+          'preferred.')
+    print()
+    print('  This section is not in ANALYSIS_PLAN.md 10\'s list of twelve. '
+          'That list predates')
+    print('  the secondary policy having any runs behind it, and the omission '
+          'is recorded in')
+    print('  12 rather than resolved by leaving the arbitration out.')
+
+    # -- where the second leg is -------------------------------------------
+    h2('9t-a. the second leg: which cells have tuned arms')
+    arb2 = (conf or {}).get('arbitration') or {}
+    cell_rows = arb2.get('cells') or [
+        {'cell': c, 'tuned_arms': tuned.state(c), 'runs': 0,
+         'trained_at': '-', 'selected': '-', 'shares_common_runs': False}
+        for c in CELL_ORDER]
+    print(table(cell_rows, ('cell', 'tuned_arms', 'runs', 'trained_at',
+                            'selected', 'shares_common_runs')))
+    print('  own-runs  the cell\'s selection differs from the a priori '
+          'configuration, so its')
+    print('            tuned arms are their own runs under their own '
+          'tuned- labels.')
+    print('  shared    the selection equals the a priori configuration, so '
+          'the tuned arms\'')
+    print('            run digests are identical and the two legs are the '
+          'SAME RUNS. They')
+    print('            agree by construction; that is a fact about the '
+          'selection, not a')
+    print('            replication, and it is what makes the tuned stage an '
+          'upper bound on')
+    print('            cost rather than a doubling.')
+    print('  absent    no tuned run. The arbitration is NOT EVALUABLE and '
+          'nothing is asserted.')
+    for cell in CELL_ORDER:
+        if tuned.state(cell) == 'absent' and tuned.reason(cell):
+            print(f'    {cell}: {tuned.reason(cell)}')
+
+    # -- RQ2 ----------------------------------------------------------------
+    h2('9t-b. RQ2 -- the within-cell delta under both policies')
+    rq2_rows = arb2.get('rows') or []
+    if rq2_rows:
+        print(table(rq2_rows, ('metric', 'cell', 'tuned_arms', 'hl_common',
+                               'hl_tuned', 'conclusion_common',
+                               'conclusion_tuned', 'verdict', 'assertable')))
+        print('  Computed in 5d, restated here. The tuned leg is the same '
+              'eight hypotheses')
+        print('  through the same code, Holm-adjusted over the same '
+              'pre-registered family of')
+        print(f'  {CONFIRMATORY_FAMILY_SIZE}; it adds no member to the family '
+              'and none to the ledger.')
+    else:
+        print('  (no confirmatory member was computed, so there is nothing '
+              'to arbitrate)')
+
+    # -- RQ3 ----------------------------------------------------------------
+    h2('9t-c. RQ3 -- the between-cell contrasts under both policies')
+    print('  UNDER THE SECONDARY POLICY EVERY CROSS-CELL CONTRAST CARRIES AN '
+          'EXTRA CONFOUND.')
+    print('  DESIGN.md 3.3 makes lr invariant WITHIN a cell and deliberately '
+          'varying ACROSS')
+    print('  cells, so two cells compared under that policy differ in the '
+          'factor under study')
+    print('  AND in their learning rate. The tuned leg is therefore not a '
+          'cleaner version of')
+    print('  the common-leg contrast; it is a different and more confounded '
+          'one, and it is')
+    print('  here only to say whether the common-leg statement survives it. '
+          'Where two cells')
+    print('  selected the same configuration the extra confound is absent, '
+          'and the confound')
+    print('  column below says which pairs those are.')
+
+    tuned_frame = tuned.frame()
+    rq3: dict[str, Any] = {}
+    for metric in sorted(est_by_metric):
+        common_rq3 = (est_by_metric.get(metric) or {}).get('rq3') or {}
+        h2(f'9t-c({metric}). between-cell contrasts on {metric}')
+        if tuned.available:
+            # The intensity gate is a property of arch and protocol -- the
+            # transferred-parameter fraction -- and not of the learning rate,
+            # so the gate computed in 2 for the common policy governs the
+            # tuned leg unchanged. It is passed in rather than recomputed so
+            # the two legs cannot be blocked on different grounds.
+            tuned_rq3 = _rq3_compute(tuned_frame, opts, metric, gate)
+        else:
+            tuned_rq3 = {'pairs': [], 'interaction': {'available': False,
+                                                      'status': 'absent'},
+                         'headroom': {}, 'deltas': {}, 'cell_refusals': {}}
+        common_pairs = {(r['a'], r['b']): r
+                        for r in (common_rq3.get('pairs') or [])}
+        tuned_pairs = {(r['a'], r['b']): r for r in tuned_rq3['pairs']}
+        rows = []
+        for a, b in combinations(CELL_ORDER, 2):
+            cr = common_pairs.get((a, b))
+            tr = tuned_pairs.get((a, b))
+            evaluable = (tuned.state(a) != 'absent'
+                         and tuned.state(b) != 'absent')
+            reason = '; '.join(
+                f'{c}: no tuned arms' for c in (a, b)
+                if tuned.state(c) == 'absent') or ''
+            c_stmt = _rq3_statement(cr)
+            t_stmt = _rq3_statement(tr) if evaluable else RQ3_NOT_COMPUTED
+            verdict, why = _arbitrate_statements(c_stmt, t_stmt, evaluable,
+                                                 reason)
+            confound, cnote = _cross_cell_confound(tuned, a, b)
+            assertable = bool(verdict == AGREES
+                              and c_stmt not in (RQ3_NOT_COMPUTED,
+                                                 RQ3_NO_WORDING)
+                              and not tuned.assertion_block)
+            rows.append({
+                'a': a, 'b': b, 'metric': metric,
+                'hl_common': (cr or {}).get('hl'),
+                'hl_tuned': (tr or {}).get('hl'),
+                'statement_common': c_stmt, 'statement_tuned': t_stmt,
+                'verdict': verdict, 'assertable': assertable,
+                'cross_cell_confound': confound,
+                'confound_note': cnote, 'why': why,
+            })
+            ledger.arbitration.append(
+                f'RQ3 {metric} {a} vs {b}: {verdict}'
+                + (f' ({why})' if why else ''))
+        print(table(rows, ('a', 'b', 'hl_common', 'hl_tuned',
+                           'statement_common', 'statement_tuned', 'verdict',
+                           'assertable', 'cross_cell_confound')))
+        for r in rows:
+            if r['verdict'] == DISAGREES:
+                print(f'  {r["a"]} vs {r["b"]}: THE TWO POLICIES DISAGREE. '
+                      f'{r["why"]}.')
+                print('    That disagreement is the finding for this pair '
+                      '(DESIGN.md 3.3); no RQ3')
+                print('    conclusion is asserted and neither leg is '
+                      'preferred.')
+                ledger.refusals.append(
+                    f'RQ3 {metric} {r["a"]} vs {r["b"]}: the '
+                    f'common and per-cell tuned policies DISAGREE, so no '
+                    f'conclusion is asserted; the disagreement is the finding')
+            if r['cross_cell_confound']:
+                print(f'  {r["a"]} vs {r["b"]}: tuned-leg confound -- '
+                      f'{r["confound_note"]}.')
+
+        c_inter = (common_rq3.get('interaction') or {})
+        t_inter = (tuned_rq3.get('interaction') or {})
+        evaluable = all(tuned.state(c) != 'absent' for c in CELL_ORDER)
+        c_stmt = _interaction_statement(c_inter)
+        t_stmt = (_interaction_statement(t_inter) if evaluable
+                  else RQ3_NOT_COMPUTED)
+        verdict, why = _arbitrate_statements(
+            c_stmt, t_stmt, evaluable,
+            'not every cell has tuned arms, so the 2x2 interaction cannot be '
+            'computed under the secondary policy')
+        inter_row = {
+            'metric': metric,
+            'hl_common': c_inter.get('hl'), 'hl_tuned': t_inter.get('hl'),
+            'statement_common': c_stmt, 'statement_tuned': t_stmt,
+            'verdict': verdict,
+            'assertable': bool(verdict == AGREES
+                               and c_stmt not in (RQ3_NOT_COMPUTED,
+                                                  RQ3_NO_WORDING)
+                               and not tuned.assertion_block),
+            'why': why,
+        }
+        print()
+        print(f'  2x2 interaction: common {c_stmt}, tuned {t_stmt} -> '
+              f'{verdict}'
+              + (f'  ({why})' if why else ''))
+        print('  The interaction mixes all four cells, so under the secondary '
+              'policy it mixes')
+        print('  up to four learning rates as well. It is an interval by '
+              'design (MDE ~2.7')
+        print('  sigma, ANALYSIS_PLAN.md 6) and carries no p-value under '
+              'either policy.')
+        ledger.arbitration.append(
+            f'RQ3 {metric} 2x2 interaction: {verdict}'
+            + (f' ({why})' if why else ''))
+        rq3[metric] = {'pairs': rows, 'interaction': inter_row}
+
+    # -- what may be asserted ----------------------------------------------
+    h2('9t-d. what DESIGN.md 3.3 permits this report to assert')
+    rq2_ok = [r for r in rq2_rows if r.get('assertable')]
+    rq3_ok = [r for m in rq3 for r in rq3[m]['pairs'] if r.get('assertable')]
+    rq3_ok += [rq3[m]['interaction'] for m in rq3
+               if rq3[m]['interaction'].get('assertable')]
+    rq2_dis = [r for r in rq2_rows if r.get('verdict') == DISAGREES]
+    rq3_dis = [r for m in rq3 for r in rq3[m]['pairs']
+               if r.get('verdict') == DISAGREES]
+    rq3_dis += [rq3[m]['interaction'] for m in rq3
+                if rq3[m]['interaction'].get('verdict') == DISAGREES]
+    print(f'  RQ2 conclusions assertable   : {len(rq2_ok)} of '
+          f'{len(rq2_rows)}')
+    print(f'  RQ3 statements assertable    : {len(rq3_ok)}')
+    print(f'  disagreements, REPORTED as findings : {len(rq2_dis)} on RQ2, '
+          f'{len(rq3_dis)} on RQ3')
+    if not rq2_ok and not rq3_ok:
+        print()
+        print('  ' + '*' * 70)
+        print('  NOTHING IS ASSERTED FOR RQ2 OR RQ3 IN THIS REPORT.')
+        if not tuned.available:
+            print('  The per-cell tuned policy has no runs in the analysis '
+                  'set, so the second leg')
+            print('  of the pre-registered arbitration does not exist and no '
+                  'conclusion of either')
+            print('  question clears DESIGN.md 3.3. Numbers above are '
+                  'estimates under the common')
+            print('  configuration alone and are labelled as such.')
+        elif tuned.assertion_block:
+            print(f'  {tuned.assertion_block}.')
+        else:
+            print('  Every contrast either disagrees across the two policies '
+                  'or licenses no')
+            print('  wording under at least one of them. The disagreements '
+                  'above are the finding.')
+        print('  ' + '*' * 70)
+    else:
+        for r in rq2_ok:
+            print(f'  RQ2 {r["metric"]}/{r["cell"]}: '
+                  f'{CONCLUSION_TEXT[r["conclusion_common"]]}, and it holds '
+                  'under both policies.')
+        for r in rq3_ok:
+            name = (f'{r["a"]} vs {r["b"]}' if 'a' in r else '2x2 interaction')
+            print(f'  RQ3 {r["metric"]} {name}: '
+                  f'{RQ3_STATEMENT_TEXT[r["statement_common"]]}, under both '
+                  'policies'
+                  + ('. NOTE the tuned leg also varies lr across these cells'
+                     if r.get('cross_cell_confound') else ''))
+    return {'policies': dict(POLICY_NAMES),
+            'selection': arb2.get('selection') or {},
+            'cells': cell_rows,
+            'rq2': rq2_rows,
+            'rq3': rq3,
+            'counts': {'rq2_assertable': len(rq2_ok),
+                       'rq3_assertable': len(rq3_ok),
+                       'rq2_disagreements': len(rq2_dis),
+                       'rq3_disagreements': len(rq3_dis),
+                       'tuned_cells': list(tuned.evaluable_cells)},
+            'family_size_unchanged': CONFIRMATORY_FAMILY_SIZE,
+            'adds_family_members': 0}
+
+
 def section_power(df: pd.DataFrame, conf: dict, opts: Options,
                   ledger: Ledger) -> dict:
     """§10.10 -- power and minimum detectable effects, at the observed SDs.
@@ -5025,6 +6266,52 @@ def section_ledger(ledger: Ledger, conf: dict) -> dict:
     print(f'  refusals                             : {len(ledger.refusals)}')
     for name in ledger.refusals:
         print(f'    {name}')
+    print(f'  DESIGN.md 3.3 arbitration entries    : '
+          f'{len(ledger.arbitration)}')
+    for name in ledger.arbitration:
+        print(f'    {name}')
+    print()
+    # The guarantee, computed rather than asserted in prose. The arbitration
+    # re-tests the SAME hypotheses under the secondary policy, so the family
+    # must still be the pre-registered eight and every member of it must have
+    # come from the common policy. If either fails, the multiplicity ledger is
+    # wrong and 12 says so, which is the only honest place for it.
+    members = (conf or {}).get('members') or []
+    foreign = [m for m in members
+               if m.get('policy') not in (None, POLICY_COMMON)]
+    accounted = len(ledger.confirmatory) + len(ledger.suppressed)
+    print(f'  family members emitted               : {len(members)} of '
+          f'{CONFIRMATORY_FAMILY_SIZE} (a --metric restriction lowers')
+    print('                                         this; the family size is '
+          'a constant)')
+    print(f'  members contributed by the tuned leg : {len(foreign)} '
+          '(must be 0)')
+    print(f'  members accounted for in this ledger : {accounted} '
+          f'(computed {len(ledger.confirmatory)} + suppressed '
+          f'{len(ledger.suppressed)})')
+    ledger_ok = (not foreign
+                 and len(members) <= CONFIRMATORY_FAMILY_SIZE
+                 and accounted == len(members))
+    if ledger_ok:
+        print('  The DESIGN.md 3.3 arbitration is a CONJUNCTION over these '
+              'same members, not a')
+        print('  second family: "both policies reject" has as its rejection '
+              'region the')
+        print('  intersection of the two legs\', which is never larger '
+              'than either, so the FWER')
+        print(f'  stays bounded by Holm over {CONFIRMATORY_FAMILY_SIZE}. Its '
+              'entries are listed above and counted')
+        print('  separately, and none of them is a family member.')
+    else:
+        print('  LEDGER INVARIANT FAILED: the confirmatory family is not the '
+              'pre-registered')
+        print('  set. See 12.')
+        ledger.deviations.append(
+            f'multiplicity ledger invariant failed: {len(members)} family '
+            f'member(s) of which {len(foreign)} did not come from the common '
+            f'policy, and {accounted} accounted for in the ledger. '
+            f'ANALYSIS_PLAN.md 7 fixes the family at '
+            f'{CONFIRMATORY_FAMILY_SIZE} before launch')
     print()
     print('  Holm step-down thresholds for the family of '
           f'{CONFIRMATORY_FAMILY_SIZE}:')
@@ -5041,6 +6328,10 @@ def section_ledger(ledger: Ledger, conf: dict) -> dict:
             'suppressed_outside_family': ledger.other_suppressed,
             'estimation_only': ledger.estimation,
             'refusals': ledger.refusals,
+            'arbitration': ledger.arbitration,
+            'family_members_emitted': len(members),
+            'family_members_from_tuned_leg': len(foreign),
+            'family_size_invariant_ok': bool(ledger_ok),
             'screen_q_count': len(ledger.screen_q)}
 
 
@@ -5072,6 +6363,14 @@ def section_deviations(ledger: Ledger, stamped: bool) -> dict:
     print('    - §3 asks for Brown-Forsythe "for continuity" while forbidding '
           'a dispersion')
     print('      p-value. W is emitted, the p-value is withheld.')
+    print('    - DESIGN.md 3.3 requires an arbitration between the two '
+          'hyperparameter')
+    print('      policies before an RQ2 or RQ3 conclusion is asserted, and '
+          'ANALYSIS_PLAN.md')
+    print('      10\'s list of twelve reported items has no slot for it. The '
+          'arbitration is')
+    print('      emitted as 5d and 9t rather than omitted to keep the list at '
+          'twelve.')
     print('    - §7 permits Benjamini-Hochberg q for screens, which requires '
           'p-values; that')
     print('      is the one declared exception to "no p-value outside the '
@@ -5101,6 +6400,239 @@ def section_deviations(ledger: Ledger, stamped: bool) -> dict:
 #    trusted; the statistical primitives are checked against values that can be
 #    verified by hand.
 # ===========================================================================
+
+def _arbitration_fixture(deltas: dict, *, prefix: str = '',
+                         lr: float = 5e-4, target_update: str = 'hard',
+                         experiments: str = 'E1;E2',
+                         seeds: Sequence[int] = tuple(range(10)),
+                         base: float = 0.40) -> pd.DataFrame:
+    """A minimal two-arm frame per cell, for the arbitration self-tests.
+
+    Only the columns the arm selectors read. `deltas` maps a cell to the
+    transfer-minus-scratch shift the fixture puts there, so a leg that should
+    conclude an effect and a leg that should conclude nothing are the same
+    code with different numbers.
+    """
+    rows = []
+    for cell in CELL_ORDER:
+        arch, rule = cell.split('-')
+        for cond, stem in (('scratch', 'scratch'), ('transfer', 'transfer')):
+            for seed in seeds:
+                shift = deltas[cell] if cond == 'transfer' else 0.0
+                if isinstance(shift, (list, tuple)):
+                    shift = shift[seed % len(shift)]
+                value = (base + 0.02 * CELL_ORDER.index(cell)
+                         + 0.01 * (seed % 4) + shift)
+                rows.append({
+                    'label': f'{prefix}{stem}-{cell}', 'arm': f'{stem}-{cell}',
+                    'experiments': experiments, 'arch': arch,
+                    'target_rule': rule, 'condition': cond, 'cell': cell,
+                    'env': registry.TARGET_ENV,
+                    'source_env': ('' if cond == 'scratch'
+                                   else registry.SOURCE_ENV),
+                    'seed': seed, 'seed_block': 'CONFIRM',
+                    'transfer_set': registry.PROTOCOL['transfer_set'],
+                    'input_policy': registry.PROTOCOL['input_policy'],
+                    'head_policy': registry.PROTOCOL['head_policy'],
+                    'freeze_group': registry.PROTOCOL['freeze_group'],
+                    'freeze_updates': registry.PROTOCOL['freeze_updates'],
+                    'lr': lr, 'target_update': target_update,
+                    'final_score': value, 'auc_score': value * 0.8,
+                    'run_dir': f'{prefix}{stem}-{cell}/seed{seed}',
+                    'plan_hash': '0' * 32})
+    return pd.DataFrame(rows)
+
+
+def _arbitration_self_test() -> list[tuple[str, bool, str]]:
+    """Assertions on `DESIGN.md` 3.3's arbitration, both states.
+
+    The first block is the defect this section closes: with no tuned runs the
+    common policy can be Holm-significant in all eight members and NOTHING may
+    be asserted. Before the arbitration existed, that state printed eight
+    confirmed effects.
+    """
+    out: list[tuple[str, bool, str]] = []
+
+    def add(name: str, cond: bool, detail: str = '') -> None:
+        out.append((name, bool(cond), detail))
+
+    opts = Options(per_seed='<fixture>', metrics=CONFIRMATORY_ENDPOINTS,
+                   experiments=None, target_env=registry.TARGET_ENV,
+                   source_env=registry.SOURCE_ENV,
+                   interface_env=registry.INTERFACE_ENV,
+                   allow_intensity_confound=False, source_policy='valid',
+                   n_boot=200, boot_seed=BOOT_SEED, json_out=None)
+    effect = {c: 0.15 for c in CELL_ORDER}
+    null = {c: (0.02, -0.02) for c in CELL_ORDER}
+    common = _arbitration_fixture(effect)
+    tuned_same = _arbitration_fixture(effect, prefix=TUNED_LABEL_PREFIX,
+                                      lr=1e-3, experiments='E1t;E2t')
+    tuned_null = _arbitration_fixture(null, prefix=TUNED_LABEL_PREFIX,
+                                      lr=1e-3, experiments='E1t;E2t')
+
+    # -- the two policies are separated by label, and only by label ---------
+    both = pd.concat([common, tuned_same], ignore_index=True)
+    add('the common policy keeps every row that is not tuned-labelled',
+        len(common_policy_rows(both)) == len(common),
+        f'{len(common_policy_rows(both))} vs {len(common)}')
+    add('the tuned policy is exactly the tuned-labelled rows',
+        len(tuned_policy_rows(both)) == len(tuned_same))
+    add('a shared run belongs to both policies',
+        len(common_policy_rows(common)) == len(common)
+        and bool(claims_tuned_experiment(tuned_same).all()))
+
+    def leg(frame: pd.DataFrame) -> TunedPolicy:
+        tp = TunedPolicy()
+        for cell in CELL_ORDER:
+            tp.frames[cell] = frame[frame['cell'] == cell]
+            tp.cells[cell] = {'cell': cell, 'state': 'own-runs', 'reason': '',
+                              'rows': int(len(tp.frames[cell])),
+                              'config': _config_summary(tp.frames[cell], opts),
+                              'config_text': '', 'shares_common_runs': False}
+        return tp
+
+    def family(frame: pd.DataFrame, tp: Optional[TunedPolicy]):
+        ledger = Ledger()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            conf = section_confirmatory(frame, opts, ledger, tuned=tp)
+        return conf, ledger, buf.getvalue()
+
+    # -- 1. no tuned runs: significant under one policy, asserted by none ---
+    conf, ledger, text = family(common, None)
+    members = conf['members']
+    add('the fixture is Holm-significant in all eight members under the '
+        'common policy',
+        len(members) == CONFIRMATORY_FAMILY_SIZE
+        and all(m.get('significant_holm') for m in members),
+        str([m.get('p_holm') for m in members]))
+    add('with no tuned runs NO member is asserted',
+        not any(m.get('asserted') for m in members))
+    add('with no tuned runs every verdict is not-evaluable',
+        all(m.get('arbitration_verdict') == NOT_EVALUABLE for m in members))
+    add('with no tuned runs the report says so in words',
+        'NO RQ2 CONCLUSION IS ASSERTED' in text)
+
+    # -- 2. the family stays eight whatever the second leg does ------------
+    add('the family is eight members and eight ledger entries',
+        len(members) == CONFIRMATORY_FAMILY_SIZE
+        and len(ledger.confirmatory) + len(ledger.suppressed)
+        == CONFIRMATORY_FAMILY_SIZE,
+        f'{len(members)}, {len(ledger.confirmatory)}, '
+        f'{len(ledger.suppressed)}')
+    add('no member of the family came from the tuned leg',
+        all(m.get('policy') == POLICY_COMMON for m in members))
+
+    conf2, ledger2, text2 = family(common, leg(tuned_same))
+    add('running the second leg adds no family member',
+        len(conf2['members']) == CONFIRMATORY_FAMILY_SIZE
+        and len(ledger2.confirmatory) == CONFIRMATORY_FAMILY_SIZE
+        and conf2['arbitration']['adds_family_members'] == 0,
+        f'{len(conf2["members"])}, {len(ledger2.confirmatory)}')
+    add('running the second leg adds no ledger entry to the family',
+        len(ledger2.confirmatory) == len(ledger.confirmatory)
+        and len(ledger2.suppressed) == len(ledger.suppressed))
+    add('the arbitration keeps its own count, apart from the family',
+        len(ledger2.arbitration) == CONFIRMATORY_FAMILY_SIZE
+        and len(ledger.arbitration) == CONFIRMATORY_FAMILY_SIZE)
+
+    # -- 3. agreement, and its consequence ---------------------------------
+    add('two legs that conclude the same thing AGREE',
+        all(r['verdict'] == AGREES for r in conf2['arbitration']['rows']),
+        str([r['verdict'] for r in conf2['arbitration']['rows']]))
+    add('an agreeing verdict makes the conclusion assertable',
+        all(r['assertable'] for r in conf2['arbitration']['rows']))
+
+    # -- 4. disagreement is a finding, not a suppression -------------------
+    conf3, ledger3, text3 = family(common, leg(tuned_null))
+    rows3 = conf3['arbitration']['rows']
+    add('a second leg that concludes nothing DISAGREES',
+        all(r['verdict'] == DISAGREES for r in rows3),
+        str([r['verdict'] for r in rows3]))
+    add('a disagreement asserts nothing',
+        not any(r['assertable'] for r in rows3)
+        and not any(m.get('asserted') for m in conf3['members']))
+    add('a disagreement is REPORTED, in words, as the finding',
+        'THE TWO POLICIES DISAGREE' in text3
+        and 'that disagreement IS the' in text3)
+    add('a disagreement reaches the ledger as a refusal',
+        sum(1 for r in ledger3.refusals if 'DISAGREE' in r)
+        == CONFIRMATORY_FAMILY_SIZE, str(len(ledger3.refusals)))
+    add('the common leg is unchanged by what the tuned leg found',
+        [repr(m.get('hl')) for m in conf3['members']]
+        == [repr(m.get('hl')) for m in members])
+
+    # -- 5. a shared cell is the same runs, so its legs are identical ------
+    shared = TunedPolicy()
+    for cell in CELL_ORDER:
+        shared.frames[cell] = common[common['cell'] == cell]
+        shared.cells[cell] = {'cell': cell, 'state': 'shared', 'reason': '',
+                              'rows': int(len(shared.frames[cell])),
+                              'config': _config_summary(shared.frames[cell],
+                                                        opts),
+                              'config_text': '', 'shares_common_runs': True}
+    conf4, ledger4, _ = family(common, shared)
+    tuned_recs = {(m['metric'], m['cell']): m
+                  for m in conf4['arbitration']['tuned_members']}
+    base_recs = {(m['metric'], m['cell']): m for m in conf4['members']}
+    add('a cell that shares its runs produces an identical second leg',
+        all(repr(tuned_recs[k].get('hl')) == repr(base_recs[k].get('hl'))
+            and repr(tuned_recs[k].get('p_signflip'))
+            == repr(base_recs[k].get('p_signflip')) for k in base_recs))
+    add('a cell that shares its runs agrees with itself',
+        all(r['verdict'] == AGREES
+            for r in conf4['arbitration']['rows']))
+
+    # -- 6. the verdict function, at its boundaries ------------------------
+    add('two rejections in opposite directions do NOT agree',
+        _arbitrate(CONCLUSION_UP, CONCLUSION_DOWN, True, '')[0] == DISAGREES)
+    add('two nulls agree',
+        _arbitrate(CONCLUSION_NULL, CONCLUSION_NULL, True, '')[0] == AGREES)
+    add('a suppressed second leg is not-evaluable, never agreement',
+        _arbitrate(CONCLUSION_UP, CONCLUSION_NONE, True, '')[0]
+        == NOT_EVALUABLE)
+    add('an absent second leg is not-evaluable',
+        _arbitrate(CONCLUSION_UP, CONCLUSION_UP, False, 'no runs')[0]
+        == NOT_EVALUABLE)
+    add('a Holm-significant member with no direction has no conclusion',
+        _member_conclusion({'p_holm': 0.001, 'significant_holm': True,
+                            'hl': 0.0, 'mean_delta': 0.0})
+        == CONCLUSION_NONE)
+
+    # -- 7. RQ3's statement and its two-scale gate -------------------------
+    add('an RQ3 interval that excludes zero from above is positive',
+        _rq3_statement({'status': 'computed', 'scales': 'agree',
+                        'ci_lo': 0.1, 'ci_hi': 0.4}) == RQ3_POSITIVE)
+    add('an RQ3 contrast whose scales disagree licenses no wording',
+        _rq3_statement({'status': 'computed', 'scales': 'DISAGREE',
+                        'ci_lo': 0.1, 'ci_hi': 0.4}) == RQ3_NO_WORDING)
+    add('a contrast licensing no wording is not-evaluable, not agreement',
+        _arbitrate_statements(RQ3_NO_WORDING, RQ3_NO_WORDING, True, '')[0]
+        == NOT_EVALUABLE)
+    add('two RQ3 legs pointing opposite ways DISAGREE',
+        _arbitrate_statements(RQ3_POSITIVE, RQ3_NEGATIVE, True, '')[0]
+        == DISAGREES)
+
+    # -- 8. the cross-cell confound the secondary policy introduces --------
+    mixed = leg(tuned_same)
+    mixed.cells['mlp-vanilla']['config'] = {'lr': ('0.0005',),
+                                            'target_update': ('hard',)}
+    mixed.cells['mlp-double']['config'] = {'lr': ('0.001',),
+                                           'target_update': ('hard',)}
+    flag, note = _cross_cell_confound(mixed, 'mlp-vanilla', 'mlp-double')
+    add('a cross-cell contrast at two learning rates is flagged confounded',
+        flag is True and 'lr' in note, note)
+    mixed.cells['mlp-double']['config'] = {'lr': ('0.0005',),
+                                           'target_update': ('hard',)}
+    flag2, note2 = _cross_cell_confound(mixed, 'mlp-vanilla', 'mlp-double')
+    add('two cells tuned to the same configuration carry no extra confound',
+        flag2 is False, note2)
+    flag3, _ = _cross_cell_confound(TunedPolicy(), 'mlp-vanilla',
+                                    'mlp-double')
+    add('an unknown configuration is not reported as "no confound"',
+        flag3 is None)
+    return out
+
 
 def self_test() -> int:
     """Assertions on the primitives and on every directional phrase."""
@@ -5345,6 +6877,10 @@ def self_test() -> int:
               ('effective_rank', 'stable_rank', 'param_norm_total',
                'param_norm_trunk', 'q_max')))
 
+    h2('the DESIGN.md 3.3 arbitration')
+    for name, cond, detail in _arbitration_self_test():
+        check(name, cond, detail)
+
     h2('the estimators against statlib.py')
     prim = verify_primitives_against_statlib(n_boot=500)
     if prim['ran']:
@@ -5466,6 +7002,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--overrides', nargs='*', default=None,
                    help='launch-level overrides that were in force, as '
                         'field=value, passed through to audit.py')
+    p.add_argument('--selection', dest='selection_path', default=None,
+                   help='path to the DESIGN.md 3.3 tuning-selection artifact. '
+                        'Defaults to the one stored under the run tree '
+                        '(_jobs/tuning_selection.json), which is where '
+                        'tuning.py writes it and where registry.py enumerates '
+                        'the tuned arms from. Read only, never written, and '
+                        'its content address is re-verified on every read')
     p.add_argument('--no-mde-verify', action='store_true',
                    help='skip re-deriving the ANALYSIS_PLAN.md §6.2 MDE '
                         'multipliers with statlib. The pre-registered values '
@@ -5508,7 +7051,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         override_audit=bool(args.allow_audit_failure),
         audit_seeds=args.seeds,
         audit_overrides=tuple(args.overrides) if args.overrides else (),
-        verify_mde=not args.no_mde_verify)
+        verify_mde=not args.no_mde_verify,
+        selection_path=args.selection_path or '')
     ledger = Ledger()
 
     try:
@@ -5544,6 +7088,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     opts.tune_runs_excluded = n_tune
     opts.tune_seeds_excluded = tune_seeds
 
+    # DESIGN.md 3.3's secondary policy is a SECOND LEG, not extra rows in the
+    # first. A cell whose tuned configuration differs from the a priori one
+    # has two runs per (condition, seed) in this table -- one per policy --
+    # and leaving them together would give every arm two rows for every seed,
+    # which `arm_by_seed` refuses as ambiguous and which would suppress the
+    # entire confirmatory family the moment the tuned stage was run. The tuned
+    # rows are therefore set aside here and analysed in 5d and 9t as the leg
+    # they are. A SHARED run stays in both: it is one run that both policies
+    # declare, and removing it would delete the common-policy arm.
+    tuned_rows_all = tuned_policy_rows(df)
+    df = common_policy_rows(df)
+    opts.tuned_rows_set_aside = int(len(tuned_rows_all))
+    if not len(df) and len(tuned_rows_all):
+        # A selection of tuned arms alone. The arbitration is a comparison
+        # between two policies, so a report over the second leg by itself is
+        # not the secondary analysis: it is the first leg missing, and every
+        # verdict in it would be not-evaluable for a reason that is an
+        # artefact of the invocation rather than of the data.
+        print(f'stats.py: all {len(tuned_rows_all)} selected row(s) are '
+              f'tuned arms of the secondary policy of DESIGN.md 3.3, and '
+              f'none is a common-policy run. That section arbitrates BETWEEN '
+              f'the two policies, so a report on one of them alone is not '
+              f'produced. Select the common-policy experiments as well (E1, '
+              f'E2 beside E1t, E2t), or drop --experiments.')
+        return 1
+
     report: dict[str, Any] = {'invocation': {
         'argv': list(sys.argv), 'cwd': os.getcwd(),
         'per_seed': opts.per_seed, 'experiments': opts.experiments,
@@ -5553,10 +7123,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         'allow_intensity_confound': opts.allow_intensity_confound,
         'override_audit': opts.override_audit,
         'tune_runs_excluded': n_tune,
-        'tune_seeds_excluded': list(tune_seeds)}}
+        'tune_seeds_excluded': list(tune_seeds),
+        'tuned_rows_set_aside': opts.tuned_rows_set_aside,
+        'selection_path': opts.selection_path}}
 
-    print('stats.py -- executing ANALYSIS_PLAN.md §10, sections 1-12')
+    print('stats.py -- executing ANALYSIS_PLAN.md §10, sections 1-12, '
+          'plus the DESIGN.md 3.3')
+    print('  arbitration (5d and 9t), which §10\'s list has no slot for')
     print(f'  invocation: {" ".join(sys.argv)}')
+    if opts.tuned_rows_set_aside:
+        print(f'  {opts.tuned_rows_set_aside} run(s) carry a '
+              f'{TUNED_LABEL_PREFIX!r} arm label and are the SECONDARY policy '
+              'of DESIGN.md 3.3.')
+        print('  They are set aside from the primary analysis set and '
+              'analysed in 5d and 9t as')
+        print('  the second leg of the arbitration, never pooled into the '
+              'first.')
 
     # §10.1 first, and it is a gate: "If the audit fails, nothing below is
     # emitted without an explicit override that is stamped into the output."
@@ -5639,12 +7221,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             'analysis set is POOLED OVER SOURCE COMPETENCE (DESIGN.md §4.3 '
             'secondary), not the primary valid-sources-only estimand')
 
+    # The second leg of DESIGN.md 3.3's arbitration, resolved once and passed
+    # down, so 5d and 9t cannot disagree about which runs it is. The
+    # source-validity filter of 4.3 applies to it exactly as to the primary
+    # set: a tuned transfer arm drawn from a source that never learned is
+    # outside the primary estimand under either policy.
+    tuned_analysis = tuned_rows_all
+    if (opts.source_policy == 'valid'
+            and 'source_valid' in tuned_rows_all.columns):
+        tuned_analysis = tuned_rows_all[
+            tuned_rows_all['source_valid'] != False]
+    tuned_policy = resolve_tuned_policy(analysis, tuned_analysis, opts, ledger)
+    # Not a numbered section: a record of WHICH runs the second leg is,
+    # resolved once before any section runs, so 5d and 9t cannot
+    # disagree about it and a reader can check the resolution itself.
+    report['tuned_policy'] = {
+        'policy': TUNED_POLICY_NAME,
+        'rows_set_aside': opts.tuned_rows_set_aside,
+        'rows_in_analysis_set': int(len(tuned_analysis)),
+        'cells': {c: {k: v
+                      for k, v in (tuned_policy.cells.get(c) or {}).items()
+                      if k != 'config'}
+                  for c in CELL_ORDER},
+        'evaluable_cells': list(tuned_policy.evaluable_cells),
+        'selection_readable': tuned_policy.selection is not None,
+        'selection_note': tuned_policy.selection_note,
+        'assertion_block': tuned_policy.assertion_block,
+        'notes': list(tuned_policy.notes)}
+
     primary_metric = opts.metrics[0]
     report['s3_descriptives'] = {
         m: section_descriptives(analysis, opts, ledger, m)
         for m in opts.metrics}
     report['s4_convergence'] = section_convergence(analysis, opts, ledger)
-    conf = section_confirmatory(analysis, opts, ledger)
+    conf = section_confirmatory(analysis, opts, ledger,
+                                tuned=tuned_policy)
     report['s5_confirmatory'] = conf
     report['s6_equivalence'] = section_equivalence(conf, analysis, opts, ledger)
     report['s7_controls'] = {
@@ -5663,6 +7274,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report['s8_c4_by_metric'] = c4_by_metric
     report['s9_estimation'] = est_by_metric[primary_metric]
     report['s9_estimation_by_metric'] = est_by_metric
+    report['s9t_arbitration'] = section_arbitration(
+        tuned_policy, opts, ledger, conf, est_by_metric, gate_rows)
     report['s10_power'] = section_power(analysis, conf, opts, ledger)
     report['s11_ledger'] = section_ledger(ledger, conf)
 

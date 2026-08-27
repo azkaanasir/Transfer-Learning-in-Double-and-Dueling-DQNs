@@ -58,7 +58,7 @@ class ReplayBuffer:
                 self.next_states[idx], self.dones[idx])
 
     # ---- checkpointing ---------------------------------------------------
-    def save(self, path: str) -> None:
+    def save(self, path: str, generation: int | None = None) -> None:
         """Persist contents. The generator's position is *not* stored here.
 
         It belongs to the run's `buffer` stream and is checkpointed with the
@@ -66,15 +66,28 @@ class ReplayBuffer:
         RNG position. The published version wrote a partial RNG state into the
         buffer archive that its own loader then ignored, which meant a resumed
         run silently sampled a different sequence.
+
+        `generation` is the checkpoint generation this archive belongs to, and
+        it goes INSIDE the archive rather than into a marker file beside it. A
+        marker is a second file, so a checkpoint commit interrupted between the
+        archive and its marker leaves one of the two stale, and a size check
+        cannot tell which: successive replay archives of the same run are very
+        nearly the same length. Stamping the archive makes it and its
+        generation a single `os.replace`, which is what lets
+        `train.py::_recover_checkpoint` decide whether the files in a run
+        directory are one checkpoint or two. `load` reads by key and ignores
+        it.
         """
-        np.savez_compressed(
-            path,
+        payload = dict(
             states=self.states[:self.size], actions=self.actions[:self.size],
             rewards=self.rewards[:self.size],
             next_states=self.next_states[:self.size],
             dones=self.dones[:self.size],
             pos=self.pos, size=self.size, capacity=self.capacity,
             state_dim=self.state_dim)
+        if generation is not None:
+            payload['ckpt_generation'] = np.int64(generation)
+        np.savez_compressed(path, **payload)
 
     def load(self, path: str) -> None:
         d = np.load(path)

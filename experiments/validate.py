@@ -236,6 +236,61 @@ of design revision 1 found in the corrected design.
     an absent file yields no hash, and every recorded run carries the
     analysis-plan hash `audit.py` compares against.
 
+``test_selection_refuses_evidence_outside_tune`` / ``test_selection_refuses_incomplete_evidence``
+    The two refusals the `DESIGN.md` 3.3 tuning selection rests on. A selection
+    computed on CONFIRM seeds is revision 1's defect run backwards -- the
+    hyperparameters chosen on the very sample RQ2 is estimated from -- and it
+    would leave no trace in the artifact, so it is refused before any rule is
+    called. An input short of `ANALYSIS_PLAN.md` 2.3's four cells at eight
+    configurations at five seeds changes what the choice was made over, so each
+    way of falling short is refused separately and the permissive flag is shown
+    to relax the grid and not the four cells.
+
+``test_tuned_arms_refuse_to_enumerate_without_a_selection``
+    The tuned stage is sequentially dependent on E3, and the failure to avoid is
+    not an exception but an empty list: `jobs('E1t')` returning `[]` gives a
+    runner nothing to do and a reader a green tree with the secondary policy
+    unexecuted and unmentioned, which is indistinguishable from one that ran.
+
+``test_tuned_cells_share_runs_only_when_a_priori``
+    `lr` is a trajectory field, so a cell selecting the a priori configuration
+    yields digests identical to its common-policy arms and SHARES those run
+    directories; that is what makes the tuned stage an upper bound on cost
+    rather than a doubling, and `DESIGN.md` 3.3 quotes it as such. The
+    separation is guarded in the other direction too: a retuned cell that
+    collapsed onto the common policy's directory would mean the secondary
+    policy was never run while the catalogue said it was.
+
+``test_confirmatory_family_is_eight_with_tuned_arms``
+    The arbitration is a conjunction over the same eight hypotheses, not sixteen
+    tests. A family that grew with the second policy would loosen every Holm
+    step `ANALYSIS_PLAN.md` 2 and 7 fix before launch, which is the thing that
+    stops a result being rescued by relocating it.
+
+``test_no_rq2_conclusion_without_the_arbitration``
+    The condition on this study's primary confirmatory claim. Before the tuned
+    stage existed, a Holm-adjusted p below 0.05 was the end of the matter and
+    nothing said that the second leg of the pre-registered arbitration had never
+    been run. Four states are driven -- not-evaluable, agreeing, blocked by a
+    placeholder rule, and disagreeing -- because a guard that only ever saw the
+    refusing one could not be told from a module that refuses everything.
+
+``test_no_reported_estimate_draws_on_tune_with_tuned_arms``
+    The selection-bias guard at the point where the catalogue grew a new way to
+    break it: the tuned arms are the first REPORTED experiments whose provenance
+    runs through the TUNE block, so their declared seeds, the selection's
+    evidence seeds and the analysis-layer exclusion are each checked.
+
+``test_audit_scopes_and_provenances_the_tuned_arms``
+    The audit-side halves, over a tree of tuned runs. `DESIGN.md` 3.3 puts `lr`
+    invariance at (cell, environment) -- wider and it reports the across-cell
+    variation the design asks for as an error, narrower and an `lr` that drifted
+    inside one cell passes. And the selection artifact is provenance: replacing
+    it re-points every tuned arm, leaving the runs on disk claimed by nobody
+    while the new arms read as missing, and no other check in `audit.py` can see
+    that.
+
+
 ``test_guardrail_coverage_is_declared``
     The meta-case. It parses the §9 table out of `DESIGN.md` and requires
     `_GUARDRAIL_COVERAGE` to name, for every row, the case that covers it and
@@ -1616,6 +1671,381 @@ def test_resume_refuses_changed_config(ctx: Ctx) -> None:
     finally:
         os.replace(moved, optim)
     ctx.note('both refusals fire; an unchanged resume still proceeds')
+
+
+class _CheckpointKill(RuntimeError):
+    """A kill landing inside the checkpoint writer, where a real one would."""
+
+
+def _checkpoint_probe(trainer) -> dict:
+    """Everything a resume restores that a *different* checkpoint would change."""
+    from src.dqn.transfer import weight_fingerprint
+
+    return {'fingerprint': weight_fingerprint(trainer.agent.online),
+            'env_steps': int(trainer.agent.env_steps),
+            'updates': int(trainer.agent.update_counter),
+            'buffer_size': int(len(trainer.agent.buffer))}
+
+
+@case('DESIGN.md 8.2 -- a checkpoint interrupted at any write boundary leaves '
+      'a resumable or a refused state, never a silently mixed one', slow=True)
+def test_checkpoint_write_is_atomic(ctx: Ctx) -> None:
+    """Kill the writer at every boundary, then read the result back by resuming.
+
+    The defect this guards is not the torn file, which raises and is therefore
+    survivable. It is the mixed *set*. The published writer emitted five
+    artefacts in sequence with no consistency marker, so a kill between the
+    replay archive and the state file left weights, replay and optimiser from
+    checkpoint N+1 beside a `state.json` from checkpoint N; `_maybe_resume`
+    then restored episode N into a network already holding N+1's parameters
+    and trained on with nothing raised and every existing check passing,
+    because `trajectory_digest` compares the configuration, not the progress.
+
+    So the assertion is not "it did not crash". It is that whichever episode
+    the resume reports, the weights, the counters and the replay buffer all
+    belong to *that* checkpoint. The kill is injected at a named boundary
+    rather than raced against a real one, so the case is reproducible.
+    """
+    import numpy as np
+
+    from src.dqn import train as train_mod
+    from src.dqn.train import Trainer
+
+    root = ctx.tmpdir('atomic_')
+    cfg = _tiny_cfg(out_root=root, num_episodes=4, max_steps=60, arch='mlp',
+                    target_rule='double', env='CartPole-v1', seed=5)
+    with contextlib.redirect_stdout(io.StringIO()):
+        writer = Trainer(cfg, argv=[])
+    run_dir = cfg.run_dir()
+    staging = os.path.join(run_dir, train_mod.STAGING_DIRNAME)
+
+    # -- the checkpoint that is already committed when the kill lands.
+    with contextlib.redirect_stdout(io.StringIO()):
+        writer.save_checkpoint(10)
+    older = dict(_checkpoint_probe(writer), episode=10)
+    keep = os.path.join(ctx.tmpdir('atomic_keep_'), 'committed')
+    shutil.copytree(run_dir, keep)
+
+    # -- the checkpoint the kill interrupts. Every field a resume restores is
+    # moved, so "which checkpoint did this come from" has an answer per field
+    # rather than only in aggregate.
+    rng = np.random.default_rng(0)
+    writer.agent.online.set_weights(
+        [w + 1.0 for w in writer.agent.online.get_weights()])
+    writer.agent.target.set_weights(writer.agent.online.get_weights())
+    writer.agent.env_steps += 777
+    writer.agent.update_counter += 555
+    for _ in range(64):
+        writer.agent.buffer.add(rng.random(4).astype(np.float32), 1, 1.0,
+                                rng.random(4).astype(np.float32), False)
+    newer = dict(_checkpoint_probe(writer), episode=20)
+    req(older['fingerprint'] != newer['fingerprint'],
+        'the two checkpoints are indistinguishable, so a mixed set would look '
+        'exactly like a clean one and this case would check nothing')
+
+    n_artefacts = len(train_mod.CHECKPOINT_ARTEFACTS)
+    boundaries = [('artefact write', i) for i in range(n_artefacts)]
+    boundaries.append(('staged state write', 0))
+    boundaries += [('commit rename', i) for i in range(n_artefacts + 1)]
+
+    def interrupted_save(phase: str, index: int) -> None:
+        """Restore the committed checkpoint, then die at exactly one boundary."""
+        shutil.rmtree(run_dir, ignore_errors=True)
+        shutil.copytree(keep, run_dir)
+        real_write = writer._write_artefact
+        real_commit = writer._commit_one
+        real_json = train_mod._write_json_atomic
+        seen = {'write': 0, 'commit': 0}
+
+        def write(kind, path, generation):
+            if phase == 'artefact write' and seen['write'] == index:
+                raise _CheckpointKill(f'kill while writing {kind}')
+            seen['write'] += 1
+            real_write(kind, path, generation)
+
+        def commit(src, dst):
+            if phase == 'commit rename' and seen['commit'] == index:
+                raise _CheckpointKill(
+                    f'kill while renaming {os.path.basename(dst)} into place')
+            seen['commit'] += 1
+            real_commit(src, dst)
+
+        def write_json(path, payload, **kwargs):
+            if (phase == 'staged state write'
+                    and os.path.basename(path) == train_mod.STAGED_STATE_NAME):
+                raise _CheckpointKill('kill while writing the staged state')
+            real_json(path, payload, **kwargs)
+
+        writer._write_artefact = write                # type: ignore[assignment]
+        writer._commit_one = commit                   # type: ignore[assignment]
+        train_mod._write_json_atomic = write_json
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                writer.save_checkpoint(int(newer['episode']))
+        except _CheckpointKill:
+            return
+        finally:
+            writer._write_artefact = real_write       # type: ignore[assignment]
+            writer._commit_one = real_commit          # type: ignore[assignment]
+            train_mod._write_json_atomic = real_json
+        raise Failed(f'the kill injected at {phase}[{index}] never fired, so '
+                     f'the boundary it names was never exercised')
+
+    expected_by_episode = {int(older['episode']): older,
+                           int(newer['episode']): newer}
+    resumed, refused = [], []
+    try:
+        for phase, index in boundaries:
+            label = f'{phase}[{index}]'
+            interrupted_save(phase, index)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    reader = Trainer(cfg, argv=[])
+            except RuntimeError as exc:
+                req('refusing to resume' in str(exc),
+                    f'a checkpoint interrupted at {label} failed the resume, '
+                    f'but not as a refusal: {exc}')
+                refused.append(label)
+                continue
+            try:
+                episode = reader.start_episode - 1
+                expected = expected_by_episode.get(episode)
+                req(expected is not None,
+                    f'a checkpoint interrupted at {label} resumed at episode '
+                    f'{episode}, which belongs to neither the committed '
+                    f'checkpoint (episode {older["episode"]}) nor the '
+                    f'interrupted one (episode {newer["episode"]})')
+                same(_checkpoint_probe(reader),
+                     {k: v for k, v in expected.items() if k != 'episode'},
+                     f'a checkpoint interrupted at {label} resumed at episode '
+                     f'{episode} but restored state belonging to the other '
+                     f'checkpoint. This is the silent defect: the run would '
+                     f'replay those episodes with another checkpoint\'s '
+                     f'weights and emit a wrong trajectory with nothing '
+                     f'raised, and no existing guard would see it, because '
+                     f'trajectory_digest compares the configuration and not '
+                     f'the progress.')
+                resumed.append(label)
+            finally:
+                for env in (reader.env, reader.eval_env):
+                    with contextlib.suppress(Exception):
+                        env.close()
+
+        # A commit interrupted and then tidied up: the staged copies that would
+        # have let the commit be finished are gone, so the committed set really
+        # is two checkpoints at once. That is exactly the state the published
+        # writer left on every kill, and exactly the one it resumed from.
+        interrupted_save('commit rename', 1)
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                Trainer(cfg, argv=[])
+        except RuntimeError as exc:
+            req('refusing to resume' in str(exc) and 'does not match' in str(exc),
+                f'the mixed set was rejected, but not by the consistency '
+                f'check, and the message does not say which artefact came '
+                f'from which checkpoint: {exc}')
+        else:
+            raise Failed(
+                'a resume proceeded from a directory whose weights came from '
+                'one checkpoint and whose state.json came from another. The '
+                'run would restore the older episode index into the newer '
+                'network, replay those episodes with advanced weights and '
+                'report a trajectory that no configuration produces, with '
+                'nothing raised anywhere.')
+    finally:
+        for env in (getattr(writer, 'env', None),
+                    getattr(writer, 'eval_env', None)):
+            if env is not None:
+                with contextlib.suppress(Exception):
+                    env.close()
+
+    ctx.note(f'{len(boundaries)} write boundaries: {len(resumed)} resumed '
+             f'consistently, {len(refused)} refused; a tidied-up mixed set is '
+             f'refused')
+
+
+@case('DESIGN.md 8.2 -- a checkpoint that cannot be shown to be one checkpoint '
+      'is refused, and no artefact is ever written under a committed name')
+def test_checkpoint_consistency_is_verified(ctx: Ctx) -> None:
+    """Torn, absent and mismatched checkpoints are refused with a reason.
+
+    Four things are checked, and the first two are about the writer rather
+    than the reader, because a check that only fires at resume leaves the torn
+    file on disk in the meantime:
+
+    1. every artefact is written inside the staging directory, never under the
+       name a resume reads, so a torn artefact is unobservable rather than
+       merely unlikely;
+    2. `state.json` is the last file renamed into place, because it is the
+       pointer: committing it before the artefacts it names would rebuild the
+       mixed-set defect in reverse;
+    3. a `state.json` that is empty, truncated or absent is refused with a
+       message, not a `JSONDecodeError` traceback -- `open(path, 'w')`
+       truncates in place, so the published writer produced exactly this;
+    4. a generation that does not match what the artefacts carry is refused,
+       and the message names the generations found.
+    """
+    from src.dqn import train as train_mod
+    from src.dqn.train import Trainer
+
+    root = ctx.tmpdir('consistency_')
+    cfg = _tiny_cfg(out_root=root, num_episodes=3, arch='mlp',
+                    target_rule='double', env='CartPole-v1', seed=5)
+    _train(cfg)
+    run_dir = cfg.run_dir()
+    state_path = os.path.join(run_dir, 'state.json')
+    staging = os.path.join(run_dir, train_mod.STAGING_DIRNAME)
+
+    generation_one = os.path.join(ctx.tmpdir('gen1_'), 'set')
+    shutil.copytree(run_dir, generation_one)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        trainer = Trainer(cfg, argv=[])
+    try:
+        # -- 1 and 2. Where the writer writes, and in what order it commits.
+        written, committed = [], []
+        real_write = trainer._write_artefact
+        real_commit = trainer._commit_one
+
+        def write(kind, path, generation):
+            written.append(path)
+            real_write(kind, path, generation)
+
+        def commit(src, dst):
+            committed.append(os.path.basename(dst))
+            real_commit(src, dst)
+
+        trainer._write_artefact = write               # type: ignore[assignment]
+        trainer._commit_one = commit                  # type: ignore[assignment]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                trainer.save_checkpoint(2)
+        finally:
+            trainer._write_artefact = real_write      # type: ignore[assignment]
+            trainer._commit_one = real_commit         # type: ignore[assignment]
+
+        req(written, 'the writer wrote no artefact at all')
+        outside = sorted(p for p in written
+                         if os.path.dirname(os.path.abspath(p))
+                         != os.path.abspath(staging))
+        req(not outside,
+            f'{len(outside)} artefact(s) were written straight to the name a '
+            f'resume reads: {[os.path.basename(p) for p in outside]}. A file '
+            f'written in place is torn for as long as the write takes, and '
+            f'the replay archive takes about a second; it has to be staged '
+            f'and moved in by os.replace, which is atomic on a same-volume '
+            f'rename.')
+        same(committed[-1], 'state.json',
+            'state.json was not the last file renamed into place. It is the '
+            'checkpoint\'s pointer: committing it before the artefacts it '
+            'names means a kill in between leaves a state.json describing a '
+            'set that is not there yet, which is the mixed-set defect with '
+            'the two halves swapped.')
+    finally:
+        for env in (trainer.env, trainer.eval_env):
+            with contextlib.suppress(Exception):
+                env.close()
+
+    intact = os.path.join(ctx.tmpdir('gen2_'), 'set')
+    shutil.copytree(run_dir, intact)
+
+    def resume_refusal(what: str) -> str:
+        """Resume, require a refusal, and return the message."""
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                bad = Trainer(cfg, argv=[])
+        except RuntimeError as exc:
+            req('refusing to resume' in str(exc),
+                f'{what} stopped the resume, but not as a refusal: {exc}')
+            return str(exc)
+        except Exception as exc:                       # noqa: BLE001
+            raise Failed(
+                f'{what} was not refused: it reached {type(exc).__name__} '
+                f'({exc}). A resume that dies in the JSON parser has no way '
+                f'to say what is wrong or what to do about it, and the '
+                f'published writer truncated state.json in place, so this is '
+                f'the state a kill actually leaves.') from None
+        for env in (bad.env, bad.eval_env):
+            with contextlib.suppress(Exception):
+                env.close()
+        raise Failed(
+            f'{what} was accepted and the run resumed from it. A checkpoint '
+            f'that cannot be shown to be one checkpoint must be refused: the '
+            f'run then restarts clean and costs about half an hour, whereas '
+            f'resuming a mixed one costs the result and says nothing.')
+
+    def restore(source: str) -> None:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        shutil.copytree(source, run_dir)
+
+    # -- 3a. truncated to zero bytes, which is what `open(path, 'w')` leaves.
+    open(state_path, 'wb').close()
+    message = resume_refusal('a zero-byte state.json')
+    req('empty' in message, f'the refusal does not say the file was empty: '
+                            f'{message}')
+
+    # -- 3b. truncated part-way through the document.
+    restore(intact)
+    with open(state_path, encoding='utf-8') as fh:
+        text = fh.read()
+    with open(state_path, 'w', encoding='utf-8') as fh:
+        fh.write(text[:len(text) // 2])
+    resume_refusal('a state.json truncated part-way through')
+
+    # -- 3c. gone entirely, with the artefacts it named still there.
+    restore(intact)
+    os.remove(state_path)
+    resume_refusal('a checkpoint whose state.json is missing')
+
+    # -- 4a. a generation state.json names that nothing on disk carries.
+    restore(intact)
+    with open(state_path, encoding='utf-8') as fh:
+        state = json.load(fh)
+    named = int(state['generation'])
+    state['generation'] = named + 7
+    state['checkpoint_set']['generation'] = named + 7
+    with open(state_path, 'w', encoding='utf-8') as fh:
+        json.dump(state, fh)
+    message = resume_refusal('a state.json naming a generation no artefact '
+                             'carries')
+    req(f'generation {named + 7}' in message and f'generation {named}' in message,
+        f'the refusal does not name both the generation state.json asks for '
+        f'and the generation the files carry, so the reader cannot tell a '
+        f'stale artefact from a corrupt one: {message}')
+
+    # -- 4b. one artefact left behind from the previous generation. This is
+    # what a commit interrupted between two renames leaves, and it is the case
+    # a size check cannot see: successive checkpoints of the same network are
+    # byte-for-byte the same length.
+    restore(intact)
+    stale = os.path.join(generation_one, 'online.weights.h5')
+    fresh = os.path.join(run_dir, 'online.weights.h5')
+    same(os.path.getsize(stale), os.path.getsize(fresh),
+         'the two generations of the weights file differ in length, so this '
+         'sub-case would be caught by a size check and would not exercise the '
+         'generation stamp it is here to exercise')
+    shutil.copyfile(stale, fresh)
+    message = resume_refusal('a weights file left behind from the previous '
+                             'generation')
+    req('online.weights.h5' in message and 'does not match' in message,
+        f'the refusal does not name the artefact that does not belong: '
+        f'{message}')
+
+    # -- the control: put it back and the resume proceeds.
+    restore(intact)
+    with contextlib.redirect_stdout(io.StringIO()):
+        good = Trainer(cfg, argv=[])
+    try:
+        same(good.start_episode, 3,
+             'an intact checkpoint no longer resumes, so the refusals above '
+             'are not a guard but a broken resume')
+    finally:
+        for env in (good.env, good.eval_env):
+            with contextlib.suppress(Exception):
+                env.close()
+    ctx.note('staged writes, state.json committed last, and six unsound '
+             'checkpoints refused with a reason')
 
 
 # ===========================================================================
@@ -3765,6 +4195,18 @@ def test_stats_intensity_gate(ctx: Ctx) -> None:
              f'{stats.INTENSITY_TOLERANCE}; {len(rows)} pair(s) refused when '
              f'the fraction was moved outside it')
 
+def _blocking_arbitration(member: dict) -> dict:
+    """An arbitration block that BLOCKS, built by the real reader.
+
+    `member` is the raw pair of keys `stats.py` writes. Passing it through
+    `report.read_arbitration` rather than asserting `{'blocks': True}` means a
+    reader that stopped blocking, or started coercing a string into a licence,
+    fails these rows instead of being hidden by a literal.
+    """
+    from experiments import report as _report
+    return _report.read_arbitration(member)
+
+
 # ===========================================================================
 # 7a. Wording: the guards that stand between a number and a sentence
 # ===========================================================================
@@ -3898,25 +4340,71 @@ _REFUSED_SENTENCES: tuple[tuple[str, str, str, dict, str], ...] = (
     ('nothing stated that would refute it',
      'The paired delta is 0.18 [0.05, 0.31] over n=10 seeds.',
      'causal', {'refuted_by': None}, 'refutability'),
+    # The DESIGN.md 3.3 arbitration, one row per way it must bite.
+    ('the tuned leg has not been run, so nothing is evaluable',
+     'The paired delta is 0.18 [0.05, 0.31] over n=10 seeds.',
+     'causal',
+     {'arbitration': _blocking_arbitration(
+         {'arbitration_verdict': 'not-evaluable', 'asserted': False})},
+     'arbitration'),
+    ('the two hyperparameter policies disagree, which IS the finding',
+     'The paired delta is 0.18 [0.05, 0.31] over n=10 seeds.',
+     'causal',
+     {'arbitration': _blocking_arbitration(
+         {'arbitration_verdict': 'disagrees', 'asserted': False})},
+     'arbitration'),
+    ('no verdict recorded at all, which is not permission',
+     'The paired delta is 0.18 [0.05, 0.31] over n=10 seeds.',
+     'causal', {'arbitration': _blocking_arbitration({})},
+     'arbitration'),
+    ('agrees, but stats.py withheld the asserted flag',
+     'The paired delta is 0.18 [0.05, 0.31] over n=10 seeds.',
+     'causal',
+     {'arbitration': _blocking_arbitration(
+         {'arbitration_verdict': 'agrees', 'asserted': False})},
+     'arbitration'),
 )
+
+def _licensing_arbitration() -> dict:
+    """An arbitration block that LICENSES a conclusion, built by the real reader.
+
+    Built through `report.read_arbitration` rather than hand-written as
+    `{'blocks': False}`, so that a reader which stopped licensing anything, or
+    started licensing everything, breaks this case instead of being papered over
+    by a literal.
+
+    These fixtures acquired an arbitration block on 2026-08-27, when
+    `ANALYSIS_PLAN.md` 2.4 made the `DESIGN.md` 3.3 verdict a precondition on
+    presenting any conclusion about the within-cell delta. Before that the guard
+    did not exist and the sentences below were licensed without one. The fixture
+    changed because the pre-registration changed, not to make a failing case
+    pass: the REFUSED half of this same case still proves the guard bites.
+    """
+    from experiments import report as _report
+    return _report.read_arbitration({'arbitration_verdict': 'agrees',
+                                     'asserted': True})
+
 
 #: The same shapes, licensed. Without these the case could not tell a working
 #: guard from one that refuses every sentence put to it.
 _ACCEPTED_SENTENCES: tuple[tuple[str, str, str, dict], ...] = (
     ('the plain within-cell delta',
-     'The paired delta is 0.18 [0.05, 0.31] over n=10 seeds.', 'causal', {}),
+     'The paired delta is 0.18 [0.05, 0.31] over n=10 seeds.', 'causal',
+     {'arbitration': _licensing_arbitration()}),
     ('two verdicts compared, with the contrast supplied',
      'mlp-double avoids the drop while dueling-double does not, 0.18 '
      '[0.05, 0.31] over n=10 seeds.',
      'causal', {'between_cell_contrast': {'delta': 0.12, 'ci_lo': 0.02,
-                                          'ci_hi': 0.22}}),
+                                          'ci_hi': 0.22},
+                'arbitration': _licensing_arbitration()}),
     ('a mechanism claim naming an instrumented signal',
      'The trunk gradient norm falls by 0.18 [0.05, 0.31] over n=10 seeds.',
      'mechanism', {'estimand': 'mechanism_signal',
                    'signal': 'grad_norm_trunk'}),
     ('a p-value inside the confirmatory family',
      'The delta is 0.18 [0.05, 0.31] with p = 0.03 over n=10 seeds.',
-     'causal', {'confirmatory': True, 'p_holm': 0.03}),
+     'causal', {'confirmatory': True, 'p_holm': 0.03,
+                'arbitration': _licensing_arbitration()}),
     ('the dispersion adjective the SDs support',
      'The transfer arm is wider than the scratch arm, SD ratio 1.80 '
      '[1.2, 2.5] over n=10 seeds.',
@@ -3930,26 +4418,31 @@ _ACCEPTED_SENTENCES: tuple[tuple[str, str, str, dict], ...] = (
     ('the licensed form of a null result',
      'The paired delta is 0.02 [-0.10, 0.14] over n=10 seeds, which is not '
      'distinguishable from zero at this n.',
-     'causal', {'ci_lo': -0.10, 'ci_hi': 0.14}),
+     'causal', {'ci_lo': -0.10, 'ci_hi': 0.14,
+                'arbitration': _licensing_arbitration()}),
 
     # -- the licensed halves of the equivalence family. Without these the rows
     #    above would be satisfied by a gate that refuses every equivalence
     #    sentence put to it, which is what the dispersion gate did to DIFFERENT.
     ('an equivalence verdict the interval and the SDs both support',
      'The two arms are equivalent within the pre-registered margin.',
-     'equivalence', {'verdict': 'EQUIVALENT', 'ci_lo': -0.02, 'ci_hi': 0.01,
+     'equivalence', {'arbitration': _licensing_arbitration(),
+                     'verdict': 'EQUIVALENT', 'ci_lo': -0.02, 'ci_hi': 0.01,
                      'sd_a': 0.031, 'sd_b': 0.042}),
     ('a DIFFERENT verdict in a cell far too noisy for an equivalence claim',
      'The two arms are not distinguishable within the margin.',
-     'equivalence', {'verdict': 'DIFFERENT', 'ci_lo': -0.60, 'ci_hi': -0.40,
+     'equivalence', {'arbitration': _licensing_arbitration(),
+                     'verdict': 'DIFFERENT', 'ci_lo': -0.60, 'ci_hi': -0.40,
                      'sd_a': 0.093, 'sd_b': 0.369}),
     ('an UNTESTABLE verdict, which is the statement that there is no interval',
      'The dispersion in this cell makes equivalence untestable at this n.',
-     'equivalence', {'verdict': 'UNTESTABLE', 'ci_lo': None, 'ci_hi': None,
+     'equivalence', {'arbitration': _licensing_arbitration(),
+                     'verdict': 'UNTESTABLE', 'ci_lo': None, 'ci_hi': None,
                      'sd_a': 0.093, 'sd_b': 0.369}),
     ('the exclusion bound the computing module published',
      'Every degradation is excluded at 95%.',
-     'exclusion', {'exclusion_bound': 0.05}),
+     'exclusion', {'exclusion_bound': 0.05,
+                   'arbitration': _licensing_arbitration()}),
     ('a component claim naming what was manipulated',
      'The paired delta is 0.18 [0.05, 0.31] over n=10 seeds.',
      'causal_component', {'estimand': 'control_contrast',
@@ -3978,11 +4471,19 @@ def test_report_wording_guards_fire(ctx: Ctx) -> None:
     """
     from experiments import report
 
+    # The arbitration block is part of a HEALTHY within-cell delta from
+    # 2026-08-27, when ANALYSIS_PLAN.md 2.4 made the DESIGN.md 3.3 verdict a
+    # precondition on presenting a conclusion about this estimand. Putting a
+    # licensing block in the base also sharpens the refusal rows below: each
+    # is then refused for its OWN named guard rather than incidentally for a
+    # missing arbitration, and a row that means to test a blocking verdict
+    # overrides this key explicitly.
     healthy = dict(
         estimand='within_cell_delta', n=10, ci_lo=0.05, ci_hi=0.31,
         counterfactual='the scratch arm at the same seed',
         rivals='initialisation scale and the optimiser reset',
         excluded_by='C2 and C3',
+        arbitration=_licensing_arbitration(),
         refuted_by='an interval containing zero')
 
     for label, text, kind, override, guard in _REFUSED_SENTENCES:
@@ -4560,7 +5061,1528 @@ def test_provenance_is_content_addressed(ctx: Ctx) -> None:
 
 
 # ===========================================================================
-# 7b. Coverage: what this suite does and does not check
+# 7b. The secondary tuning policy of DESIGN.md 3.3
+# ===========================================================================
+# `DESIGN.md` 3.3 declares two hyperparameter policies and pre-registers an
+# arbitration between them: an RQ2 or RQ3 conclusion is asserted only where the
+# common-configuration and the per-cell-tuned policy agree. Until 2026-08-26 the
+# secondary policy had no runs behind it -- only E3 varied `lr` anywhere in the
+# catalogue -- so the arbitration was unsatisfiable and RQ2, the primary
+# confirmatory question, could not have been asserted at all. It is executed
+# rather than weakened: `E1t` and `E2t` replicate `E1` and `E2` at each cell's
+# own E3-selected configuration, on the same CONFIRM seeds.
+#
+# That adds one artifact and one dependency, and each is a new way for a number
+# to go quietly wrong. The artifact is a *selection*, computed on the TUNE
+# block, and everything downstream of it is a function of it. The dependency is
+# sequential: the tuned arms cannot be enumerated before E3 has been selected
+# on. The cases below guard those two facts, and each one is written so that
+# reverting the behaviour it names makes it fail.
+# ---------------------------------------------------------------------------
+
+#: Stamped into every synthetic selection, run directory and run digest these
+#: cases build. The same reasoning as `_FIXTURE_MARKER`: an artifact produced
+#: here must never be mistakable for one produced by a launch, in a bundle or in
+#: a transcript, and grep has to find every one of them.
+_TUNING_FIXTURE_MARKER = 'SYNTHETIC-TUNING-FIXTURE-NOT-A-RESULT'
+
+#: Two configurations from `E3`'s grid that are not the a priori one, used to
+#: give a cell a selection of its own. Named once rather than typed at each use,
+#: so a change to the grid breaks one place.
+_OTHER_CONFIGS = ('lr0.001-hard', 'lr0.0001-soft')
+
+
+def _registry_copies() -> list:
+    """Every loaded copy of the registry module. There are two, and it matters.
+
+    `validate.py` reaches the catalogue as `experiments.registry`. `audit.py`
+    and `aggregate.py` put `experiments/` on `sys.path` and reach it as
+    `registry`. Python treats those as two unrelated modules with two
+    `EXPERIMENTS` dicts, so `activate_tuned_arms` called on one leaves the other
+    enumerating the common policy alone. A case that installed the tuned arms
+    into the copy it happened to import and then asserted against a module
+    holding the other copy would be asserting about a catalogue the code under
+    test never sees, which is the shape of pass this file exists to refuse.
+
+    `audit` is imported first because importing it is what puts `experiments/`
+    on `sys.path`: `registry.py` reaches `tuning` by absolute import while
+    adding only the repository root, so the top-level copy has to be reachable
+    before either copy can resolve a tuned id at all.
+    """
+    from experiments import audit                            # noqa: F401
+    from experiments import registry as packaged
+
+    copies: list = []
+    for name in ('registry', 'experiments.registry'):
+        module = sys.modules.get(name)
+        if module is not None and not any(module is m for m in copies):
+            copies.append(module)
+    if not any(packaged is m for m in copies):
+        copies.append(packaged)
+    return copies
+
+
+def _tuning():
+    """The one `tuning` module every copy of the registry resolves through.
+
+    Taken from `audit` rather than imported by name, so that the refusal classes
+    caught below are the classes the code under test raises. `registry._tuning`
+    imports `tuning` absolutely, so both registry copies share this module; a
+    second copy imported as `experiments.tuning` would define a second
+    `SelectionMissing` that no `except` here would catch.
+    """
+    from experiments import audit
+
+    return audit.tuning
+
+
+def _fixed_selection_rule(want: dict):
+    """A selection rule returning a named `config_key` for each cell.
+
+    The cases below are about the machinery around the rule -- the refusals, the
+    artifact, the arms, the shared run directories -- and none of them is about
+    which configuration the pre-registered criterion picks. Steering a fixture
+    so that the *installed* rule happens to choose a wanted configuration would
+    tie every guard here to a criterion `ANALYSIS_PLAN.md` 2.3 fixes
+    independently and that `tuning.SELECTION_RULE` exists to let somebody swap.
+    `compute_selection` takes the rule as an argument for exactly this reason,
+    so the fixture supplies its own and these guards stay true whatever the
+    criterion becomes. The installed rule is exercised separately, once, in
+    `test_selection_refuses_evidence_outside_tune`.
+    """
+    from experiments import registry
+
+    def rule(cell, candidates):
+        del candidates                       # the choice is the fixture's
+        return want[registry._tag(*cell)]
+
+    rule.__name__ = 'validate_fixture_fixed_selection'
+    return rule
+
+
+def _e3_table(seeds: Sequence[int] | None = None) -> list[dict]:
+    """A complete, well-formed `E3` per-seed table over the TUNE block.
+
+    Eight configurations per cell at five TUNE seeds, which is what
+    `ANALYSIS_PLAN.md` 2.3 states the input to be. The configurations are read
+    out of `tuning.candidate_grid`, which reads them out of the catalogue, so
+    the fixture cannot drift from the experiment it claims to describe.
+
+    Every score sits above the solved threshold of 1.0 on the normalised scale,
+    because 2.3 lets the rule REFUSE a cell in which nothing reaches it: a
+    fixture below the threshold would exercise that refusal in every case here
+    rather than the selection path each of them is about.
+    """
+    import hashlib
+
+    from experiments import registry
+
+    tuning = _tuning()
+    grid = tuning.candidate_grid()
+    block = list(seeds if seeds is not None
+                 else registry.SEED_BLOCKS[tuning.SELECTION_SEED_BLOCK])
+    rows: list[dict] = []
+    for arch, target_rule in registry.CELLS:
+        cell_key = registry._tag(arch, target_rule)
+        for config_key in sorted(grid[cell_key]):
+            label, cfg = grid[cell_key][config_key]
+            for index, seed in enumerate(block):
+                tag = f'{_TUNING_FIXTURE_MARKER}|{cell_key}|{config_key}|{seed}'
+                digest = hashlib.md5(tag.encode()).hexdigest()
+                rows.append({
+                    'experiments': 'E3', 'experiment': 'E3',
+                    'arch': arch, 'target_rule': target_rule,
+                    'cell': cell_key, 'label': label,
+                    'seed': int(seed), 'seed_block': 'TUNE',
+                    'env': registry.TARGET_ENV, 'condition': 'scratch',
+                    'lr': float(cfg.lr),
+                    'target_update': cfg.target_update,
+                    'target_update_freq': int(cfg.target_update_freq),
+                    'tau': float(cfg.tau),
+                    'run_digest': digest,
+                    'run_dir': f'{_TUNING_FIXTURE_MARKER}/{digest[:12]}',
+                    'auc_score': 1.20 + 0.01 * index + 0.001 * len(config_key),
+                    'final_score': 1.40 + 0.01 * index,
+                })
+    return rows
+
+
+def _config_key_of(row: dict) -> str:
+    return f'lr{float(row["lr"]):g}-{row["target_update"]}'
+
+
+def _a_priori_key() -> str:
+    return _tuning().A_PRIORI_CONFIG.config_key
+
+
+def _wanted(tuned_cells: Sequence[str] = ()) -> dict:
+    """`cell -> config_key`: the a priori configuration except where named.
+
+    `tuned_cells` get a configuration of their own, which is what makes them
+    cost a run of their own; every other cell selects the a priori
+    configuration and therefore shares the common policy's runs.
+    """
+    from experiments import registry
+
+    want = {registry._tag(*c): _a_priori_key() for c in registry.CELLS}
+    for index, cell in enumerate(tuned_cells):
+        want[cell] = _OTHER_CONFIGS[index % len(_OTHER_CONFIGS)]
+    return want
+
+
+def _selection(tuned_cells: Sequence[str] = (), *,
+               table: Sequence[dict] | None = None,
+               require_complete: bool = True):
+    """A synthetic selection over the fixture table, under a fixed rule."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        return _tuning().compute_selection(
+            list(table if table is not None else _e3_table()),
+            rule=_fixed_selection_rule(_wanted(tuned_cells)),
+            require_complete=require_complete,
+            generator=f'{_TUNING_FIXTURE_MARKER} validate.py',
+            record_git=False)
+
+
+def _selection_tree(ctx: Ctx, selection, root: str | None = None) -> str:
+    """A temporary run tree holding `selection` as its active selection."""
+    root = root or ctx.tmpdir('selection_')
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        _tuning().write_selection(selection, root, replace=True)
+    return root
+
+
+@contextlib.contextmanager
+def _tuned_catalogue(selection, out_root: str):
+    """Install the tuned arms into every loaded copy of the registry.
+
+    `EXPERIMENTS` is module state and `activate_tuned_arms` mutates it in place,
+    which is what makes the tuned stage visible to `plan.py`, `sweep.py`,
+    `audit.py` and `aggregate.py` at once. In a test process that state outlives
+    the case, so it is installed and removed under a context manager: a case
+    that left `E1t` in the catalogue would change what every later case in this
+    file enumerates, and the failure would surface somewhere other than here.
+    """
+    copies = _registry_copies()
+    activated: list = []
+    try:
+        with warnings.catch_warnings():
+            # Every selection built here is computed under a fixture rule, so
+            # `read_selection` warns on each read that it is not the
+            # pre-registered criterion. That warning is correct and it is the
+            # point of the audit-side check on placeholders; what it must not
+            # do is bury the suite's own output under one line per enumeration.
+            warnings.filterwarnings('ignore', message='.*PLACEHOLDER.*',
+                                    category=RuntimeWarning)
+            for module in copies:
+                module.activate_tuned_arms(selection=selection,
+                                           out_root=out_root)
+                activated.append(module)
+            yield copies
+    finally:
+        for module in activated:
+            module.deactivate_tuned_arms()
+
+
+def _mark_experiments(frame, ids: Sequence[str]):
+    """Add experiment ids to every row's membership field, as aggregate.py does.
+
+    A run shared between the common and the tuned policy is ONE run belonging to
+    both, and that is how `aggregate.py` exports it: one row whose
+    semicolon-joined `experiments` names them both. Modelling the shared case
+    any other way -- two rows, say -- would be modelling the unshared case.
+    """
+    wanted = {str(i) for i in ids}
+    out = frame.copy()
+    if 'experiments' not in out.columns:
+        out['experiments'] = ''
+    out['experiments'] = out['experiments'].fillna('').map(
+        lambda value: ';'.join(sorted(
+            {p for p in str(value).split(';') if p} | wanted)))
+    return out
+
+
+def _write_manifests(root: str, jobs: Sequence[Any]) -> list[str]:
+    """Write a manifest per job, so `audit.py` has runs to read.
+
+    Nothing is trained. `audit.py` reads a run's identity, configuration and
+    provenance out of `manifest.json`, and every guard exercised against it here
+    is about that record rather than about the numbers a run produces, so the
+    manifest is written straight from the configuration the registry resolved.
+    The runs live under a temporary root and their recorded argv is the fixture
+    marker, so none of them can be mistaken for a recorded run.
+    """
+    from src.dqn import provenance
+
+    written: list[str] = []
+    for job in jobs:
+        run_dir = job.cfg.run_dir()
+        os.makedirs(run_dir, exist_ok=True)
+        manifest = {
+            'identity': job.cfg.identity(),
+            'config': job.cfg.to_dict(),
+            'seeds': {'run_seed': int(job.cfg.seed),
+                      'streams': {'init': 1, 'action': 2, 'buffer': 3}},
+            'provenance': dict(provenance.snapshot(
+                argv=[_TUNING_FIXTURE_MARKER])),
+            'result': {'episodes_completed': 0},
+        }
+        path = os.path.join(run_dir, 'manifest.json')
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump(manifest, fh, indent=1, default=str)
+        written.append(path)
+    return written
+
+
+def _codes(check, level: str = 'error') -> set[str]:
+    """The finding codes an `audit.Check` emitted at one level."""
+    return {f.code for f in check.findings if f.level == level}
+
+
+@case('DESIGN.md 3.4, ANALYSIS_PLAN.md 2.3, 8 -- a tuning selection computed '
+      'on anything but the TUNE block is refused')
+def test_selection_refuses_evidence_outside_tune(ctx: Ctx) -> None:
+    """The selection block, enforced where the selection is actually made.
+
+    Revision 1 selected hyperparameters on seeds 0-4 and then ran every
+    confirmatory arm on 0-9, so half of each confirmatory sample had been tuned
+    on. `DESIGN.md` 3.4 answers that by giving TUNE one licensed use and
+    `ANALYSIS_PLAN.md` 8 by barring the block from every reported estimate --
+    but both statements are about *reporting*, and neither guards the selection
+    itself. The same leak runs the other way: a selection computed on CONFIRM
+    seeds is a selection made on precisely the sample RQ2 is estimated from, and
+    nothing downstream could see it, because the artifact would look exactly
+    like a well-formed one and the arms enumerated from it would carry no trace
+    of which seeds chose their learning rate.
+
+    So the refusal lives in `compute_selection`, before a rule is ever called,
+    and it is checked here in both directions: evidence from outside the block,
+    and evidence from inside the block whose row claims a different block.
+    """
+    from experiments import registry
+
+    tuning = _tuning()
+    block = tuple(registry.SEED_BLOCKS[tuning.SELECTION_SEED_BLOCK])
+    reported = sorted(set(registry.SEED_BLOCKS['CONFIRM'])
+                      | set(registry.SEED_BLOCKS['REPLICATE']))
+    req(not (set(block) & set(reported)),
+        f'the TUNE block {list(block)} overlaps the reported blocks, so a '
+        f'selection made inside TUNE would already be a selection made on the '
+        f'confirmatory sample and the refusal below would guard nothing')
+
+    # -- the positive control. A well-formed table selects, so every refusal
+    #    below is about the seeds and not about the shape of the fixture.
+    good = _e3_table()
+    selection = _selection(table=good)
+    same(selection.seed_block, tuning.SELECTION_SEED_BLOCK,
+         'the computed selection does not record the block it was made on')
+    same(tuple(selection.seeds), block,
+         'the selection records seeds other than the whole TUNE block')
+    same(len(selection.cells), len(registry.CELLS),
+         'the control selection does not cover the four cells')
+
+    # And the INSTALLED rule, on the same evidence. Every other case here
+    # supplies its own rule so as not to depend on the criterion; this one
+    # assertion is what stops a rule being wired in that cannot return a
+    # candidate from the pool it was handed.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        installed = tuning.compute_selection(
+            list(good), generator=_TUNING_FIXTURE_MARKER, record_git=False)
+    for cell_key, chosen in sorted(installed.cells.items()):
+        pool = {c.config_key for c in installed.candidates[cell_key]}
+        req(chosen.config_key in pool,
+            f'{tuning.SELECTION_RULE_ID} returned {chosen.config_key!r} for '
+            f'{cell_key}, which is not one of E3\'s {sorted(pool)}')
+
+    # -- 1. one row from a reported seed. Not "most rows": one is the whole
+    #       defect, because one contaminated candidate can decide the choice.
+    #
+    #       The row keeps its seed_block=TUNE, and that isolation is the point.
+    #       Written with seed_block=CONFIRM as well, this sub-case passed with
+    #       the seed-membership refusal DELETED, because the second refusal
+    #       below -- the row that declares another block -- fired instead and
+    #       raised the same class. Two guards standing in for each other is a
+    #       case that cannot tell which of them is gone, which is the failure
+    #       this suite exists to refuse; sub-case 3 exercises that guard on its
+    #       own. `require_complete=False` is driven too, so the completeness
+    #       refusal cannot stand in either: with the seed guard gone the seed-5
+    #       row simply leaves the candidate one TUNE seed short, and an
+    #       incompleteness refusal is not this one.
+    intruder = int(reported[0])
+    leaked = [dict(row) for row in good]
+    leaked[0]['seed'] = intruder
+    for complete in (True, False):
+        try:
+            _selection(table=leaked, require_complete=complete)
+        except tuning.SeedBlockViolation as exc:
+            req(str(intruder) in str(exc),
+                f'the refusal does not name the offending seed {intruder}: '
+                f'{exc}')
+        else:
+            raise Failed(
+                f'a selection was computed (require_complete={complete}) from '
+                f'a table carrying seed {intruder}, which is a CONFIRM seed. '
+                f'DESIGN.md 3.4 reserves TUNE {list(block)} for selection and '
+                f'ANALYSIS_PLAN.md 8 forbids a reported estimate drawing on '
+                f'the selection block; a selection made ON a confirmatory seed '
+                f'is that leak in the other direction, and it leaves no trace '
+                f'at all in the artifact.')
+
+    # -- 2. the whole table moved off the block, still declaring TUNE. It must
+    #       refuse, not select over the rows that remain and not return an
+    #       empty selection.
+    moved = []
+    for row in good:
+        row = dict(row)
+        row['seed'] = int(reported[block.index(row['seed']) % len(reported)])
+        moved.append(row)
+    for complete in (True, False):
+        try:
+            _selection(table=moved, require_complete=complete)
+        except tuning.SeedBlockViolation:
+            pass
+        else:
+            raise Failed(f'a selection was computed '
+                         f'(require_complete={complete}) from a table with no '
+                         f'TUNE seed in it at all')
+
+    # -- 3. a TUNE seed whose row declares another block. The table and the
+    #       catalogue then disagree about what the run is, and believing either
+    #       one silently is how a mislabelled block survives to the artifact.
+    mislabelled = [dict(row) for row in good]
+    mislabelled[0]['seed_block'] = 'CONFIRM'
+    try:
+        _selection(table=mislabelled)
+    except tuning.SeedBlockViolation:
+        pass
+    else:
+        raise Failed(
+            'a selection was computed from a row sitting on a TUNE seed while '
+            'declaring seed_block=CONFIRM. One of the two is wrong, and the '
+            'selection cannot be computed while it is unknown which.')
+
+    # -- 4. and the artifact says what it was made on, inside its own content
+    #       address, so a reader can check the same thing without recomputing.
+    payload = selection.to_dict()
+    same(payload['seed_block'], 'TUNE',
+         'the stored artifact does not record its seed block')
+    same([int(s) for s in payload['seeds']], list(block),
+         'the stored artifact does not record the seeds it was made on')
+    req('seed_block' in tuning.canonical_json(selection.addressed_payload()),
+        'the seed block is outside the content address, so it could be edited '
+        'without the artifact ceasing to hash to its own id')
+    ctx.note(f'TUNE={list(block)} disjoint from the reported blocks; one '
+             f'CONFIRM row, a wholly off-block table and a mislabelled block '
+             f'each refused; {tuning.SELECTION_RULE_ID} returns a candidate '
+             f'for all {len(installed.cells)} cells')
+
+
+@case('ANALYSIS_PLAN.md 2.3 -- an incomplete tuning selection is refused '
+      'rather than made over a truncated grid')
+def test_selection_refuses_incomplete_evidence(ctx: Ctx) -> None:
+    """Four cells at eight configurations at five seeds, or no selection.
+
+    `ANALYSIS_PLAN.md` 2.3 states the input exactly, and each way of falling
+    short of it changes the meaning of the result rather than merely weakening
+    it. A missing cell means the secondary policy runs that cell under the
+    primary one while the artifact claims otherwise, and the DESIGN.md 3.3
+    arbitration is then asserted over a cell nobody retuned. A missing
+    configuration means the choice was made over a smaller grid than the plan
+    describes. A missing seed means one candidate was compared against its
+    rivals on less evidence than they had, which is the oldest way of winning a
+    comparison.
+
+    The permissive flag is checked too. `require_complete=False` exists so that
+    the completeness bar can travel with a swapped rule, and it must not become
+    a way of quietly relaxing the four-cell rule, which is not the rule's
+    property at all.
+    """
+    from experiments import registry
+
+    tuning = _tuning()
+    good = _e3_table()
+    victim = registry._tag(*registry.CELLS[0])
+    a_priori = _a_priori_key()
+
+    def refuse(rows, why, *, require_complete=True):
+        try:
+            _selection(table=rows, require_complete=require_complete)
+        except tuning.SelectionIncomplete as exc:
+            return str(exc)
+        raise Failed(why)
+
+    # -- 1. a whole cell absent.
+    message = refuse([r for r in good if r['cell'] != victim],
+                     f'a selection was computed with no evidence for {victim}. '
+                     f'ANALYSIS_PLAN.md 2.3 refuses an incomplete selection: '
+                     f'the uncovered cell would run under the primary policy '
+                     f'while the artifact claimed the secondary one, and the '
+                     f'DESIGN.md 3.3 arbitration would be asserted over a cell '
+                     f'nobody retuned.')
+    req(victim in message,
+        f'the refusal for a missing cell does not name {victim}: {message}')
+
+    # -- 2. one configuration of one cell absent. The grid the rule chooses
+    #       over is the catalogue's, not whatever the table happens to hold.
+    dropped = sorted(tuning.candidate_grid()[victim])[0]
+    thinned = [r for r in good
+               if not (r['cell'] == victim and _config_key_of(r) == dropped)]
+    message = refuse(thinned,
+                     f'a selection was computed for {victim} over seven of '
+                     f'E3\'s eight configurations, so the choice was made over '
+                     f'a grid nobody pre-registered.')
+    req(dropped in message,
+        f'the refusal does not name the missing configuration {dropped}: '
+        f'{message}')
+
+    # -- 3. one seed of one candidate absent.
+    lost = int(registry.SEED_BLOCKS[tuning.SELECTION_SEED_BLOCK][-1])
+    partial = [r for r in good
+               if not (r['cell'] == victim and r['seed'] == lost
+                       and _config_key_of(r) == a_priori)]
+    message = refuse(partial,
+                     f'a selection was computed with one candidate of {victim} '
+                     f'measured at four seeds and its rivals at five, which is '
+                     f'a comparison on unequal evidence.')
+    req(str(lost) in message,
+        f'the refusal does not name the missing seed {lost}: {message}')
+
+    # -- 4. a configuration that is not one of E3's at all.
+    invented = [dict(r) for r in good]
+    invented[0] = dict(invented[0], lr=7e-4)
+    refuse(invented,
+           'a selection was computed from a row whose configuration is not one '
+           'of E3\'s eight, so the candidate set and the catalogue disagree '
+           'about what E3 is and the choice was made over a set nobody '
+           'pre-registered.')
+
+    # -- 5. one configuration at one seed recorded twice, under different run
+    #       digests. Two rows mean the table was concatenated from trees that
+    #       do not agree, and one of the two is not evidence about this run.
+    doubled = [dict(r) for r in good]
+    doubled.append(dict(doubled[0], run_digest='0' * 32))
+    refuse(doubled,
+           'a selection was computed from a table holding one configuration at '
+           'one seed twice with different run digests.')
+
+    # -- 6. the permissive flag relaxes the grid and NOT the four-cell rule,
+    #       and the artifact records that it was used.
+    relaxed = _selection(table=thinned, require_complete=False)
+    same(len(relaxed.cells), len(registry.CELLS),
+         'the permissive selection does not cover the four cells')
+    same(bool(relaxed.rule.get('require_complete')), False,
+         'a selection computed over a truncated grid records '
+         'require_complete=True, so no reader could tell it from a complete '
+         'one; ANALYSIS_PLAN.md 2.3 says nothing may be reported from it')
+    refuse([r for r in good if r['cell'] != victim],
+           f'require_complete=False also dropped the four-cell rule and '
+           f'produced a selection without {victim}. The completeness bar '
+           f'belongs to the rule; the four cells belong to DESIGN.md 3.3 and '
+           f'are not the rule\'s to relax.',
+           require_complete=False)
+    ctx.note('a missing cell, a missing configuration, a missing seed, a '
+             'configuration outside the grid and a doubled row each refused; '
+             'require_complete=False relaxes the grid and not the four cells')
+
+
+@case('DESIGN.md 3.3 -- the tuned arms refuse to enumerate with no selection, '
+      'rather than enumerating empty')
+def test_tuned_arms_refuse_to_enumerate_without_a_selection(ctx: Ctx) -> None:
+    """A tuned stage that enumerated nothing would look exactly like one that ran.
+
+    The tuned arms are sequentially dependent on `E3`: their configurations come
+    from the selection and from nothing else. The failure to avoid is therefore
+    not an exception, it is an empty list -- `jobs('E1t')` returning `[]` before
+    a selection exists gives a runner nothing to do, a completeness check
+    nothing to miss and a reader a green tree with the secondary policy
+    unexecuted and unmentioned. `DESIGN.md` 3.3's arbitration would then be
+    asserted over one policy while the catalogue said two.
+
+    So every entry point refuses, and the refusal names the commands that
+    produce a selection, because the reason it cannot be enumerated is a fact
+    about the campaign's order rather than about the catalogue.
+    """
+    from experiments import audit, registry
+
+    tuning = _tuning()
+    empty = ctx.tmpdir('nosel_')
+    copies = _registry_copies()
+
+    same(tuning.read_selection(empty, required=False), None,
+         'read_selection reported a selection in an empty tree')
+    try:
+        tuning.read_selection(empty, required=True)
+    except tuning.SelectionMissing as exc:
+        for wanted in ('sweep.py', 'aggregate.py', 'tuning.py select'):
+            req(wanted in str(exc),
+                f'the refusal does not name {wanted!r}, so it says the tuned '
+                f'stage is unavailable without saying what would make it '
+                f'available: {exc}')
+    else:
+        raise Failed('read_selection(required=True) returned on an empty tree')
+
+    for module in copies:
+        origin = getattr(module, '__name__', '?')
+        for eid in sorted(module.TUNED_OF):
+            entries = (
+                ('resolve_experiment',
+                 lambda e=eid, m=module: m.resolve_experiment(e,
+                                                              out_root=empty)),
+                ('jobs', lambda e=eid, m=module: m.jobs(e, out_root=empty)),
+                ('all_jobs',
+                 lambda e=eid, m=module: m.all_jobs([e], out_root=empty)))
+            for name, call in entries:
+                try:
+                    produced = call()
+                except tuning.SelectionMissing:
+                    continue
+                except Exception as exc:                    # noqa: BLE001
+                    raise Failed(
+                        f'{origin}.{name}({eid!r}) raised '
+                        f'{type(exc).__name__} rather than the pre-registered '
+                        f'refusal tuning.SelectionMissing: {exc}') from None
+                raise Failed(
+                    f'{origin}.{name}({eid!r}) returned {produced!r} with no '
+                    f'selection in the tree. An empty enumeration of the tuned '
+                    f'stage is indistinguishable from a tuned stage that ran, '
+                    f'and DESIGN.md 3.3 makes that stage a prerequisite of the '
+                    f'RQ2 arbitration.')
+
+        catalogue = module.catalogue(out_root=empty)
+        for eid in module.TUNED_OF:
+            req(eid not in catalogue,
+                f'{origin}.catalogue() offered {eid} with no selection stored')
+        try:
+            module.catalogue(out_root=empty, include_tuned=True)
+        except tuning.SelectionMissing:
+            pass
+        else:
+            raise Failed(
+                f'{origin}.catalogue(include_tuned=True) returned without the '
+                f'tuned ids instead of refusing. A caller that has decided to '
+                f'run the tuned stage is asking for it, and a catalogue that '
+                f'quietly omits it hands back the common policy alone.')
+        try:
+            module.activate_tuned_arms(out_root=empty)
+        except tuning.SelectionMissing:
+            pass
+        else:
+            module.deactivate_tuned_arms()
+            raise Failed(f'{origin}.activate_tuned_arms() installed the tuned '
+                         f'arms with no selection to build them from')
+        req(not module.tuned_arms_active(),
+            f'{origin} holds the tuned arms after a refused activation, so a '
+            f'failed call left the catalogue half-installed')
+        same(module.active_selection(), None,
+             f'{origin} holds an active selection after a refused activation')
+
+    # And the other way a tuned arm can be built from the wrong thing: an
+    # activated selection and a stored one that disagree is refused rather than
+    # resolved by precedence. A tuned arm's run digest is a function of the
+    # selection, so enumerating under one against a tree populated under the
+    # other writes runs that no arm declares.
+    first = _selection()
+    second = _selection((registry._tag(*registry.CELLS[0]),))
+    req(first.selection_id != second.selection_id,
+        'the two fixture selections are the same artifact, so the '
+        'disagreement below cannot arise')
+    other = _selection_tree(ctx, second)
+    with _tuned_catalogue(first, _selection_tree(ctx, first)):
+        for module in copies:
+            try:
+                module.jobs('E1t', out_root=other)
+            except ValueError as exc:
+                req(first.short_id in str(exc) and second.short_id in str(exc),
+                    f'the refusal does not name both selections: {exc}')
+            else:
+                raise Failed(
+                    f'{getattr(module, "__name__", "?")}.jobs enumerated E1t '
+                    f'while the activated selection ({first.short_id}) and the '
+                    f'one stored in the tree ({second.short_id}) disagree. One '
+                    f'of the two answers is a set of runs nothing declares.')
+
+        # The audit turns that refusal into a finding rather than a traceback:
+        # a checker that dies on one unresolvable experiment produces no report
+        # for any of the others.
+        declared = audit.declare(seeds=[0], out_root=other)
+    codes = {f.code for f in declared.findings}
+    req('catalogue_unresolvable' in codes,
+        f'audit.declare did not report the unresolvable tuned experiment as a '
+        f'finding; it reported {sorted(codes)}. An audit that dies on one '
+        f'experiment produces no report for any of the others.')
+    ctx.note(f'{len(copies)} registry copies: resolve_experiment, jobs, '
+             f'all_jobs, catalogue(include_tuned=True) and activate_tuned_arms '
+             f'each refuse with SelectionMissing; a disagreeing pair refuses '
+             f'and audit.declare reports it')
+
+
+@case('DESIGN.md 3.3 -- a cell selecting the a priori configuration SHARES the '
+      'common policy\'s run directories, and one that does not gets its own')
+def test_tuned_cells_share_runs_only_when_a_priori(ctx: Ctx) -> None:
+    """The property that makes the tuned stage an upper bound and not a doubling.
+
+    `lr` is a trajectory field, so a cell whose E3 selection happens to be the a
+    priori configuration produces run digests identical to its common-policy
+    arms and shares those directories. `DESIGN.md` 3.3 quotes the cost of the
+    secondary policy on that basis, and the arbitration for such a cell is
+    trivially satisfied because the two policies are literally the same runs.
+
+    Both halves are guarded, because each fails in its own direction. Lose the
+    sharing -- give a tuned arm any distinguishing field -- and every cell costs
+    a second run, the quoted cost is wrong, and two independent estimates of one
+    quantity appear where there is one run. Lose the separation -- let a retuned
+    cell collapse onto the common policy's directory -- and the secondary policy
+    is not run at all while the catalogue says it was.
+
+    The labels are checked apart from the runs. Two arms may share a directory;
+    that is a fact about configuration and the catalogue is full of it. Sharing
+    a *label* would be a claim about arms, and `plots.py` selects curve rows by
+    label, so it would merge the two policies wherever they really differ.
+    """
+    from experiments import registry
+
+    tuning = _tuning()
+    cells = [registry._tag(*c) for c in registry.CELLS]
+    retuned, shared_cells = cells[:2], cells[2:]
+    selection = _selection(retuned)
+    root = _selection_tree(ctx, selection)
+    same(sorted(selection.shared_cells), sorted(shared_cells),
+         'the fixture selection does not share the cells it was built to share')
+    for cell in retuned:
+        req(not selection.equals_a_priori(cell),
+            f'{cell} was given a configuration of its own and still reports '
+            f'equals_a_priori')
+
+    seeds = list(registry.SEED_BLOCKS['CONFIRM'])[:2]
+    for tuned_id, base_id in sorted(registry.TUNED_OF.items()):
+        common = registry.jobs(base_id, seeds=seeds, out_root=root)
+        tuned = registry.jobs(tuned_id, seeds=seeds, out_root=root,
+                              selection=selection)
+        same(len(tuned), len(common),
+             f'{tuned_id} enumerates a different number of jobs from '
+             f'{base_id}; the secondary policy replicates the same arms at a '
+             f'different configuration, so the arm count is the base '
+             f'experiment\'s')
+        common_keys = {j.key() for j in common}
+        # Keyed on (arm, seed): a source arm resolves to a different run at
+        # each seed, so an arm-only key would compare a tuned run against the
+        # common-policy run of some other seed and call the two different.
+        by_label = {(j.arm, int(j.cfg.seed)): j for j in common}
+
+        for job in tuned:
+            marked = job.arm.startswith(registry.TUNED_LABEL_PREFIX)
+            base_label = (job.arm[len(registry.TUNED_LABEL_PREFIX):]
+                          if marked else job.arm)
+            origin = by_label.get((base_label, int(job.cfg.seed)))
+            req(origin is not None,
+                f'{tuned_id}:{job.arm} has no counterpart in {base_id}, so the '
+                f'two policies are not replicating the same arms')
+            cell = registry._tag(str(job.cfg.arch), str(job.cfg.target_rule))
+            if str(job.cfg.env) == registry.SOURCE_ENV:
+                req(not marked,
+                    f'{tuned_id}:{job.arm} is a CartPole source run carrying '
+                    f'the tuned prefix. DESIGN.md 3.3 scopes the secondary '
+                    f'policy to the target task, and a source trained at a '
+                    f'rate selected on LunarLander would make the two policies '
+                    f'differ in the source as well as in the arm under study, '
+                    f'so a disagreement between them could no longer be read '
+                    f'as being about the tuning policy.')
+                same(job.key(), origin.key(),
+                     f'{tuned_id}:{job.arm} is a source run and does not share '
+                     f'{base_id}\'s directory, so the tuned stage would '
+                     f'retrain every source')
+                continue
+            req(marked,
+                f'{tuned_id}:{job.arm} is a retuned target-task arm and does '
+                f'not carry the {registry.TUNED_LABEL_PREFIX!r} prefix. Two '
+                f'arms may share a run; sharing a label would merge the two '
+                f'policies in every table and every figure that groups by one.')
+            if cell in shared_cells:
+                same(job.key(), origin.key(),
+                     f'{tuned_id}:{job.arm} selects the a priori configuration '
+                     f'and does not resolve onto {base_id}:{origin.arm}\'s run '
+                     f'directory. lr is a trajectory field, so an identical '
+                     f'configuration is an identical run; DESIGN.md 3.3 quotes '
+                     f'the cost of the secondary policy on exactly that, and '
+                     f'losing it doubles the stage and produces two '
+                     f'independent estimates of one quantity.')
+                same(job.cfg.run_digest(), origin.cfg.run_digest(),
+                     f'{tuned_id}:{job.arm} shares a directory with '
+                     f'{base_id}:{origin.arm} without sharing a run digest')
+            else:
+                req(job.key() not in common_keys,
+                    f'{tuned_id}:{job.arm} is in cell {cell}, which selected '
+                    f'{selection.cells[cell].config_key} rather than the a '
+                    f'priori configuration, and it still resolves onto a '
+                    f'common-policy run directory. The secondary policy would '
+                    f'then not be run at all while the catalogue said it was.')
+                differing = sorted(
+                    name for name in tuning.A_PRIORI_CONFIG.to_dict()
+                    if getattr(job.cfg, name) != getattr(origin.cfg, name))
+                req(differing,
+                    f'{tuned_id}:{job.arm} has a run directory of its own and '
+                    f'no selected field differs from {base_id}:{origin.arm}, '
+                    f'so the two were separated by something other than the '
+                    f'tuning policy')
+
+        # And the payoff, counted: the union costs the common policy plus one
+        # run per arm of the cells that were actually retuned.
+        union = registry.all_jobs([base_id, tuned_id], seeds=seeds,
+                                  out_root=root, selection=selection)
+        extra = [j for j in tuned if j.key() not in common_keys]
+        same(len(union), len(common) + len(extra),
+             f'{base_id}+{tuned_id} de-duplicates to {len(union)} runs, not '
+             f'the {len(common)} common-policy runs plus the {len(extra)} that '
+             f'the retuned cells add')
+        req(0 < len(extra) < len(tuned),
+             f'{tuned_id} adds {len(extra)} of {len(tuned)} runs, so the '
+             f'fixture is exercising only one side of the sharing property')
+        ctx.note(f'{base_id}+{tuned_id}: {len(common)} + {len(extra)} = '
+                 f'{len(union)} runs, {len(tuned) - len(extra)} shared')
+
+    # The whole catalogue, enumerated the way a launch would, with the tuned
+    # arms installed: every run directory still belongs to exactly one run.
+    # Checked on one registry copy because the two hold the same catalogue by
+    # construction, and `_tuned_catalogue` has just asserted that by installing
+    # into both.
+    module = _registry_copies()[0]
+    ids = [e for e in module.EXPERIMENTS if e != 'E0']
+    before = {j.key() for j in module.all_jobs(ids, out_root=root)}
+    with _tuned_catalogue(selection, root):
+        ids = [e for e in module.EXPERIMENTS if e != 'E0']
+        after = [j.key() for j in module.all_jobs(ids, out_root=root)]
+    same(len(after), len(set(after)),
+         'all_jobs returned a duplicated run directory with the tuned arms '
+         'installed, so two arms would write into one directory')
+    req(before <= set(after),
+        f'{len(before - set(after))} common-policy run(s) stopped being '
+        f'enumerated once the tuned arms were installed; the secondary policy '
+        f'adds runs and replaces none')
+
+
+@case('ANALYSIS_PLAN.md 2, 7 -- the confirmatory family is still exactly 8 '
+      'members with the tuned arms present')
+def test_confirmatory_family_is_eight_with_tuned_arms(ctx: Ctx) -> None:
+    """The arbitration is a conjunction over the same contrasts, not new tests.
+
+    `DESIGN.md` 3.3 asserts a conclusion only where both policies agree. That is
+    a *conjunction* over the eight pre-registered contrasts: the same four cells
+    and the same two co-primary endpoints, evaluated twice and required to
+    agree. It is not eight further tests, and treating it as sixteen would
+    loosen every Holm step in the family `ANALYSIS_PLAN.md` 2 and 7 fix at
+    eight.
+
+    The failure is not hypothetical. The family is the one thing in this
+    analysis that a result can be rescued by relocating, and adding a second
+    policy to the catalogue is exactly the kind of change that grows a family
+    without anybody deciding to. So the size is checked against the plan's
+    constant, against the catalogue the tuned arms install, against the ledger
+    the audit prints, and against a report computed over a table that carries
+    both policies.
+    """
+    from experiments import audit, registry, stats
+
+    same(stats.CONFIRMATORY_FAMILY_SIZE,
+         len(registry.CELLS) * len(stats.CONFIRMATORY_ENDPOINTS),
+         'the pre-registered family size is not 4 cells x 2 co-primary '
+         'endpoints')
+    same(stats.CONFIRMATORY_FAMILY_SIZE, 8,
+         'ANALYSIS_PLAN.md 2 fixes the confirmatory family at 8 members')
+
+    selection = _selection()                 # every cell shares its runs
+    root = _selection_tree(ctx, selection)
+    with _tuned_catalogue(selection, root):
+        for module in _registry_copies():
+            origin = getattr(module, '__name__', '?')
+            for eid in sorted(module.TUNED_OF):
+                exp = module.EXPERIMENTS[eid]
+                base = module.EXPERIMENTS[module.TUNED_OF[eid]]
+                cells = {registry._tag(str(a.overrides.get('arch')),
+                                       str(a.overrides.get('target_rule')))
+                         for a in exp.arms}
+                same(sorted(cells),
+                     sorted(registry._tag(*c) for c in registry.CELLS),
+                     f'{origin}: {eid} covers cells other than the '
+                     f'pre-registered 2x2, so the confirmatory family would '
+                     f'gain members')
+                same(exp.family, base.family,
+                     f'{origin}: {eid} declares a family of its own rather '
+                     f'than inheriting {base.id}\'s. A second family is a '
+                     f'second error budget, and the arbitration spends none: '
+                     f'it is a conjunction over the same eight contrasts.')
+        ledger = audit.multiplicity_ledger(list(audit.registry.EXPERIMENTS))
+        req(str(stats.CONFIRMATORY_FAMILY_SIZE) in str(ledger['members']),
+            f'the audit ledger reports members={ledger["members"]!r} with the '
+            f'tuned arms in the catalogue, which is not the '
+            f'{stats.CONFIRMATORY_FAMILY_SIZE} ANALYSIS_PLAN.md 2 fixes')
+        confirmatory = set(ledger['confirmatory_experiments_in_selection'])
+        # Only the tuned experiments whose BASE is confirmatory: E2t
+        # replicates E2, which is an estimation experiment, and counting it
+        # here would put an estimation-only experiment in the error budget.
+        expect = {eid for eid, base in audit.registry.TUNED_OF.items()
+                  if audit.registry.EXPERIMENTS[base].family == 'confirmatory'}
+        req(expect <= confirmatory,
+            f'{sorted(expect - confirmatory)} replicate a confirmatory '
+            f'experiment and are not counted as confirmatory in the '
+            f'multiplicity ledger ({sorted(confirmatory)}), so a reader cannot '
+            f'see that the family is evaluated under two policies')
+
+    # And over a table that carries them. Every cell of this selection shares
+    # its runs, so a tuned row IS the common-policy row: one row per seed
+    # belonging to both experiments, which is what the shared case looks like
+    # once `aggregate.py` has exported it.
+    actx, origin = _analysis_ctx(ctx)
+    frame = _select_rows(actx)
+    req(len(_target_seeds(actx, frame)) >= stats.MIN_N_FOR_INFERENCE,
+        f'{origin} has too few target-side seeds for any member to be tested, '
+        f'so a family of 8 could not be told from 8 suppressions')
+    args = ['--experiments', 'E1', 'E1t', '--source-policy', 'pooled']
+    path = _write_per_seed(actx, _mark_experiments(frame, ('E1', 'E1t')))
+    code, _text, report = _run_stats(actx, path, args)
+    same(code, 0, f'stats.py exited {code} with both policies selected')
+    members = _members(report)
+    same(int(report['s5_confirmatory']['family_size']),
+         stats.CONFIRMATORY_FAMILY_SIZE,
+         'the report declares a family size other than the pre-registered one '
+         'when the tuned experiment is in the selection')
+    same(len(members), stats.CONFIRMATORY_FAMILY_SIZE,
+         f'the confirmatory family has {len(members)} members with both '
+         f'policies selected. The DESIGN.md 3.3 arbitration is a conjunction '
+         f'over the same eight contrasts; a family that grew with the second '
+         f'policy would loosen every Holm step the plan fixes at '
+         f'{stats.CONFIRMATORY_FAMILY_SIZE}.')
+    same(sorted({m['cell'] for m in members}), sorted(stats.CELL_ORDER),
+         'the members are not the four pre-registered cells')
+    req(_tested(members),
+        'no member was tested, so this case cannot tell a family of 8 from a '
+        'family of 8 suppressions')
+    ctx.note(f'family_size={report["s5_confirmatory"]["family_size"]} over '
+             f'{len(members)} member(s) with E1 and E1t both selected; the '
+             f'tuned experiments inherit the confirmatory family rather than '
+             f'opening a second one')
+
+
+def _not_placeholder(selection):
+    """The same selection, recorded as having been computed under a real rule.
+
+    `tuning.SELECTION_RULE` is still the placeholder, and every selection these
+    cases build supplies a rule of its own, so `compute_selection` records
+    `placeholder: true` on all of them -- correctly, because neither is the
+    criterion `ANALYSIS_PLAN.md` 2.3 pre-registers. `stats.py` blocks an RQ2
+    assertion outright while that flag is set, which is right and which would
+    also make "nothing was asserted" true here for a reason that has nothing to
+    do with the arbitration. So one fixture selection carries the flag cleared,
+    to give the arbitration cases a state in which an assertion IS permitted.
+    Without it a mutant that never asserted anything would pass.
+
+    Re-addressed after the edit, because `read_selection` re-checks the content
+    address and would otherwise refuse the artifact as one edited after the
+    fact -- which is exactly the guard `audit.py` relies on.
+    """
+    import dataclasses
+
+    tuning = _tuning()
+    rule = dict(selection.rule)
+    rule['placeholder'] = False
+    rule['id'] = f'{_TUNING_FIXTURE_MARKER}-rule-not-a-placeholder'
+    out = dataclasses.replace(selection, rule=rule)
+    return dataclasses.replace(
+        out, selection_id=tuning.content_address(out.addressed_payload()))
+
+
+def _rejection_is_attainable(n: int) -> bool:
+    """Whether the exact sign-flip test can reject at this n, at all.
+
+    The two-sided exact test over `n` paired deltas enumerates 2**n sign
+    assignments, so its smallest attainable p is 2/2**n; Holm over the
+    pre-registered family of eight compares the smallest p against alpha/8.
+    Below n=9 no member can reject however large the effect, which means an
+    arbitration case run there could never produce a DISAGREES and would be
+    asserting about a state the data cannot reach.
+    """
+    from experiments import stats
+
+    return (2.0 / float(2 ** int(n))) * stats.CONFIRMATORY_FAMILY_SIZE \
+        < stats.ALPHA
+
+
+def _arbitration_ctx(ctx: Ctx) -> tuple[Ctx, str]:
+    """A context whose tree carries enough seeds for a leg to REJECT.
+
+    `_analysis_ctx` asks for `MIN_N_FOR_INFERENCE` seeds, which is the floor
+    below which no member is computed at all. The arbitration needs more than
+    that: two policies can only be shown to DISAGREE if at least one of them
+    can reject, and at `n=3` the exact sign-flip test cannot return a p below
+    0.25 whatever the effect. On a tree with fewer than nine target-side seeds
+    this returns the deterministic fixture instead, and says so.
+    """
+    import dataclasses
+
+    actx, origin = _analysis_ctx(ctx)
+    seeds = _target_seeds(actx, _select_rows(actx))
+    if _rejection_is_attainable(len(seeds)):
+        return actx, origin
+    root = ctx.tmpdir('arbitration_')
+    _fixture_frame(_select_rows(actx)).to_csv(
+        os.path.join(root, 'per_seed.csv'), index=False)
+    return dataclasses.replace(actx, runs=root), (
+        f'a SYNTHETIC {_fixture_seed_count()}-seed fixture: the tree at '
+        f'{actx.runs} has {len(seeds)} target-side seed(s) and the exact '
+        f'sign-flip test cannot reject at that n whatever the effect, so no '
+        f'disagreement between the two policies could be constructed there. '
+        f'No number below is a result')
+
+
+@case('DESIGN.md 3.3 -- stats.py asserts no RQ2 conclusion while the '
+      'arbitration verdict is not-evaluable, and a disagreement is the finding',
+      slow=True)
+def test_no_rq2_conclusion_without_the_arbitration(ctx: Ctx) -> None:
+    """The pre-registered condition on the study's primary confirmatory claim.
+
+    `DESIGN.md` 3.3: "an RQ2 or RQ3 conclusion is asserted only if it holds
+    under BOTH policies. Where they disagree, that disagreement is the finding."
+    Until the tuned stage existed there was nothing to arbitrate against, and
+    the analysis asserted RQ2 anyway: a Holm-adjusted p below 0.05 in 5a was the
+    end of the matter and nothing in the output said that the second leg of the
+    pre-registered condition had never been run. That is the defect this case
+    guards, and it guards it in the direction that matters -- the default state
+    is `not-evaluable`, and `not-evaluable` BLOCKS an assertion rather than
+    permitting one.
+
+    Four states are driven, because a guard that only ever saw the refusing one
+    could not be told from a module that refuses everything:
+
+    * no tuned runs and no selection: every verdict `not-evaluable`, nothing
+      asserted, and the report says so in words rather than leaving a reader to
+      infer it from a column;
+    * every cell sharing the common policy's runs, under a selection that is
+      not a placeholder: the two legs are the same runs, they agree by
+      construction, and an assertion IS permitted. This is the positive control;
+    * the same runs under a PLACEHOLDER selection: the verdict still agrees and
+      the assertion is blocked anyway, because arms enumerated from a rule the
+      plan does not contain are not the secondary policy;
+    * one cell whose tuned leg concludes the opposite way: `disagrees`, no
+      assertion, the disagreement printed as the finding, and every other cell
+      still assertable, so the refusal is shown to be the targeted one.
+    """
+    import pandas as pd
+
+    from experiments import registry, stats
+
+    tuning = _tuning()
+    actx, origin = _arbitration_ctx(ctx)
+    frame = _select_rows(actx)
+    seeds = _target_seeds(actx, frame)
+    req(_rejection_is_attainable(len(seeds)),
+        f'{origin} carries {len(seeds)} target-side seed(s); the exact '
+        f'sign-flip test cannot reject at that n, so neither leg could reach a '
+        f'directional conclusion and a disagreement could not be constructed')
+    args = ['--experiments', 'E1', 'E1t', '--source-policy', 'pooled']
+
+    def arbitration(report: dict) -> dict:
+        arb = report['s5_confirmatory'].get('arbitration')
+        req(arb, 'the confirmatory section carries no arbitration at all, so '
+                 'DESIGN.md 3.3\'s condition on the primary conclusion is not '
+                 'evaluated anywhere and a Holm-adjusted p is the end of the '
+                 'matter again')
+        return {(r['metric'], r['cell']): r for r in arb['rows']}
+
+    def asserted(report: dict) -> list[dict]:
+        return [m for m in _members(report) if m.get('asserted')]
+
+    # -- 1. the default state. No tuned run, no selection artifact.
+    plain = _write_per_seed(actx, frame)
+    code, text, report = _run_stats(actx, plain, args)
+    same(code, 0, f'stats.py exited {code} with no tuned runs present')
+    rows = arbitration(report)
+    same(len(rows), stats.CONFIRMATORY_FAMILY_SIZE,
+         'the arbitration does not cover the whole confirmatory family')
+    for key, row in sorted(rows.items()):
+        same(row['verdict'], stats.NOT_EVALUABLE,
+             f'{key[0]}/{key[1]}: the arbitration returned a verdict with no '
+             f'tuned runs in the analysis set. The secondary policy of '
+             f'DESIGN.md 3.3 has not been run, so the second leg has nothing '
+             f'to conclude and the only honest verdict is not-evaluable.')
+        req(not row['assertable'],
+            f'{key[0]}/{key[1]}: assertable under a not-evaluable arbitration')
+    same(asserted(report), [],
+         f'{len(asserted(report))} confirmatory member(s) are marked asserted '
+         f'while the second leg of the DESIGN.md 3.3 arbitration has not been '
+         f'run. This is the defect exactly: a member reaching alpha under the '
+         f'common configuration is a result under that policy and is not this '
+         f'study\'s confirmatory conclusion until the tuned policy agrees.')
+    req('NO RQ2 CONCLUSION IS ASSERTED' in text,
+        'the report does not say that no RQ2 conclusion is asserted; a reader '
+        'who stopped at the 5a table would take a Holm-adjusted p below alpha '
+        'as the study\'s confirmatory conclusion, which is what the '
+        'arbitration exists to prevent')
+
+    # -- 2. the positive control: every cell shares the common policy's runs,
+    #       under a selection recorded as a real rule. The two legs are then
+    #       the same runs, they agree by construction, and an assertion is
+    #       permitted -- so "nothing was asserted" above is a property of the
+    #       arbitration and not of a module that never asserts.
+    marked = _mark_experiments(frame, ('E1', 'E1t'))
+    shared = _not_placeholder(_selection())
+    shared_path = tuning.selection_path(_selection_tree(ctx, shared))
+    code, text, report = _run_stats(
+        actx, _write_per_seed(actx, marked), args + ['--selection',
+                                                     shared_path])
+    same(code, 0, f'stats.py exited {code} over the sharing selection')
+    rows = arbitration(report)
+    licensed = [k for k, r in sorted(rows.items())
+                if r['conclusion_common'] != stats.CONCLUSION_NONE]
+    for key, row in sorted(rows.items()):
+        same(row['tuned_arms'], 'shared',
+             f'{key[0]}/{key[1]}: the selection gives every cell the a priori '
+             f'configuration, so every cell has the common policy own runs as '
+             f'its tuned arms and the state is "shared"')
+        if key not in licensed:
+            # The common leg is suppressed for this member, so there is no
+            # first-leg conclusion to arbitrate. `not-evaluable` is the right
+            # answer, and it still blocks an assertion, which is the direction
+            # the pre-registration requires.
+            same(row['verdict'], stats.NOT_EVALUABLE,
+                 f'{key[0]}/{key[1]}: the common-policy member is suppressed '
+                 f'and the arbitration reached a verdict over it anyway')
+            req(not row['assertable'],
+                f'{key[0]}/{key[1]}: assertable with no first-leg conclusion')
+            continue
+        same(row['verdict'], stats.AGREES,
+             f'{key[0]}/{key[1]}: the two legs are the SAME RUNS and the '
+             f'arbitration did not find them in agreement '
+             f'({row["conclusion_common"]} against {row["conclusion_tuned"]})')
+    req(licensed, 'every common-policy member is suppressed on this tree, so '
+                  'the positive control cannot show an assertion being '
+                  'permitted')
+    for key in licensed:
+        req(rows[key]['assertable'],
+            f'{key[0]}/{key[1]}: both legs agree, the selection is not a '
+            f'placeholder and the member still cannot be asserted. A guard '
+            f'that refuses every state refuses nothing in particular.')
+    req(asserted(report),
+        'no confirmatory member is marked asserted even where both policies '
+        'agree, so the refusals above cannot be told from a module that never '
+        'asserts anything')
+
+    # -- 3. the same runs, under a PLACEHOLDER selection. The verdict still
+    #       agrees; the assertion is blocked anyway, because arms enumerated
+    #       from a rule ANALYSIS_PLAN.md 2.3 does not contain are not the
+    #       secondary policy.
+    fixture_path = tuning.selection_path(_selection_tree(ctx, _selection()))
+    code, text, report = _run_stats(
+        actx, _write_per_seed(actx, marked),
+        args + ['--selection', fixture_path])
+    same(code, 0, f'stats.py exited {code} over the placeholder selection')
+    rows = arbitration(report)
+    req(any(r['verdict'] == stats.AGREES for r in rows.values()),
+        'the placeholder run produced no agreeing verdict at all, so the block '
+        'below cannot be told from a not-evaluable arbitration')
+    same(asserted(report), [],
+         'a conclusion was asserted from a selection computed under a rule '
+         'that declares itself a placeholder. ANALYSIS_PLAN.md 2.3 fixes the '
+         'criterion; arms enumerated from any other one test the pipeline and '
+         'are not the secondary policy.')
+    req('ASSERTION BLOCKED' in text,
+        'the placeholder block is not stated in the output, so a reader sees '
+        'agreeing verdicts and no assertion with nothing saying why')
+
+    # -- 4. a cell whose tuned leg concludes the other way. DESIGN.md 3.3
+    #       makes the disagreement the finding, and it must be reported as one
+    #       rather than averaged, resolved towards the primary, or left in a
+    #       column.
+    cells = [c for c in stats.CELL_ORDER if c in set(frame['cell'])]
+    retuned = next(
+        (c for c in cells
+         if all(rows[(m, c)]['conclusion_common'] != stats.CONCLUSION_NONE
+                for m in stats.CONFIRMATORY_ENDPOINTS)), None)
+    req(retuned, f'no cell of {cells} carries a conclusion under the common '
+                 f'policy for both co-primary endpoints, so no disagreement '
+                 f'can be constructed against one')
+    selection = _not_placeholder(_selection((retuned,)))
+    chosen = selection.config_for(retuned)
+    path = tuning.selection_path(_selection_tree(ctx, selection))
+
+    target = frame[(frame['cell'] == retuned)
+                   & (frame['env'] == registry.TARGET_ENV)].copy()
+    req(len(target), f'no target-side row for {retuned}')
+    target['label'] = registry.TUNED_LABEL_PREFIX + target['label'].astype(str)
+    target['experiments'] = 'E1t'
+    target['lr'] = float(chosen.lr)
+    target['target_update'] = chosen.target_update
+    target['run_digest'] = [f'{0xa0000 + i:032x}' for i in range(len(target))]
+    target['run_dir'] = [f'{_TUNING_FIXTURE_MARKER}/tuned{i:04d}'
+                         for i in range(len(target))]
+    # The tuned leg is made to reach the OPPOSITE conclusion from the common
+    # one, per endpoint, by moving its transfer arm a long way from its scratch
+    # arm in the chosen direction at every seed. A uniform sign across all
+    # seeds is what the exact sign-flip test needs in order to reject at all.
+    is_transfer = target['condition'] == 'transfer'
+    for metric in stats.CONFIRMATORY_ENDPOINTS:
+        if metric not in target.columns:
+            continue
+        common_says = rows[(metric, retuned)]['conclusion_common']
+        step = -8.0 if common_says == stats.CONCLUSION_UP else 8.0
+        base = pd.to_numeric(target.loc[~is_transfer, metric],
+                             errors='coerce').mean()
+        base = 0.0 if pd.isna(base) else float(base)
+        target.loc[is_transfer, metric] = [
+            base + step + 0.001 * i
+            for i in range(int(is_transfer.sum()))]
+    both = pd.concat([marked, target], ignore_index=True)
+
+    code, text, report = _run_stats(
+        actx, _write_per_seed(actx, both), args + ['--selection', path])
+    same(code, 0, f'stats.py exited {code} over the disagreeing selection')
+    rows = arbitration(report)
+    disagreed = [k for k, r in rows.items()
+                 if k[1] == retuned and r['verdict'] == stats.DISAGREES]
+    req(disagreed,
+        f'{retuned} was run under both policies with the tuned leg reaching '
+        f'the opposite conclusion, and the arbitration reported '
+        f'{sorted({rows[(m, retuned)]["verdict"] for m in stats.CONFIRMATORY_ENDPOINTS})}'
+        f' rather than a disagreement. Its states were '
+        f'{[(m, rows[(m, retuned)]["conclusion_common"], rows[(m, retuned)]["conclusion_tuned"], rows[(m, retuned)]["tuned_arms"]) for m in stats.CONFIRMATORY_ENDPOINTS]}.')
+    for key in disagreed:
+        req(not rows[key]['assertable'],
+            f'{key[0]}/{key[1]} is assertable while the two policies disagree')
+        req(rows[key]['why'],
+            f'{key[0]}/{key[1]} disagrees and the report gives no reason, so '
+            f'the disagreement cannot be reported as the finding it is')
+    for member in _members(report):
+        if member['cell'] == retuned:
+            req(not member.get('asserted'),
+                f'{member["metric"]}/{retuned}: a conclusion was asserted for '
+                f'a cell in which the common configuration and the per-cell '
+                f'tuned configuration reach opposite conclusions. DESIGN.md '
+                f'3.3 makes that disagreement the finding and asserts nothing.')
+    req('THE TWO POLICIES DISAGREE' in text,
+        'the disagreement is not reported in words. DESIGN.md 3.3 requires it '
+        'to BE the finding, and a verdict that appears only as a column value '
+        'is not one')
+    elsewhere = [k for k, r in rows.items()
+                 if k[1] != retuned and r['verdict'] == stats.AGREES]
+    req(elsewhere,
+        f'giving {retuned} a disagreeing tuned leg moved every other cell off '
+        f'agreement as well, so this guard cannot be told from an arbitration '
+        f'that never agrees')
+    req(asserted(report),
+        f'no member anywhere is asserted once {retuned} disagrees; the other '
+        f'three cells share their runs and agree by construction, so the '
+        f'refusal is not the targeted one this case is asserting')
+    ctx.note(f'against {origin.split(":")[0]}: {len(rows)} member(s) '
+             f'not-evaluable with no tuned runs and none asserted; all '
+             f'agreeing and {len(asserted(report))} assertable when every cell '
+             f'shares its runs; blocked under a placeholder rule; '
+             f'{len(disagreed)} disagreement(s) in {retuned} reported as the '
+             f'finding with lr={chosen.lr:g} against the common '
+             f'{registry.COMMON["lr"]:g}')
+
+
+@case('DESIGN.md 3.4, ANALYSIS_PLAN.md 8 -- no reported estimate draws on a '
+      'TUNE seed once the tuned arms are in the catalogue')
+def test_no_reported_estimate_draws_on_tune_with_tuned_arms(ctx: Ctx) -> None:
+    """The seeds a learning rate was chosen on are never seeds it is judged on.
+
+    This is the selection-bias guard at the point where the catalogue grew a new
+    way to break it. The tuned arms are built from a selection made on TUNE; if
+    they were then enumerated on TUNE, or if the selection's own evidence seeds
+    reached a reported estimate, the confirmatory sample would again contain the
+    seeds its hyperparameters were chosen on, which is revision 1's defect with
+    one extra step in front of it.
+
+    Three things are required, at three layers. The catalogue must not schedule
+    a tuned arm on a selection seed. The selection's evidence and the tuned
+    arms' seeds must be disjoint *sets*, not merely different block names. And
+    `stats.py` must still exclude a TUNE row that arrives wearing a tuned label,
+    since the tuned arms are the first reported experiments whose provenance
+    runs through the selection block at all.
+    """
+    import pandas as pd
+
+    from experiments import registry, stats
+
+    tuning = _tuning()
+    tune = set(registry.SEED_BLOCKS[tuning.SELECTION_SEED_BLOCK])
+    selection = _selection((registry._tag(*registry.CELLS[0]),))
+    root = _selection_tree(ctx, selection)
+
+    req(set(selection.seeds) <= tune,
+        f'the selection records evidence seeds {list(selection.seeds)} outside '
+        f'the {tuning.SELECTION_SEED_BLOCK} block')
+    evidence = {int(s) for cell in selection.cells.values() for s in cell.seeds}
+    req(evidence <= tune,
+        f'the selected candidates were measured at seeds {sorted(evidence)}, '
+        f'which are not all in the selection block')
+
+    with _tuned_catalogue(selection, root):
+        for module in _registry_copies():
+            origin = getattr(module, '__name__', '?')
+            for eid in sorted(module.TUNED_OF):
+                exp = module.EXPERIMENTS[eid]
+                base = module.EXPERIMENTS[module.TUNED_OF[eid]]
+                same(exp.seed_block, base.seed_block,
+                     f'{origin}: {eid} declares a seed block other than the '
+                     f'one {base.id} declares, so the two policies would be '
+                     f'estimated on different samples')
+                declared = set(module.resolve_seeds(None, exp.seed_block))
+                leaked = sorted(declared & tune)
+                req(not leaked,
+                    f'{origin}: {eid} is declared on seeds {leaked}, which are '
+                    f'the seeds its own learning rate was selected on. That is '
+                    f'ANALYSIS_PLAN.md 8\'s forbidden case with the selection '
+                    f'artifact in between.')
+                req(not (evidence & declared),
+                    f'{origin}: {eid} is declared on the very seeds the '
+                    f'selection was computed from')
+            # And the whole catalogue at its declared blocks: a job on a TUNE
+            # seed may only belong to an experiment that declares the block.
+            ids = [e for e in module.EXPERIMENTS if e != 'E0']
+            offenders: dict = {}
+            for job in module.all_jobs(ids, out_root=root):
+                if int(job.cfg.seed) in tune:
+                    if module.EXPERIMENTS[job.experiment].seed_block \
+                            != tuning.SELECTION_SEED_BLOCK:
+                        offenders.setdefault(job.experiment, set()).add(
+                            int(job.cfg.seed))
+            req(not offenders,
+                f'{origin}: {sorted(offenders)} are scheduled on TUNE seeds '
+                f'{sorted({s for v in offenders.values() for s in v})} without '
+                f'declaring the selection block. DESIGN.md 3.4 gives TUNE one '
+                f'licensed use, and this is not it.')
+
+    # The analysis layer, with a tuned label on the contaminated rows. The
+    # tuned arms are the first REPORTED experiments whose provenance runs
+    # through the selection block, so the exclusion is exercised on them by
+    # name rather than only on a row that happens to carry a TUNE seed.
+    actx, origin = _analysis_ctx(ctx)
+    frame = _select_rows(actx)
+    marked = _mark_experiments(frame, ('E1', 'E1t'))
+    args = ['--experiments', 'E1', 'E1t', '--source-policy', 'pooled']
+    code, _t, base = _run_stats(actx, _write_per_seed(actx, marked), args)
+    same(code, 0, f'stats.py exited {code} on the uncontaminated selection')
+
+    seed = int(sorted(tune)[0])
+    contaminated = marked[marked['condition'] == 'transfer'].head(4).copy()
+    req(len(contaminated),
+        'the selection holds no transfer row to relabel as a tuned TUNE run')
+    contaminated['seed'] = seed
+    contaminated['seed_block'] = tuning.SELECTION_SEED_BLOCK
+    contaminated['label'] = (registry.TUNED_LABEL_PREFIX
+                             + contaminated['label'].astype(str))
+    contaminated['experiments'] = 'E1t'
+    contaminated['run_digest'] = [f'{0xb0000 + i:032x}'
+                                  for i in range(len(contaminated))]
+    path = _write_per_seed(actx, pd.concat([marked, contaminated],
+                                           ignore_index=True))
+    code, text, report = _run_stats(actx, path, args)
+    same(code, 0, f'stats.py exited {code} on the contaminated selection')
+    same(int(report['invocation'].get('tune_runs_excluded') or 0),
+         len(contaminated),
+         f'stats.py did not exclude the {len(contaminated)} tuned run(s) '
+         f'injected at TUNE seed {seed}. A tuned arm is enumerated from a '
+         f'selection made on that block, so a tuned row sitting on it is the '
+         f'selection sample and the estimate at once.')
+    req(tuning.SELECTION_SEED_BLOCK in text,
+        'the exclusion is not mentioned in the output, so a reader cannot see '
+        'that it happened')
+
+    def fingerprint(members: Sequence[dict]) -> list[tuple]:
+        return [(m['metric'], m['cell'], m.get('n'), m.get('p_signflip'))
+                for m in members]
+    same(fingerprint(_members(report)), fingerprint(_members(base)),
+         'the confirmatory family moved when TUNE-block tuned rows were added '
+         'to the input. Excluding them is not enough if they change the '
+         'answer: a number that moved was computed on a sample that had been '
+         'tuned on.')
+    ctx.note(f'the selection evidence {sorted(evidence)} and the tuned arms\' '
+             f'declared seeds are disjoint; no non-selection experiment is '
+             f'scheduled on TUNE; {len(contaminated)} tuned TUNE row(s) '
+             f'excluded and the family unmoved')
+
+
+@case('DESIGN.md 3.3, 8.3 -- audit.py scopes the per-cell invariant to the '
+      'cell and refuses a tuned run that does not match the stored selection',
+      slow=True)
+def test_audit_scopes_and_provenances_the_tuned_arms(ctx: Ctx) -> None:
+    """The two audit-side halves of the secondary policy, over a real tree.
+
+    `DESIGN.md` 3.3 says `audit.py` enforces `lr` invariance "within a cell
+    across {scratch, transfer, C2, C3}" and deliberately not across cells. That
+    scope has two ways of being wrong and only one of them is a missing check.
+    Too wide -- the whole experiment -- and it reports the across-cell variation
+    the design asks for as a violation, which makes the audit unpassable on a
+    correct tree. Keyed on the wrong grouping and it reports nothing at all: an
+    `lr` that drifted between two runs of one cell would pass, which is the
+    published study's defect exactly. The key is (arch, target_rule, env),
+    because the tuned experiments carry the selected rate on the target task and
+    the common one on the CartPole sources they share with the primary policy,
+    so a key without the environment fires on every retuned cell.
+
+    The second half is provenance. The tuned arms are a function of one stored
+    artifact, so replacing that artifact re-points every arm: the runs already
+    on disk stay there, no arm declares them any more, and the arms the new
+    selection declares are reported missing. Nothing else in `audit.py` can see
+    it -- those runs have consistent digests, valid manifests and a matching
+    plan hash -- so a tuned run is compared against the selection on disk, and
+    where it disagrees the archived selections are searched for the one it does
+    match.
+    """
+    from experiments import audit, registry
+
+    tuning = _tuning()
+    cells = [registry._tag(*c) for c in registry.CELLS]
+    retuned = cells[:2]
+    first = _selection(retuned)
+    root = ctx.tmpdir('tunedtree_')
+    _selection_tree(ctx, first, root=root)
+    seeds = list(registry.SEED_BLOCKS['CONFIRM'])[:1]
+    comparisons = 0
+
+    with _tuned_catalogue(first, root):
+        jobs = audit.registry.jobs('E1t', seeds=seeds, out_root=root,
+                                   selection=first)
+        _write_manifests(root, jobs)
+        runs, discovery = audit.discover_runs(root)
+        req(not discovery,
+            f'the fixture tree does not read back cleanly: {discovery}')
+        same(len(runs), len(jobs),
+             f'{len(jobs)} tuned job(s) produced {len(runs)} run(s) on disk')
+
+        declared = audit.declare(seeds=seeds, observed_seeds=seeds,
+                                 out_root=root)
+        membership, _orphans, _every = audit.attribute(runs, ['E1t'], declared)
+        exps = {'E1t': audit.registry.EXPERIMENTS['E1t']}
+
+        # -- 1. the intended structure is NOT a violation.
+        chk = audit.check_invariants(membership, exps, declared)
+        fired = [f.message for f in chk.findings
+                 if f.code == 'cell_invariant_violated']
+        req(not fired,
+            f'the per-cell scope fired on the structure DESIGN.md 3.3 asks '
+            f'for: {fired[:2]}. Under the secondary policy lr varies BETWEEN '
+            f'cells and the CartPole sources keep the common rate, so a scope '
+            f'that reports either as an error makes the audit unpassable on a '
+            f'correct tree.')
+        detail = chk.detail.get('cell_scope') or {}
+        comparisons = int(detail.get('field_x_cell_comparisons') or 0)
+        req(comparisons > 0,
+            f'the per-cell scope made {comparisons} comparison(s) over an '
+            f'experiment that declares scoped invariants, so it passed by '
+            f'looking at nothing. That is the dormant state the scope reports '
+            f'as a note, and it must not be the state it is in when the tuned '
+            f'arms are on disk.')
+        req('cell_scope_dormant' not in {f.code for f in chk.findings},
+            'the scope reported itself dormant with the tuned arms on disk')
+        checked = set(chk.detail['E1t'].get('cell_scope_fields') or ())
+        req(set(registry.TUNED_VARIES) <= checked,
+            f'the scope checks {sorted(checked)}, which does not cover the '
+            f'fields E1t declares varied {list(registry.TUNED_VARIES)}; a '
+            f'declared scoped invariant nothing compares is a declaration and '
+            f'not a check')
+
+        # -- 2. an lr that drifted WITHIN one cell is caught.
+        target = next(r for r in runs
+                      if str(r.cfg.get('env')) == registry.TARGET_ENV
+                      and r.cell in retuned)
+        original = float(target.cfg.get('lr'))
+        drifted = 3e-4
+        req(abs(drifted - original) > 1e-9,
+            'the injected lr equals the recorded one, so nothing was mutated')
+        target.manifest['config']['lr'] = drifted
+        req('cell_invariant_violated' in _codes(
+                audit.check_invariants(membership, exps, declared)),
+            f'one run of {target.cell} was moved from lr={original:g} to '
+            f'lr={drifted:g} and the per-cell scope did not report it. That is '
+            f'the published defect -- a transfer arm at 1e-4 against a '
+            f'baseline at 5e-4 under a claim of identical hyperparameters -- '
+            f'inside the one experiment whose declaration lets lr vary at all.')
+        target.manifest['config']['lr'] = original
+        req('cell_invariant_violated' not in _codes(
+                audit.check_invariants(membership, exps, declared)),
+            'the violation persists after the injected value was restored, so '
+            'the check is not reading what this case mutated')
+
+        # -- 3. provenance: the stored artifact against the runs on disk.
+        chk = audit.check_tuning_provenance(runs, root)
+        codes = _codes(chk)
+        req('tuned_selection_mismatch' not in codes,
+            f'the runs the registry enumerated from {first.short_id} are '
+            f'reported as not matching it: {sorted(codes)}')
+        req('selection_rule_is_placeholder' in codes,
+            f'a selection computed under a rule that is not the pre-registered '
+            f'criterion produced {len(runs)} tuned run(s), and the audit did '
+            f'not report it as an error; it reported {sorted(codes)}. '
+            f'ANALYSIS_PLAN.md 2.3 fixes the rule, and no number out of a run '
+            f'enumerated under any other one is a result.')
+        same(int(chk.detail.get('runs_compared_against_selection') or 0),
+             len(runs),
+             'the provenance check compared fewer runs than the tree holds, so '
+             'it passed on the ones it happened to look at')
+
+        # -- 4. replacing the active selection is refused unless asked for,
+        #       because that is what orphans the runs already on disk.
+        second = _selection(cells[2:])
+        try:
+            tuning.write_selection(second, root)
+        except tuning.SelectionError as exc:
+            req(first.short_id in str(exc),
+                f'the refusal does not name the selection being replaced: '
+                f'{exc}')
+        else:
+            raise Failed(
+                'write_selection replaced the active selection without being '
+                'asked to. Every tuned run on disk was enumerated from the old '
+                'one, so re-pointing it silently orphans them.')
+
+    # -- 5. and when it IS replaced, the audit says which selection the runs
+    #       on disk actually came from.
+    _selection_tree(ctx, second, root=root)
+    chk = audit.check_tuning_provenance(runs, root)
+    findings = [f for f in chk.findings if f.code == 'tuned_selection_mismatch']
+    req(findings,
+        f'the active selection was replaced with {second.short_id} and the '
+        f'{len(runs)} run(s) enumerated from {first.short_id} were not '
+        f'reported. They stay on disk, no arm declares them, and the arms the '
+        f'new selection declares read as missing -- which looks like a '
+        f'campaign that has not finished rather than an artifact that was '
+        f'swapped.')
+    named = {s for f in findings
+             for s in (f.detail.get('matches_archived') or [])}
+    req(first.short_id in named,
+        f'the finding does not name the archived selection the runs came from '
+        f'({first.short_id}); it named {sorted(named)}. Without that the '
+        f'report says the runs are wrong without saying what produced them.')
+
+    # -- 6. the artifact edited in place. It no longer hashes to its own id,
+    #       which is the only thing that makes such an edit visible at all.
+    path = tuning.selection_path(root)
+    with open(path, encoding='utf-8') as fh:
+        payload = json.load(fh)
+    payload['cells'][cells[0]]['config']['lr'] = 7e-4
+    with open(path, 'w', encoding='utf-8') as fh:
+        json.dump(payload, fh, indent=1)
+    req('selection_unreadable' in _codes(
+            audit.check_tuning_provenance(runs, root)),
+        f'the stored selection was edited after the runs were enumerated from '
+        f'it and the audit read it anyway')
+
+    # -- 7. and the artifact removed while its runs are still there.
+    os.remove(path)
+    req('tuned_runs_without_selection' in _codes(
+            audit.check_tuning_provenance(runs, root)),
+        f'{len(runs)} run(s) are recorded under the tuned experiments with no '
+        f'selection in the tree, and the audit did not report it')
+    ctx.note(f'{len(runs)} tuned run(s): the scope makes {comparisons} '
+             f'comparison(s), passes the intended across-cell variation and '
+             f'catches an lr drifting within a cell; the provenance check '
+             f'catches a replaced, an edited and a removed selection')
+
+
+# ===========================================================================
+# 7c. Coverage: what this suite does and does not check
 # ===========================================================================
 #: One entry per row of the `DESIGN.md` §9 table, keyed by the row's exact
 #: fallacy text. `cases` names the case(s) here that would fail if the guard
@@ -4599,10 +6621,17 @@ _GUARDRAIL_COVERAGE: dict[str, tuple[tuple[str, ...], str]] = {
         ('test_stats_no_pvalue_outside_family',
          'test_statlib_reference_values'), ''),
     'Selection bias in tuning': (
-        ('test_stats_excludes_tune_and_partial_arms', 'test_n1_is_labelled'),
-        'the TUNE refusal is exercised at the analysis layer; that the seed '
-        'blocks are disjoint in the catalogue is asserted by registry.py at '
-        'import and by audit.py over a tree'),
+        ('test_stats_excludes_tune_and_partial_arms', 'test_n1_is_labelled',
+         'test_selection_refuses_evidence_outside_tune',
+         'test_no_reported_estimate_draws_on_tune_with_tuned_arms',
+         'test_selection_refuses_incomplete_evidence'),
+        'the catalogue-side half is now covered for the tuned arms, which are '
+        'the first reported experiments whose provenance runs through TUNE: '
+        'their declared seeds, the selection\'s evidence seeds and the '
+        'analysis-layer exclusion are each checked. What is still not checked '
+        'here is that the seed blocks are disjoint for every OTHER experiment '
+        'in the catalogue, which registry.py asserts at import and audit.py '
+        'asserts over a tree'),
     'Treatment intensity mistaken for architecture': (
         ('test_stats_intensity_gate', 'test_statlib_reference_values'),
         'the analysis-side refusal is driven over a mutated fraction and the '
