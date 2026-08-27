@@ -21,3 +21,6 @@ __pycache__/
 # reviewer PDFs and the internal audit must not be published from here.
 paper/
 memory/
+
+# Confidential peer review for ICANN 2026 submission 603. Never published.
+experiments/REVIEW_COVERAGE.md

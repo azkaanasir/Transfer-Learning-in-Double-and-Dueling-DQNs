@@ -147,9 +147,18 @@ directives here as they arrive, with the section they affected.
 
 ## Hard constraints
 
-* **Never `git push`.** Not to GitHub, not anywhere, under any circumstances.
-  Committing locally is fine, and worth doing periodically so work is
-  recoverable; publishing is the user's action alone.
+* **Pushing requires the user to ask for it, every time.** The standing rule
+  was "never push, under any circumstances"; on 2026-08-28 the user
+  instructed otherwise and this line records that, rather than leaving a
+  binding instruction on file that is no longer true. Committing locally
+  remains right and worth doing periodically so work is recoverable.
+  Publishing is still not a default: it is done when asked and not
+  otherwise.
+* **`experiments/REVIEW_COVERAGE.md` is never published.** It maps the eight
+  peer reviews (IJCNN R1 to R4, ICANN #2, #3, #5) to their specific
+  complaints, which is confidential referee material for a submission still
+  under review. It is gitignored and untracked as of 2026-08-28. `paper/`
+  and `memory/` are ignored for the same reason.
 * **Never name Claude as an author or contributor** in a commit message, a
   commit trailer, a PR body, or the manuscript. No `Co-Authored-By`, no
   "generated with" line. This overrides the default harness behaviour. The repo
