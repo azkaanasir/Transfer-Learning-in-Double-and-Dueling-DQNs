@@ -1944,6 +1944,93 @@ AUDIT_OVERRIDE_STAMP = (
     'audit that did not pass, on an explicit --allow-audit-failure')
 
 
+#: See the note on the same name in `report.py`: resolved through `audit`
+#: so that there is one `tuning` module and one set of refusal classes.
+_SELECTION_MODULE = auditmod.tuning
+
+
+#: What a consumer prints where the selection cannot be read at all. FAILS
+#: CLOSED, like `read_arbitration`: the subject is never omitted, because a
+#: bundle that says nothing about which pre-registration the tuned arms were
+#: selected under reads as one where the question did not arise.
+SELECTION_PROVENANCE_UNREAD = (
+    'Tuning selection: NOT READ from this run tree, so the pre-registration '
+    'behind the DESIGN.md 3.3 tuned leg is unstated (ANALYSIS_PLAN.md 1).')
+
+
+def selection_plan_provenance(out_root: Any,
+                              current: Optional[str] = None) -> dict:
+    """Which `ANALYSIS_PLAN.md` version the tuned leg's evidence was produced under.
+
+    `ANALYSIS_PLAN.md` 1 puts the plan hash in "every run manifest and every
+    emitted table and figure" and re-labels every result produced under a
+    superseded version **exploratory**. For the runs in `per_seed.csv` that is
+    already handled: they carry `plan_hash` and a mismatch is stamped. The
+    tuned leg's evidence is not in that table. `E3` runs on the `TUNE` block,
+    which `ANALYSIS_PLAN.md` 8 bars from every reported estimate, so a
+    selection computed from runs produced under a superseded plan reaches the
+    tuned arms without leaving a trace in anything downstream of it. On the
+    completed screen that is not hypothetical: 155 of `E3`'s 160 runs were
+    produced under two superseded versions, which `ANALYSIS_PLAN.md` 11
+    predicted and `audit.py` reports as `plan_hash_split`.
+
+    Reads the artifact and never re-derives a selection. Never raises: an
+    absent, unreadable or edited artifact is reported as UNREAD, which is a
+    different statement from clean and is written down as one.
+    """
+    out = {'present': False, 'short_id': None, 'drift': False, 'split': False,
+           'stale': False, 'unknown': False, 'hashes': [], 'counts': {},
+           'rows_without_a_hash': 0, 'error': None, 'note': '',
+           'sentence': SELECTION_PROVENANCE_UNREAD}
+    if not out_root:
+        return out
+    try:
+        selection = _SELECTION_MODULE.read_selection(
+            str(out_root), required=False, warn_placeholder=False,
+            warn_plan_drift=False)
+    except Exception as exc:                       # noqa: BLE001 - see below
+        # Deliberately broad. This is a provenance annotation on somebody
+        # else's artifact, and every way of failing to read it (absent,
+        # truncated, edited so it no longer hashes to its own id, written under
+        # an older schema) has the same consequence here: the pre-registration
+        # is unstated. Letting one of them abort a report would make an
+        # unreadable selection quieter than a readable one.
+        out['error'] = f'{type(exc).__name__}: {exc}'
+        out['sentence'] = (SELECTION_PROVENANCE_UNREAD
+                           + ' The artifact could not be read: '
+                           + out['error'])
+        return out
+    if selection is None:
+        out['sentence'] = (
+            'Tuning selection: none stored in this run tree, so the DESIGN.md '
+            '3.3 tuned leg has not been selected and ANALYSIS_PLAN.md 2.4 '
+            'leaves every confirmatory member not-evaluable.')
+        return out
+    counts = dict(selection.evidence_plan_counts)
+    out.update({
+        'present': True,
+        'short_id': selection.short_id,
+        'split': bool(selection.evidence_plan_split),
+        'stale': bool(selection.evidence_plan_stale(current)),
+        'unknown': bool(selection.evidence_plan_unknown),
+        'drift': bool(selection.evidence_plan_drift(current)),
+        'hashes': sorted(counts),
+        'counts': counts,
+        'rows_without_a_hash': int(selection.evidence_rows_without_a_plan),
+        'note': selection.evidence_plan_note(current),
+    })
+    if out['drift']:
+        out['sentence'] = ('PRE-REGISTRATION DRIFT IN THE TUNING SELECTION: '
+                           + out['note'])
+    else:
+        only = out['hashes'][0] if out['hashes'] else 'unrecorded'
+        out['sentence'] = (
+            f'Tuning selection {out["short_id"]}: its E3 evidence was produced '
+            f'entirely under ANALYSIS_PLAN.md {only}, which is the plan in '
+            f'force here (ANALYSIS_PLAN.md 1).')
+    return out
+
+
 @dataclass
 class Context:
     """Everything a caption needs to state, computed once per invocation."""
@@ -1973,6 +2060,23 @@ class Context:
     #: the bundle carries its sidecar and nothing else, and a reader who cannot
     #: tell whether anything was assertable will assume it was.
     arbitration: Optional[dict] = None
+    #: The pre-registration behind the DESIGN.md 3.3 tuned leg, read off the
+    #: selection artifact. On the Context for the same reason `arbitration` is:
+    #: a table lifted out of the bundle carries its sidecar and nothing else,
+    #: and `plan_hash_in_data` below cannot answer this. E3 runs on TUNE,
+    #: ANALYSIS_PLAN.md 8 keeps TUNE out of every reported estimate, so the
+    #: plan hashes of the runs the tuned arms were selected from are not in
+    #: this table at any n.
+    selection_plan: dict = field(default_factory=dict)
+
+    def selection_plan_sentence(self) -> str:
+        """The one caption sentence about the tuned leg's pre-registration."""
+        return str(self.selection_plan.get('sentence')
+                   or SELECTION_PROVENANCE_UNREAD)
+
+    @property
+    def selection_plan_drift(self) -> bool:
+        return bool(self.selection_plan.get('drift'))
 
     def arbitration_sentence(self) -> str:
         """The one caption sentence, whatever state the input is in.
@@ -2046,6 +2150,13 @@ class Context:
                      'so every confirmatory number in this table is '
                      'EXPLORATORY until the change is recorded in '
                      'ANALYSIS_PLAN.md 11 (DESIGN.md 8.3, 9).')
+        if self.selection_plan_drift:
+            text += (' SELECTION PLAN HASH MISMATCH: '
+                     + str(self.selection_plan.get('note')
+                           or self.selection_plan_sentence())
+                     + ' Every number in this table that the DESIGN.md 3.3 '
+                       'arbitration licensed from the tuned leg is therefore '
+                       'EXPLORATORY on the same ground (ANALYSIS_PLAN.md 1).')
         return text
 
 
@@ -2095,6 +2206,11 @@ def build_context(df: pd.DataFrame, per_seed: str, stats_path: Optional[str],
         audit_override=audit_override,
         audit_failing=tuple(audit_failing),
         arbitration=(arbitration_summary(stats) if stats is not None else None),
+        # `audit_root` is the run tree this invocation was pointed at, which is
+        # where the selection lives; without one there is nothing to read and
+        # the helper reports that rather than assuming none exists.
+        selection_plan=selection_plan_provenance(
+            audit_root, provenance.plan_hashes().get('ANALYSIS_PLAN.md')),
     )
 
 
@@ -4718,6 +4834,7 @@ def write_table(t: Table, outdir: str, formats: Sequence[str],
         'plan_hash_in_force': ctx.plan_hashes.get('ANALYSIS_PLAN.md'),
         'plan_hash_in_run_data': list(ctx.plan_hash_in_data),
         'plan_hash_mismatch': ctx.plan_mismatch,
+        'selection_plan_provenance': dict(ctx.selection_plan),
         'named_columns_absent_from_input': [c for c, _w in ctx.optional_absent],
         'audit': {
             'root': (ctx.audit_root or '').replace(os.sep, '/') or None,
@@ -5691,6 +5808,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               'No number in these tables may be quoted, compared, or used to '
               'choose between hypotheses (ANALYSIS_PLAN.md 9, '
               'STANDING_INSTRUCTIONS S8).')
+    if ctx.selection_plan_drift:
+        print()
+        print('WARNING: ' + str(ctx.selection_plan.get('note')
+                                or ctx.selection_plan_sentence()))
     if len(ctx.plan_hash_in_data) > 1:
         print(f'\nWARNING: {len(ctx.plan_hash_in_data)} distinct '
               f'ANALYSIS_PLAN.md hashes across the input runs. A confirmatory '

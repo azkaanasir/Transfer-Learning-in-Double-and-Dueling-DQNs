@@ -2050,6 +2050,107 @@ def section_stamps(out: list[str], ctx: dict) -> None:
                 'hash than the one in force now, so every confirmatory result '
                 'below is **exploratory** until the audit says otherwise '
                 '(ANALYSIS_PLAN.md 1).', '']
+    sel_plan = ctx.get('selection_plan') or {}
+    if sel_plan.get('drift'):
+        out += ['> ## PRE-REGISTRATION DRIFT IN THE TUNING SELECTION', '>',
+                '> ' + str(sel_plan.get('note')
+                           or sel_plan.get('sentence') or ''), '>',
+                '> The tuned arms of `DESIGN.md` 3.3 are enumerated from that '
+                'selection, so every RQ2 and RQ3 conclusion this bundle '
+                'asserts under the arbitration rests on it. Nothing here is '
+                'refused on this ground: `ANALYSIS_PLAN.md` 2.3 lists four '
+                'refusals and a plan-hash split is not one of them, and 1 '
+                'makes the consequence a label rather than a refusal.', '']
+
+
+#: The one `tuning` module every reader here resolves through, taken from
+#: `audit` rather than imported by name: `audit` imports it absolutely, so
+#: a `from experiments import tuning` here would be a SECOND copy with its
+#: own refusal classes, and the broad `except` below would then be catching
+#: a different `SelectionCorrupt` from the one the code under it raises.
+_SELECTION_MODULE = audit_mod.tuning
+
+
+#: What a consumer prints where the selection cannot be read at all. FAILS
+#: CLOSED, like `read_arbitration`: the subject is never omitted, because a
+#: bundle that says nothing about which pre-registration the tuned arms were
+#: selected under reads as one where the question did not arise.
+SELECTION_PROVENANCE_UNREAD = (
+    'Tuning selection: NOT READ from this run tree, so the pre-registration '
+    'behind the DESIGN.md 3.3 tuned leg is unstated (ANALYSIS_PLAN.md 1).')
+
+
+def selection_plan_provenance(out_root: Any,
+                              current: Optional[str] = None) -> dict:
+    """Which `ANALYSIS_PLAN.md` version the tuned leg's evidence was produced under.
+
+    `ANALYSIS_PLAN.md` 1 puts the plan hash in "every run manifest and every
+    emitted table and figure" and re-labels every result produced under a
+    superseded version **exploratory**. For the runs in `per_seed.csv` that is
+    already handled: they carry `plan_hash` and a mismatch is stamped. The
+    tuned leg's evidence is not in that table. `E3` runs on the `TUNE` block,
+    which `ANALYSIS_PLAN.md` 8 bars from every reported estimate, so a
+    selection computed from runs produced under a superseded plan reaches the
+    tuned arms without leaving a trace in anything downstream of it. On the
+    completed screen that is not hypothetical: 155 of `E3`'s 160 runs were
+    produced under two superseded versions, which `ANALYSIS_PLAN.md` 11
+    predicted and `audit.py` reports as `plan_hash_split`.
+
+    Reads the artifact and never re-derives a selection. Never raises: an
+    absent, unreadable or edited artifact is reported as UNREAD, which is a
+    different statement from clean and is written down as one.
+    """
+    out = {'present': False, 'short_id': None, 'drift': False, 'split': False,
+           'stale': False, 'unknown': False, 'hashes': [], 'counts': {},
+           'rows_without_a_hash': 0, 'error': None, 'note': '',
+           'sentence': SELECTION_PROVENANCE_UNREAD}
+    if not out_root:
+        return out
+    try:
+        selection = _SELECTION_MODULE.read_selection(
+            str(out_root), required=False, warn_placeholder=False,
+            warn_plan_drift=False)
+    except Exception as exc:                       # noqa: BLE001 - see below
+        # Deliberately broad. This is a provenance annotation on somebody
+        # else's artifact, and every way of failing to read it (absent,
+        # truncated, edited so it no longer hashes to its own id, written under
+        # an older schema) has the same consequence here: the pre-registration
+        # is unstated. Letting one of them abort a report would make an
+        # unreadable selection quieter than a readable one.
+        out['error'] = f'{type(exc).__name__}: {exc}'
+        out['sentence'] = (SELECTION_PROVENANCE_UNREAD
+                           + ' The artifact could not be read: '
+                           + out['error'])
+        return out
+    if selection is None:
+        out['sentence'] = (
+            'Tuning selection: none stored in this run tree, so the DESIGN.md '
+            '3.3 tuned leg has not been selected and ANALYSIS_PLAN.md 2.4 '
+            'leaves every confirmatory member not-evaluable.')
+        return out
+    counts = dict(selection.evidence_plan_counts)
+    out.update({
+        'present': True,
+        'short_id': selection.short_id,
+        'split': bool(selection.evidence_plan_split),
+        'stale': bool(selection.evidence_plan_stale(current)),
+        'unknown': bool(selection.evidence_plan_unknown),
+        'drift': bool(selection.evidence_plan_drift(current)),
+        'hashes': sorted(counts),
+        'counts': counts,
+        'rows_without_a_hash': int(selection.evidence_rows_without_a_plan),
+        'note': selection.evidence_plan_note(current),
+    })
+    if out['drift']:
+        out['sentence'] = ('PRE-REGISTRATION DRIFT IN THE TUNING SELECTION: '
+                           + out['note'])
+    else:
+        only = out['hashes'][0] if out['hashes'] else 'unrecorded'
+        out['sentence'] = (
+            f'Tuning selection {out["short_id"]}: its E3 evidence was produced '
+            f'entirely under ANALYSIS_PLAN.md {only}, which is the plan in '
+            f'force here (ANALYSIS_PLAN.md 1).')
+    return out
 
 
 def section_provenance(out: list[str], ctx: dict) -> None:
@@ -2081,6 +2182,14 @@ def section_provenance(out: list[str], ctx: dict) -> None:
         # promised (DESIGN.md 8.3).
         {'field': 'ANALYSIS_PLAN.md hash in the run data',
          'value': ','.join(str(h) for h in s1.get('plan_hash_in_data') or [])},
+        {'field': 'tuning selection',
+         'value': (ctx.get('selection_plan') or {}).get('short_id')
+                  or 'none stored'},
+        {'field': 'ANALYSIS_PLAN.md hash in the selection evidence',
+         'value': ','.join(
+             f'{h} x{(ctx.get("selection_plan") or {}).get("counts", {})[h]}'
+             for h in (ctx.get('selection_plan') or {}).get('hashes') or [])
+                  or 'unrecorded'},
         {'field': 'ANALYSIS_PLAN.md hash seen by stats.py',
          'value': s1.get('plan_hash_current')},
         {'field': 'DESIGN.md hash seen by stats.py',
@@ -3466,6 +3575,10 @@ def write_manifest(bundle: str, ctx: dict, log: ClaimLog) -> str:
         # has not been run this reads 0 of 8, which is the whole finding.
         'arbitration': arbitration_summary(ctx['stats']),
         'plan_drift': ctx['plan_drift'],
+        # The same question for the OTHER leg. `plan_drift` above is about the
+        # runs in this bundle's table; this is about the E3 evidence the tuned
+        # arms were selected from, which never enters that table.
+        'selection_plan_provenance': ctx.get('selection_plan'),
         'stages': [{'name': s.name, 'command': s.command,
                     'exit_code': s.exit_code, 'seconds': round(s.seconds, 3),
                     'ok': s.ok, 'note': s.note,
@@ -4485,6 +4598,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                  or (arm_ns and min(arm_ns)
                                      < stats_mod.MIN_N_FOR_INFERENCE)),
         'plan_drift': bool(s1.get('exploratory')),
+        # The pre-registration behind the TUNED leg, which the per_seed table
+        # cannot answer: E3 runs on TUNE and ANALYSIS_PLAN.md 8 keeps TUNE out
+        # of every reported estimate, so its plan hashes are not in `s1` and a
+        # selection made from superseded-plan evidence would otherwise reach
+        # the arbitration unremarked.
+        'selection_plan': selection_plan_provenance(
+            out_root, (prov.get('plans') or {}).get('ANALYSIS_PLAN.md')),
     }
     log = ClaimLog(echo=not args.quiet)
     print('\n== claims (each interrogated against STANDING_INSTRUCTIONS S5) ==')
@@ -4511,6 +4631,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if override:
         print(f'\n{OVERRIDE_STAMP}')
         print(f'  failing checks: {", ".join(failing)}')
+    if (ctx.get('selection_plan') or {}).get('drift'):
+        print('\nPRE-REGISTRATION DRIFT IN THE TUNING SELECTION')
+        for line in textwrap.wrap(
+                str((ctx['selection_plan'].get('note')
+                     or ctx['selection_plan'].get('sentence') or '')), 76):
+            print(f'  {line}')
     if ctx['validation_stamp']:
         print(f'\n{VALIDATION_STAMP}: an arm has n < '
               f'{stats_mod.MIN_N_FOR_INFERENCE}. No number in this bundle may '

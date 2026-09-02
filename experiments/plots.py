@@ -117,6 +117,7 @@ for _p in (_ROOT, _HERE):
 
 import registry                                                  # noqa: E402
 import stats                                                     # noqa: E402
+import tuning                                                    # noqa: E402
 from src.dqn import envs, provenance                              # noqa: E402
 
 WARN = '[WARNING]'
@@ -1206,6 +1207,94 @@ def arbitration_summary(sj: Any) -> dict:
     }
 
 
+#: See the note on the same name in `report.py`. `plots.py` imports its
+#: siblings absolutely, so `import tuning` here is the same module object
+#: `audit` and `registry` hold, not a second copy.
+_SELECTION_MODULE = tuning
+
+
+#: What a consumer prints where the selection cannot be read at all. FAILS
+#: CLOSED, like `read_arbitration`: the subject is never omitted, because a
+#: bundle that says nothing about which pre-registration the tuned arms were
+#: selected under reads as one where the question did not arise.
+SELECTION_PROVENANCE_UNREAD = (
+    'Tuning selection: NOT READ from this run tree, so the pre-registration '
+    'behind the DESIGN.md 3.3 tuned leg is unstated (ANALYSIS_PLAN.md 1).')
+
+
+def selection_plan_provenance(out_root: Any,
+                              current: Optional[str] = None) -> dict:
+    """Which `ANALYSIS_PLAN.md` version the tuned leg's evidence was produced under.
+
+    `ANALYSIS_PLAN.md` 1 puts the plan hash in "every run manifest and every
+    emitted table and figure" and re-labels every result produced under a
+    superseded version **exploratory**. For the runs in `per_seed.csv` that is
+    already handled: they carry `plan_hash` and a mismatch is stamped. The
+    tuned leg's evidence is not in that table. `E3` runs on the `TUNE` block,
+    which `ANALYSIS_PLAN.md` 8 bars from every reported estimate, so a
+    selection computed from runs produced under a superseded plan reaches the
+    tuned arms without leaving a trace in anything downstream of it. On the
+    completed screen that is not hypothetical: 155 of `E3`'s 160 runs were
+    produced under two superseded versions, which `ANALYSIS_PLAN.md` 11
+    predicted and `audit.py` reports as `plan_hash_split`.
+
+    Reads the artifact and never re-derives a selection. Never raises: an
+    absent, unreadable or edited artifact is reported as UNREAD, which is a
+    different statement from clean and is written down as one.
+    """
+    out = {'present': False, 'short_id': None, 'drift': False, 'split': False,
+           'stale': False, 'unknown': False, 'hashes': [], 'counts': {},
+           'rows_without_a_hash': 0, 'error': None, 'note': '',
+           'sentence': SELECTION_PROVENANCE_UNREAD}
+    if not out_root:
+        return out
+    try:
+        selection = _SELECTION_MODULE.read_selection(
+            str(out_root), required=False, warn_placeholder=False,
+            warn_plan_drift=False)
+    except Exception as exc:                       # noqa: BLE001 - see below
+        # Deliberately broad. This is a provenance annotation on somebody
+        # else's artifact, and every way of failing to read it (absent,
+        # truncated, edited so it no longer hashes to its own id, written under
+        # an older schema) has the same consequence here: the pre-registration
+        # is unstated. Letting one of them abort a report would make an
+        # unreadable selection quieter than a readable one.
+        out['error'] = f'{type(exc).__name__}: {exc}'
+        out['sentence'] = (SELECTION_PROVENANCE_UNREAD
+                           + ' The artifact could not be read: '
+                           + out['error'])
+        return out
+    if selection is None:
+        out['sentence'] = (
+            'Tuning selection: none stored in this run tree, so the DESIGN.md '
+            '3.3 tuned leg has not been selected and ANALYSIS_PLAN.md 2.4 '
+            'leaves every confirmatory member not-evaluable.')
+        return out
+    counts = dict(selection.evidence_plan_counts)
+    out.update({
+        'present': True,
+        'short_id': selection.short_id,
+        'split': bool(selection.evidence_plan_split),
+        'stale': bool(selection.evidence_plan_stale(current)),
+        'unknown': bool(selection.evidence_plan_unknown),
+        'drift': bool(selection.evidence_plan_drift(current)),
+        'hashes': sorted(counts),
+        'counts': counts,
+        'rows_without_a_hash': int(selection.evidence_rows_without_a_plan),
+        'note': selection.evidence_plan_note(current),
+    })
+    if out['drift']:
+        out['sentence'] = ('PRE-REGISTRATION DRIFT IN THE TUNING SELECTION: '
+                           + out['note'])
+    else:
+        only = out['hashes'][0] if out['hashes'] else 'unrecorded'
+        out['sentence'] = (
+            f'Tuning selection {out["short_id"]}: its E3 evidence was produced '
+            f'entirely under ANALYSIS_PLAN.md {only}, which is the plan in '
+            f'force here (ANALYSIS_PLAN.md 1).')
+    return out
+
+
 @dataclass
 class Context:
     """Everything a figure function needs, resolved once."""
@@ -1244,6 +1333,22 @@ class Context:
     stats_path: Optional[str] = None
     stats_sha: Optional[str] = None
     arbitration: Optional[dict] = None
+    #: The pre-registration behind the DESIGN.md 3.3 tuned leg, read off the
+    #: selection artifact. On the Context for the same reason `arbitration` is:
+    #: a figure travels with its caption and its sidecar and nothing else. The
+    #: per_seed table cannot answer it, because E3 runs on TUNE and
+    #: ANALYSIS_PLAN.md 8 keeps TUNE out of every reported estimate, so the
+    #: plan hashes of the runs the tuned arms were selected from never appear
+    #: in `plan_hash` here.
+    selection_plan: dict = field(default_factory=dict)
+
+    def selection_plan_sentence(self) -> str:
+        return str(self.selection_plan.get('sentence')
+                   or SELECTION_PROVENANCE_UNREAD)
+
+    @property
+    def selection_plan_drift(self) -> bool:
+        return bool(self.selection_plan.get('drift'))
     #: One run directory per (label, seed). See `resolve_selection`.
     selected: set[str] = field(default_factory=set)
     #: (label, seed) pairs that resolved to more than one run directory.
@@ -2360,6 +2465,14 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
             'POLICY DISAGREEMENT, and under ANALYSIS_PLAN.md 2.4 the '
             'disagreement is itself the reported finding rather than a caveat '
             'on one: ' + str(item), 92))
+    if ctx.selection_plan_drift:
+        lines.append(textwrap.fill(
+            'PRE-REGISTRATION DRIFT IN THE TUNING SELECTION: '
+            + str(ctx.selection_plan.get('note')
+                  or ctx.selection_plan_sentence())
+            + ' Anything in this figure that the arbitration licensed from the '
+              'tuned leg is EXPLORATORY on that ground (ANALYSIS_PLAN.md 1).',
+            92))
     git = (ctx.prov.get('git') or {})
     lines.append(textwrap.fill(
         f"Source: {os.path.basename(ctx.per_seed_path)} "
@@ -2390,6 +2503,7 @@ def emit(ctx: Context, name: str, fig: plt.Figure, body: str, *,
         },
         'git': ctx.prov.get('git'),
         'plans': ctx.prov.get('plans'),
+        'selection_plan_provenance': dict(ctx.selection_plan),
         'packages': ctx.prov.get('packages'),
         'bootstrap': {'n_boot': ctx.n_boot, 'seed': ctx.boot_seed},
         'smoothing_window_eval_points': ctx.smooth,
@@ -4824,6 +4938,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                if os.path.isfile(args.curves) else None)})
         ctx.selected, ctx.collisions, ctx.duplicate_rows = \
             resolve_selection(per_seed)
+        # plots.py takes no --runs: the run tree is the directory
+        # `aggregate.py` wrote per_seed.csv into, which is where the
+        # selection artifact lives. Derived rather than added as a flag,
+        # so a figure can never be drawn with this switched off.
+        ctx.selection_plan = selection_plan_provenance(
+            os.path.dirname(os.path.abspath(args.per_seed)),
+            (ctx.prov.get('plans') or {}).get('ANALYSIS_PLAN.md'))
         if args.shift_metrics:
             try:
                 with open(args.shift_metrics, 'r', encoding='utf-8') as fh:
@@ -4866,6 +4987,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f'more than one seed: {sorted(multi_seed)[:4]}. A run '
                   f'directory names one run, so the seed set stated in every '
                   f'curve caption is unreliable for this table.')
+        if ctx.selection_plan_drift:
+            print(f'{WARN} ' + str(ctx.selection_plan.get('note')
+                                   or ctx.selection_plan_sentence()))
         if len(table_plans) > 1:
             print(f'{WARN} the runs in this table were produced under '
                   f'{len(table_plans)} different ANALYSIS_PLAN.md hashes '

@@ -361,6 +361,11 @@ class Trainer:
         self._fp_at_freeze: dict | None = None
         self._diag_baseline: np.ndarray | None = None
         self._last_ckpt = time.time()
+        # What produced each held-out evaluation that reaches `_finalise`:
+        # measured in this session, or reloaded from `eval_episodes.jsonl`
+        # after a resume. Recorded in the manifest, and the basis of the
+        # refusal in `_finalise`.
+        self._eval_provenance: dict = {}
         # Highest checkpoint generation committed under each checkpoint
         # directory this process has written. Consulted alongside what is on
         # disk, never instead of it: a resumed process starts with none.
@@ -1073,6 +1078,217 @@ class Trainer:
                 'eval_episodes': min(cfg.final_eval_episodes, 30),
                 'note': 'trunk frozen, head refit, weights restored afterwards'}
 
+    # ---- held-out evaluations across a resume ----------------------------
+    def _recover_held_out(self, declared: set) -> dict:
+        """Reload the held-out evaluations an earlier session of this run made.
+
+        This is the one place that stands between a resume and a silently wrong
+        primary endpoint, so the defect is worth stating in full.
+
+        `held_out` is built inside the episode loop. A resume starts the loop at
+        `start_episode`, so every declared evaluation episode BELOW that point
+        is skipped, and the dict `_finalise` averages holds only the ones that
+        landed after the resume. Two consequences, and the second is the
+        dangerous one:
+
+        * Killed after the final `save_checkpoint(num_episodes - 1)` and during
+          the `model.keras` or `manifest.json` write, the resume runs no
+          episodes at all, so `held_out` is empty and `_finalise` wrote
+          `final_score: null` with `episodes_completed` at the full budget.
+          `sweep.completion_state` read the directory as COMPLETE and nothing
+          refused. Reproduced: `final_score` null against a reference of
+          -0.024354667609618103.
+        * Killed a few episodes short, the mean is taken over the SUBSET of
+          declared checkpoints that happened to fall after the resume point.
+          Reproduced on a 12-episode run with held-out evaluations declared at
+          episodes 5, 8 and 11: a kill at episode 10 gave a bit-identical
+          trajectory (every field of all 12 metric rows equal) and
+          `final_score` -0.016619519094766617 against the reference's
+          -0.024354667609618103, computed over {11} rather than {5, 8, 11}. A
+          plausible number, no error, on P1.
+
+        The evaluations do not have to be re-run, and mostly cannot be: the
+        weights that produced the evaluation at episode 5 are gone by episode
+        11, so a re-run would measure a different network. They are already on
+        disk at full resolution in `eval_episodes.jsonl`, one record per
+        evaluation episode, written as one batch immediately after the block
+        finished and before the episode's metric row, and `_maybe_resume` drops
+        exactly the records at or after the resume point. So the records below
+        the resume point are the ones the uninterrupted run wrote, and the mean
+        over them is bitwise the same float: the values round-trip through JSON
+        by `repr`, and `np.mean` is given the same list in the same order.
+
+        A block is accepted only when it is the whole declared block: as many
+        records as `final_eval_episodes`, indices exactly `range(0, n)`, and
+        every record's environment seed equal to what this run's `eval_final`
+        stream derives for it. That last check is what distinguishes "these are
+        my evaluation episodes" from "these are some evaluation episodes", and
+        it costs a hash per record. Anything short is left out of the returned
+        dict with its reason recorded, and `_finalise` refuses rather than
+        averaging what is in hand.
+
+        The mean is then checked against a second, independent record of the
+        same evaluation: the episode's own row in `metrics.jsonl` carries
+        `held_out_return`, written from the same value in the same instant. A
+        block whose record count, indices and seeds are all intact but whose
+        returns have been altered passes every check above and is exactly what
+        the endpoint would then be a mean of, so the two logs are required to
+        agree bit for bit. They do by construction, both being `repr` of the
+        same float, which is why a disagreement means damage rather than drift.
+        The metrics row is a witness and not the source: where a run predates
+        the field the reload still stands, and the manifest records whether the
+        cross-check was available.
+        """
+        wanted = sorted(e for e in declared if e < self.start_episode)
+        if not wanted:
+            return {}
+        expect = int(self.cfg.final_eval_episodes)
+        witness: dict[int, object] = {}
+        for row in self.metrics.read():
+            try:
+                witness[int(row['episode'])] = row.get('held_out_return')
+            except (KeyError, TypeError, ValueError):
+                continue
+        by_checkpoint: dict[int, list] = {}
+        for row in self.evals.read():
+            if row.get('stream') != 'eval_final':
+                continue
+            try:
+                ckpt = int(row['checkpoint'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            by_checkpoint.setdefault(ckpt, []).append(row)
+
+        out: dict[int, float] = {}
+        for episode in wanted:
+            rows = by_checkpoint.get(episode, [])
+            why = self._eval_block_defect(episode, rows, expect)
+            if why is not None:
+                self._eval_provenance[int(episode)] = {
+                    'source': 'unrecoverable', 'episodes': len(rows),
+                    'expected_episodes': expect, 'problem': why}
+                continue
+            ordered = sorted(rows, key=lambda r: int(r['index']))
+            mean = float(np.mean([float(r['return']) for r in ordered]))
+            recorded = witness.get(episode)
+            # A witness that cannot be read as a number is damage rather
+            # than an absent field: `float('')` would otherwise end the run
+            # in a ValueError traceback where a refusal belongs.
+            if recorded is None:
+                disagrees = False
+            else:
+                try:
+                    disagrees = float(recorded) != mean
+                except (TypeError, ValueError):
+                    disagrees = True
+            if disagrees:
+                self._eval_provenance[int(episode)] = {
+                    'source': 'unrecoverable', 'episodes': len(ordered),
+                    'expected_episodes': expect,
+                    'problem': (
+                        f'the {len(ordered)} records in eval_episodes.jsonl '
+                        f'average to {mean!r}, but this episode\'s row in '
+                        f'metrics.jsonl records a held-out return of '
+                        f'{recorded!r}. Two independent logs of the same '
+                        f'evaluation disagree, so one of them has been '
+                        f'damaged and neither can be preferred')}
+                continue
+            out[episode] = mean
+            self._eval_provenance[int(episode)] = {
+                'source': 'reloaded_from_eval_episodes_jsonl',
+                'episodes': len(ordered), 'expected_episodes': expect,
+                'cross_checked_against_metrics_log': recorded is not None,
+                'problem': None}
+        if out:
+            print(f'[resume] reloaded the held-out evaluations at episodes '
+                  f'{sorted(out)} from eval_episodes.jsonl, {expect} '
+                  f'evaluation episodes each')
+        return out
+
+    def _eval_block_defect(self, episode: int, rows: list,
+                           expect: int) -> str | None:
+        """Why this block of evaluation records is not the declared block.
+
+        `None` means it is. Never raises: the caller's job is to write a
+        refusal, not to stack a traceback on a damaged log.
+        """
+        if not rows:
+            return ('eval_episodes.jsonl holds no eval_final record at this '
+                    'checkpoint')
+        try:
+            indices = sorted(int(r['index']) for r in rows)
+        except (KeyError, TypeError, ValueError):
+            return 'a record carries no usable evaluation-episode index'
+        if indices != list(range(expect)):
+            return (f'the evaluation-episode indices are {indices[:8]}'
+                    f'{"..." if len(indices) > 8 else ""}, not '
+                    f'range(0, {expect}), so the block is partial, duplicated '
+                    f'or from another cadence')
+        for row in rows:
+            index = int(row['index'])
+            want = int(self.seeds.eval_seed('eval_final', episode, index))
+            got = row.get('env_seed')
+            try:
+                got_int = int(got)
+            except (TypeError, ValueError):
+                got_int = None
+            if got_int != want:
+                return (f'evaluation episode {index} records environment seed '
+                        f'{got!r}, but this run\'s eval_final stream derives '
+                        f'{want} for it, so these records were not produced by '
+                        f'this configuration')
+            value = row.get('return')
+            if not isinstance(value, (int, float)) or isinstance(value, bool) \
+                    or not np.isfinite(float(value)):
+                return (f'evaluation episode {index} records a return of '
+                        f'{value!r}, which is not a number')
+        return None
+
+    def _incomplete_evaluation_message(self, missing: list,
+                                       final_eval_episodes: set,
+                                       prefix_eval_episodes: set) -> str:
+        """Name every declared evaluation that is absent, and why it matters.
+
+        Long on purpose, for the same reason `_mixed_set_message` is: its reader
+        has to decide whether to restore a file or delete a directory.
+        """
+        lines = []
+        for episode in missing:
+            entry = self._eval_provenance.get(int(episode)) or {}
+            why = entry.get('problem') or (
+                'it was neither run in this session nor found on disk')
+            roles = []
+            if episode in final_eval_episodes:
+                roles.append('final checkpoint')
+            if episode in prefix_eval_episodes:
+                roles.append('prefix checkpoint')
+            lines.append(f'    episode {episode} ({", ".join(roles)}): {why}')
+        return (
+            f'refusing to finalise {self.dir}: the held-out evaluation set is '
+            f'incomplete, so no final_score may be computed.\n'
+            f'  P1 is defined by DESIGN.md 5.2 and ANALYSIS_PLAN.md 1 as the '
+            f'normalised score over {self.cfg.final_eval_episodes} held-out '
+            f'greedy episodes at EACH of the final '
+            f'{self.cfg.final_eval_checkpoints} evaluation checkpoints, '
+            f'averaged. Declared final checkpoints '
+            f'{sorted(final_eval_episodes)}, prefix checkpoints '
+            f'{sorted(prefix_eval_episodes)}. Missing:\n'
+            + '\n'.join(lines)
+            + '\n  Averaging over whichever declared checkpoints happen to be '
+              'in hand is what this refusal replaces. A run killed after its '
+              'last checkpoint and resumed reproduces its trajectory '
+              'bit-identically, so a mean over the subset arrives as a '
+              'plausible number with no error attached, and no check '
+              'downstream can see it: episodes_completed is at the full '
+              'budget, the metrics log is contiguous, and the manifest reads '
+              'as complete. A refusal costs one run; a wrong P1 costs the '
+              'paper.\n'
+              '  eval_episodes.jsonl holds every evaluation episode this run '
+              'ever made, so restoring it from a copy repairs this. Otherwise '
+              'delete the run directory and start it again. No manifest is '
+              'written, so the directory reads as unfinished rather than as '
+              'complete.')
+
     # ---- main loop -------------------------------------------------------
     def run(self) -> dict:
         cfg = self.cfg
@@ -1082,7 +1298,13 @@ class Trainer:
                                for j in range(cfg.final_eval_checkpoints)}
         final_eval_episodes = {e for e in final_eval_episodes if e >= 0}
         prefix_eval_episodes = set(cfg.prefix_checkpoints)
-        held_out: dict[int, float] = {}
+        # The DECLARED evaluation set: every episode at which this configuration
+        # says a held-out evaluation happens. `_finalise` averages over exactly
+        # this set or refuses; a resume skips the episodes below its start
+        # point, so what they measured is reloaded rather than lost.
+        declared_evals = final_eval_episodes | prefix_eval_episodes
+        held_out: dict[int, float] = dict(
+            self._recover_held_out(declared_evals))
 
         if self.start_episode == 0:
             ret, rows = evaluate(self.eval_env, self.agent,
@@ -1182,6 +1404,11 @@ class Trainer:
                                          'eval_final', episode, cfg.max_steps)
                     self.evals.extend(rows)
                     held_out[episode] = ret
+                    self._eval_provenance[int(episode)] = {
+                        'source': 'measured_in_this_session',
+                        'episodes': int(cfg.final_eval_episodes),
+                        'expected_episodes': int(cfg.final_eval_episodes),
+                        'problem': None}
                     row['held_out_return'] = ret
                     row['held_out_score'] = self.score(ret)
                     if episode in prefix_eval_episodes:
@@ -1195,7 +1422,14 @@ class Trainer:
 
         self.save_checkpoint(cfg.num_episodes - 1)
         self._save_model_atomic(os.path.join(self.dir, 'model.keras'))
-        self._finalise(held_out, started, final_eval_episodes)
+        # `manifest.json` goes last, after `model.keras`, and it is the only
+        # thing in the directory that reads as "finished": `find_runs` globs for
+        # it, `per_seed_row` needs its `result` block, and
+        # `sweep.completion_state` reads `result.episodes_completed` out of it.
+        # `_finalise` raises before writing it when the declared evaluation set
+        # is incomplete, so an unfinalised run cannot read as a complete one.
+        self._finalise(held_out, started, final_eval_episodes,
+                       prefix_eval_episodes)
 
         if not cfg.keep_buffer:
             for sub in ('', *[f'ckpt_ep{e}' for e in cfg.prefix_checkpoints]):
@@ -1206,8 +1440,24 @@ class Trainer:
         return self.manifest
 
     def _finalise(self, held_out: dict, started: float,
-                  final_eval_episodes: set) -> None:
+                  final_eval_episodes: set,
+                  prefix_eval_episodes: set) -> None:
+        """Compute the endpoints and write the manifest, or refuse to.
+
+        The refusal comes first and it is unconditional: a manifest must never
+        carry a `final_score` computed from a subset of the declared evaluation
+        episodes. `held_out` is complete either because this session measured
+        every declared checkpoint or because `_recover_held_out` reloaded the
+        ones an earlier session measured; anything else means the number cannot
+        be reconstructed, and then no number is written at all.
+        """
         cfg = self.cfg
+        declared = set(final_eval_episodes) | set(prefix_eval_episodes)
+        missing = sorted(e for e in declared if e not in held_out)
+        if missing:
+            raise RuntimeError(self._incomplete_evaluation_message(
+                missing, set(final_eval_episodes), set(prefix_eval_episodes)))
+
         integrity = self.metrics.check(expected=cfg.num_episodes)
         df = self.metrics.as_dataframe()
 
@@ -1217,6 +1467,19 @@ class Trainer:
         prefix = {int(e): {'return': held_out[e], 'score': self.score(held_out[e])}
                   for e in sorted(cfg.prefix_checkpoints) if e in held_out}
 
+        # WHICH evaluation episodes contributed, and where each came from. The
+        # defect this records was invisible precisely because the manifest said
+        # only what the mean was, never what it was a mean of.
+        contributions: dict = {}
+        for episode in sorted(declared):
+            entry = dict(self._eval_provenance.get(int(episode))
+                         or {'source': 'unrecorded', 'problem': None})
+            entry['roles'] = (
+                (['final'] if episode in final_eval_episodes else [])
+                + (['prefix'] if episode in prefix_eval_episodes else []))
+            entry['return'] = held_out.get(episode)
+            contributions[int(episode)] = entry
+
         result = {
             'episodes_completed': int(integrity['unique_episodes']),
             'metrics_integrity': integrity,
@@ -1225,6 +1488,14 @@ class Trainer:
             'clip_fraction': (self.agent.clip_events / self.agent.update_counter
                               if self.agent.update_counter else None),
             'final_eval_episodes': sorted(final_eval_episodes),
+            # Declared against contributing. The two are equal in every
+            # manifest that exists, because `_finalise` refuses otherwise, and
+            # they are both recorded so that an audit can check rather than
+            # assume it.
+            'final_eval_episodes_contributing': sorted(
+                int(e) for e in final_eval_episodes if e in held_out),
+            'prefix_eval_episodes': sorted(int(e) for e in prefix_eval_episodes),
+            'held_out_evaluations': contributions,
             'final_return': final_return,
             'final_score': self.score(final_return),
             'final_return_per_checkpoint': {int(k): v

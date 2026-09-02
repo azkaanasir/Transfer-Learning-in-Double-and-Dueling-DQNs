@@ -16,7 +16,7 @@ same `CONFIRM` seeds, as a stage sequentially dependent on `E3`. Those replicas
 are `registry.TUNED_OF`, and they are enumerated from the artifact this module
 writes and reads.
 
-Four properties are load-bearing, and each exists because of a specific way this
+Five properties are load-bearing, and each exists because of a specific way this
 could go wrong.
 
 * **The rule is one function.** `SELECTION_RULE` at the top of this module is
@@ -48,6 +48,21 @@ could go wrong.
   rule and the same plans, has the same id, so "which selection were these runs
   enumerated from" is answerable from twelve hex characters.
 
+* **The artifact records the plan the EVIDENCE was produced under, not only
+  the plan on disk when the selection was computed.** Those are different
+  facts and they were being reported as one. `plans` is a snapshot of
+  `experiments/` taken at compute time; `evidence_plans` is the
+  `ANALYSIS_PLAN.md` hash each `E3` row carries in its manifest. On the
+  completed screen they disagree: 155 of the 160 runs were produced under two
+  superseded versions of the plan, and an artifact whose only provenance field
+  said `plans: <current>` asserted a pre-registration the evidence does not
+  have. `ANALYSIS_PLAN.md` 1 makes the hash a reporting-stopper and re-labels
+  every affected result exploratory, and 11's 2026-08-27 entry predicted this
+  exact split; recording it here is what lets a consumer honour either. It is
+  inside the content address, so it cannot be edited out of the record, and it
+  is a label rather than a refusal: 2.3 states four refusals and this is not
+  one of them.
+
 * **A selection off the `TUNE` block is refused.** `DESIGN.md` 3.4 reserves
   `TUNE` for exactly this and `ANALYSIS_PLAN.md` 8 forbids a reported estimate
   drawing on it. Revision 1 selected hyperparameters on seeds 0-4 and then ran
@@ -69,8 +84,9 @@ import json
 import math
 import os
 import sys
+import textwrap
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -460,10 +476,19 @@ SELECTION_RULE: Callable[[tuple[str, str], Sequence['Candidate']], str] = (
 # ---------------------------------------------------------------------------
 #: Bumped whenever the meaning of a stored field changes, so that an artifact
 #: written under an older schema cannot be silently read under a newer one.
-SELECTION_SCHEMA = 'tuning-selection/v1'
+SELECTION_SCHEMA = 'tuning-selection/v2'
 
 #: The experiment the selection is computed from (`DESIGN.md` 3.3).
 SOURCE_EXPERIMENT = 'E3'
+
+#: The pre-registered document whose hash `ANALYSIS_PLAN.md` 1 makes a
+#: reporting-stopper, and the `per_seed.csv` column `aggregate.py` carries it
+#: in (one value per run, lifted from that run's manifest). Read per row rather
+#: than taken once from disk, because the question the artifact has to answer
+#: is "which pre-registration was this evidence produced under", and the plan
+#: on disk at compute time answers a different one.
+EVIDENCE_PLAN_DOCUMENT = 'ANALYSIS_PLAN.md'
+EVIDENCE_PLAN_COLUMN = 'plan_hash'
 
 #: The only block a selection may be computed on (`DESIGN.md` 3.4,
 #: `ANALYSIS_PLAN.md` 8). Not a parameter: there is no legitimate reason to
@@ -633,6 +658,16 @@ class Candidate:
     seeds: tuple[int, ...]
     run_digests: tuple[str, ...]
     stats: Mapping[str, EndpointStats]
+    #: The `EVIDENCE_PLAN_DOCUMENT` hash each of this candidate's runs was
+    #: produced under, seed-ordered and parallel to `seeds` and `run_digests`.
+    #: The empty string stands for a row that carried none, which is a
+    #: different statement from a row that carried a superseded one. Beside the
+    #: digests rather than only in the selection-level tally, because "which
+    #: candidate was measured under which pre-registration" is a per-candidate
+    #: question: a comparison between a candidate run under one plan and its
+    #: rival run under another is exactly what `ANALYSIS_PLAN.md` 1 says is not
+    #: one pre-registered set.
+    plan_hashes: tuple[str, ...] = ()
 
     @property
     def config_key(self) -> str:
@@ -646,6 +681,7 @@ class Candidate:
         return {'config_key': self.config_key, 'e3_arm': self.e3_arm,
                 'config': self.config.to_dict(), 'seeds': list(self.seeds),
                 'run_digests': list(self.run_digests),
+                'plan_hashes': list(self.plan_hashes),
                 'stats': {k: v.to_dict() for k, v in sorted(self.stats.items())}}
 
     @classmethod
@@ -656,7 +692,9 @@ class Candidate:
                    seeds=tuple(int(s) for s in data['seeds']),
                    run_digests=tuple(str(d) for d in data['run_digests']),
                    stats={k: EndpointStats.from_dict(v)
-                          for k, v in data['stats'].items()})
+                          for k, v in data['stats'].items()},
+                   plan_hashes=tuple(str(h) for h in
+                                     (data.get('plan_hashes') or ())))
 
 
 @dataclass(frozen=True)
@@ -718,14 +756,128 @@ class Selection:
     source_experiment: str
     cells: Mapping[str, CellSelection]
     candidates: Mapping[str, tuple[Candidate, ...]]
+    #: The plan documents as they stood ON DISK when this selection was
+    #: computed. NOT a statement about the evidence: see `evidence_plans`.
     plans: Mapping[str, Optional[str]]
     recorded: Mapping[str, Any]
+    #: The `EVIDENCE_PLAN_DOCUMENT` hashes the evidence rows carried, tallied.
+    #: Defaulted so the field can be read off an artifact that predates it, and
+    #: an empty tally is reported as UNKNOWN provenance rather than as clean.
+    evidence_plans: Mapping[str, Any] = field(default_factory=dict)
 
     # -- reading -----------------------------------------------------------
     @property
     def is_placeholder(self) -> bool:
         """True where the artifact was computed under a placeholder rule."""
         return bool(self.rule.get('placeholder', True))
+
+    # -- the pre-registration the EVIDENCE was produced under ---------------
+    @property
+    def plan_in_force(self) -> Optional[str]:
+        """The `EVIDENCE_PLAN_DOCUMENT` hash on disk when this was computed."""
+        value = (self.plans or {}).get(EVIDENCE_PLAN_DOCUMENT)
+        return None if value is None else str(value)
+
+    @property
+    def evidence_plan_counts(self) -> Mapping[str, int]:
+        """hash -> number of evidence rows produced under it."""
+        raw = (self.evidence_plans or {}).get('counts') or {}
+        return {str(k): int(v) for k, v in sorted(raw.items())}
+
+    @property
+    def evidence_plan_hashes(self) -> tuple[str, ...]:
+        return tuple(sorted(self.evidence_plan_counts))
+
+    @property
+    def evidence_rows_without_a_plan(self) -> int:
+        return int((self.evidence_plans or {}).get('rows_without_a_hash') or 0)
+
+    @property
+    def evidence_plan_unknown(self) -> bool:
+        """True where no evidence row said which pre-registration it ran under.
+
+        Distinct from clean. A table with no `EVIDENCE_PLAN_COLUMN` at all
+        cannot support the statement "these runs are one pre-registered set",
+        and reporting the absence as agreement is the reading `ANALYSIS_PLAN.md`
+        1 exists to prevent.
+        """
+        return not self.evidence_plan_counts
+
+    @property
+    def evidence_plan_split(self) -> bool:
+        """True where the evidence spans more than one pre-registration."""
+        return len(self.evidence_plan_counts) > 1
+
+    def evidence_plan_stale(self, current: Optional[str] = None) -> bool:
+        """True where some evidence row was produced under another plan.
+
+        `current` defaults to the plan in force when the selection was computed,
+        which is what the artifact can answer on its own. A consumer running
+        later passes the hash on disk NOW, because the plan can have moved again
+        since, and the question "is this selection's evidence the plan I am
+        reporting under" is the consumer's to ask.
+        """
+        against = self.plan_in_force if current is None else str(current)
+        if against is None:
+            return False
+        return any(h != against for h in self.evidence_plan_counts)
+
+    def evidence_plan_drift(self, current: Optional[str] = None) -> bool:
+        """Anything short of "one known pre-registration, and it is `current`".
+
+        Wider than what `compute_selection` and `read_selection` warn about,
+        which is a split or a stale hash: those are facts about a real
+        divergence and a warning is the right place for them. UNKNOWN
+        provenance is included here because an emitted table or figure may not
+        state a pre-registration it cannot show, and it is excluded from the
+        warnings because a synthetic table has no manifests behind it and a
+        warning per fixture would train a reader to ignore the real one.
+        """
+        return bool(self.evidence_plan_split
+                    or self.evidence_plan_stale(current)
+                    or self.evidence_plan_unknown)
+
+    def evidence_plan_note(self, current: Optional[str] = None) -> str:
+        """One paragraph a consumer can print verbatim. Empty when clean.
+
+        Plain words and no verdict: `ANALYSIS_PLAN.md` 1 says what follows from
+        a changed plan (the affected results are re-labelled exploratory) and
+        2.3 does not list this among its four refusals, so this states the fact
+        and cites the section rather than deciding the consequence here.
+        """
+        against = self.plan_in_force if current is None else str(current)
+        counts = self.evidence_plan_counts
+        if self.evidence_plan_unknown:
+            rows = self.evidence_rows_without_a_plan
+            return (f'selection {self.short_id}: not one of the '
+                    f'{rows} {SOURCE_EXPERIMENT} evidence row(s) carried an '
+                    f'{EVIDENCE_PLAN_DOCUMENT} hash in its '
+                    f'{EVIDENCE_PLAN_COLUMN} column, so the pre-registration '
+                    f'this selection was made under is UNKNOWN. '
+                    f'ANALYSIS_PLAN.md 1 requires that hash to be recorded on '
+                    f'every run; an absent one is not evidence of agreement.')
+        if not self.evidence_plan_drift(against):
+            return ''
+        parts = ', '.join(f'{h} x{counts[h]}' for h in sorted(counts))
+        head = (f'selection {self.short_id} was computed from '
+                f'{SOURCE_EXPERIMENT} evidence produced under '
+                f'{len(counts)} {EVIDENCE_PLAN_DOCUMENT} version(s): {parts}')
+        if against is not None:
+            stale = sum(v for k, v in counts.items() if k != against)
+            head += (f'; {stale} of '
+                     f'{sum(counts.values())} row(s) were produced under a '
+                     f'version other than {against}')
+        if self.evidence_rows_without_a_plan:
+            head += (f'; {self.evidence_rows_without_a_plan} row(s) carried no '
+                     f'hash at all')
+        return (head + '. ANALYSIS_PLAN.md 1: a confirmatory result is '
+                'interpretable only against the plan in force when it ran, and '
+                'every affected result is re-labelled EXPLORATORY. '
+                'ANALYSIS_PLAN.md 11 records this split for E3 and names the '
+                'restart that would have avoided it. The tuned arms of '
+                'DESIGN.md 3.3 are enumerated from this selection, so the '
+                'label travels to them; 2.3 lists four refusals and this is '
+                'not one of them, so nothing here is refused on this ground.')
 
     @property
     def short_id(self) -> str:
@@ -767,6 +919,13 @@ class Selection:
             'a_priori': A_PRIORI_CONFIG.to_dict(),
             'rule': _plain(self.rule),
             'plans': dict(sorted(self.plans.items())),
+            # Inside the address deliberately. A selection recomputed from the
+            # same table under the same rule has the same id, so two selections
+            # that differ only in which pre-registration their evidence was
+            # produced under must not collide; and an artifact whose evidence
+            # provenance could be edited without breaking its own hash would
+            # record the fact only until somebody found it inconvenient.
+            'evidence_plans': _plain(self.evidence_plans),
             'cells': {k: v.to_dict() for k, v in sorted(self.cells.items())},
             'candidates': {k: [c.to_dict() for c in v]
                            for k, v in sorted(self.candidates.items())},
@@ -798,7 +957,8 @@ class Selection:
                    source_experiment=str(data['source_experiment']),
                    cells=cells, candidates=cands,
                    plans=dict(data.get('plans') or {}),
-                   recorded=dict(data.get(UNADDRESSED_KEY) or {}))
+                   recorded=dict(data.get(UNADDRESSED_KEY) or {}),
+                   evidence_plans=dict(data.get('evidence_plans') or {}))
 
     def describe(self) -> str:
         lines = [f'selection {self.short_id}  rule={self.rule.get("id")}'
@@ -812,6 +972,11 @@ class Selection:
             lines.append(f'  {key:<16} lr={sel.config.lr:g} '
                          f'{sel.config.target_update}'
                          f'/{sel.config.target_update_freq}  ({mark})')
+        note = self.evidence_plan_note()
+        if note:
+            lines.append('  PRE-REGISTRATION DRIFT IN THE EVIDENCE:')
+            lines += [f'    {line}' for line in
+                      textwrap.wrap(note, 74) or [note]]
         return '\n'.join(lines)
 
 
@@ -977,9 +1142,16 @@ def compute_selection(table: Any, *,
     block = tuple(registry.SEED_BLOCKS[SELECTION_SEED_BLOCK])
     allowed_seeds = set(block)
 
-    # (cell_key, config_key) -> {seed: (run_digest, {endpoint: value})}
-    gathered: dict[tuple[str, str], dict[int, tuple[str, dict]]] = {}
+    # (cell_key, config_key) -> {seed: (run_digest, {endpoint: value}, plan)}
+    gathered: dict[tuple[str, str], dict[int, tuple[str, dict, str]]] = {}
     seen_rows = 0
+    # hash -> rows produced under it, over every E3 row read as evidence.
+    # Tallied here rather than derived from the candidates afterwards so that a
+    # row dropped by `require_complete=False` is still counted in the
+    # provenance: the question is what the table this selection was computed
+    # from was made of.
+    plan_counts: dict[str, int] = {}
+    plan_absent = 0
     for row in rows:
         exps = _experiments_of(row)
         if exps is not None and SOURCE_EXPERIMENT not in exps:
@@ -1032,6 +1204,18 @@ def compute_selection(table: Any, *,
                 f'{SOURCE_EXPERIMENT}.')
         _check_rule_params(row, grid[cell_key][config_key][1], cell_key, seed)
         digest = str(row.get('run_digest') or '')
+        # A pandas NaN stringifies to 'nan', which would be tallied as a
+        # fourth pre-registration and read as a split that is really a gap, so
+        # the raw value is tested before it is turned into text.
+        raw_plan = row.get(EVIDENCE_PLAN_COLUMN)
+        plan = ('' if raw_plan is None or _isnan_str(raw_plan)
+                else str(raw_plan).strip())
+        if plan.lower() in ('', 'nan', 'none', 'null'):
+            plan = ''
+        if plan:
+            plan_counts[plan] = plan_counts.get(plan, 0) + 1
+        else:
+            plan_absent += 1
         values = {ep: _float_of(row, ep) for ep in SELECTION_ENDPOINTS}
         slot = gathered.setdefault((cell_key, config_key), {})
         if seed in slot and slot[seed][0] != digest:
@@ -1040,7 +1224,7 @@ def compute_selection(table: Any, *,
                 f'different run digests ({slot[seed][0]} and {digest}). One '
                 f'configuration at one seed is one run; two rows mean the table '
                 f'was concatenated from trees that do not agree.')
-        slot[seed] = (digest, values)
+        slot[seed] = (digest, values, plan)
         seen_rows += 1
 
     if not seen_rows:
@@ -1080,7 +1264,8 @@ def compute_selection(table: Any, *,
                      for ep in SELECTION_ENDPOINTS}
             rows_for_cell.append(Candidate(
                 cell=cell, config=cfg, e3_arm=arm_label, seeds=seeds,
-                run_digests=tuple(slot[s][0] for s in seeds), stats=stats))
+                run_digests=tuple(slot[s][0] for s in seeds), stats=stats,
+                plan_hashes=tuple(slot[s][2] for s in seeds)))
         if not rows_for_cell:
             raise SelectionIncomplete(
                 f'{cell_key} has no {SOURCE_EXPERIMENT} evidence at all. '
@@ -1125,6 +1310,13 @@ def compute_selection(table: Any, *,
             'endpoints': list(SELECTION_ENDPOINTS),
             'selected': {ep: chosen.stats[ep].to_dict()
                          for ep in SELECTION_ENDPOINTS},
+            # Which pre-registration the runs behind THIS cell's choice were
+            # produced under, seed-ordered. The selection-level tally answers
+            # the question for the table; a reader deciding whether one cell's
+            # tuned arms may be reported needs it for that cell's runs.
+            'plan_hashes_of_selected': list(chosen.plan_hashes),
+            'plan_hashes_of_a_priori': (list(a_priori.plan_hashes)
+                                        if a_priori else None),
             'a_priori_config_key': (a_priori.config_key if a_priori else None),
             'a_priori': ({ep: a_priori.stats[ep].to_dict()
                           for ep in SELECTION_ENDPOINTS} if a_priori else None),
@@ -1151,19 +1343,38 @@ def compute_selection(table: Any, *,
         # misdescribe the decision that was actually made.
         rule_record['parameters'] = _plain(SELECTION_RULE_PARAMETERS)
     plans_record = dict(plans) if plans is not None else provenance.plan_hashes()
+    evidence_plans = {
+        'document': EVIDENCE_PLAN_DOCUMENT,
+        'column': EVIDENCE_PLAN_COLUMN,
+        'n_rows': int(seen_rows),
+        'counts': dict(sorted(plan_counts.items())),
+        'rows_without_a_hash': int(plan_absent),
+        'plan_in_force_at_compute_time': plans_record.get(
+            EVIDENCE_PLAN_DOCUMENT),
+    }
     recorded = {
         'created_utc': _datetime.datetime.now(
             _datetime.timezone.utc).replace(microsecond=0).isoformat(),
         'generator': generator or 'experiments/tuning.py compute_selection',
         'git': provenance.git_state() if record_git else None,
     }
-    selection = Selection(
+    selection = _readdress(Selection(
         selection_id='', schema=SELECTION_SCHEMA, rule=rule_record,
         seed_block=SELECTION_SEED_BLOCK, seeds=block, env=SELECTION_ENV,
         source_experiment=SOURCE_EXPERIMENT, cells=cells,
         candidates={k: tuple(v) for k, v in candidates.items()},
-        plans=dict(plans_record), recorded=recorded)
-    return _readdress(selection)
+        plans=dict(plans_record), recorded=recorded,
+        evidence_plans=evidence_plans))
+    # A warning and not a refusal. ANALYSIS_PLAN.md 2.3 states four refusals
+    # and a plan-hash split is not one of them, so inventing a fifth here would
+    # be this module writing the rule instead of executing it. 1 does state the
+    # consequence, which is a label, and the label needs somewhere to be seen:
+    # `tuning.py select` prints this, `read_selection` repeats it on every
+    # read, and report.py, tables.py and plots.py stamp it into their output.
+    if selection.evidence_plan_split or selection.evidence_plan_stale():
+        warnings.warn(selection.evidence_plan_note(), RuntimeWarning,
+                      stacklevel=2)
+    return selection
 
 
 def _readdress(selection: Selection) -> Selection:
@@ -1174,7 +1385,8 @@ def _readdress(selection: Selection) -> Selection:
                      env=selection.env,
                      source_experiment=selection.source_experiment,
                      cells=selection.cells, candidates=selection.candidates,
-                     plans=selection.plans, recorded=selection.recorded)
+                     plans=selection.plans, recorded=selection.recorded,
+                     evidence_plans=selection.evidence_plans)
 
 
 def _rule_name(rule: Callable) -> str:
@@ -1287,8 +1499,13 @@ def write_selection(selection: Selection, out_root: str = 'runs',
 
     active = selection_path(out_root)
     try:
+        # An existence probe, not a read of the artifact for its content, so
+        # neither the placeholder nor the plan-drift warning belongs to it: the
+        # one that matters here is the one the selection being WRITTEN carries,
+        # and `compute_selection` has already raised it.
         existing = read_selection(out_root, required=False, verify=False,
-                                  warn_placeholder=False)
+                                  warn_placeholder=False,
+                                  warn_plan_drift=False)
         held = existing.short_id if existing is not None else None
     except SelectionCorrupt:
         # Unreadable, but present. It is still something the tuned arms may
@@ -1325,7 +1542,8 @@ def _write_json(path: str, payload: Mapping[str, Any]) -> None:
 
 def read_selection(out_root: str = 'runs', *, path: Optional[str] = None,
                    required: bool = True, verify: bool = True,
-                   warn_placeholder: bool = True) -> Optional[Selection]:
+                   warn_placeholder: bool = True,
+                   warn_plan_drift: bool = True) -> Optional[Selection]:
     """Read the stored selection. Never recomputes it.
 
     `required=False` returns None where there is none, which is what a caller
@@ -1370,6 +1588,15 @@ def read_selection(out_root: str = 'runs', *, path: Optional[str] = None,
             f'pre-registered criterion of ANALYSIS_PLAN.md 2.3. Arms enumerated '
             f'from it are for testing the pipeline and are not a result.',
             RuntimeWarning, stacklevel=2)
+    if warn_plan_drift:
+        # Against the plan on disk NOW, not against the one recorded in the
+        # artifact. A selection can be clean at compute time and stale by the
+        # time anything is reported from it, and the reader who has to know is
+        # the one reporting.
+        current = (provenance.plan_hashes() or {}).get(EVIDENCE_PLAN_DOCUMENT)
+        if selection.evidence_plan_split or                 selection.evidence_plan_stale(current):
+            warnings.warn(selection.evidence_plan_note(current),
+                          RuntimeWarning, stacklevel=2)
     return selection
 
 
@@ -1470,6 +1697,7 @@ __all__ = ['SELECTION_RULE', 'SELECTION_RULE_ID',
            'preregistered_selection_rule', 'selection_working',
            'placeholder_selection_rule',
            'SELECTION_SCHEMA', 'SELECTION_SEED_BLOCK', 'SELECTION_ENV',
+           'EVIDENCE_PLAN_DOCUMENT', 'EVIDENCE_PLAN_COLUMN',
            'SOURCE_EXPERIMENT', 'SELECTION_RELPATH',
            'SELECTION_ARCHIVE_RELDIR', 'UNADDRESSED_KEY',
            'A_PRIORI_CONFIG', 'CellConfig', 'EndpointStats', 'Candidate',

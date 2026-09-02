@@ -291,6 +291,36 @@ of design revision 1 found in the corrected design.
     that.
 
 
+``test_preregistered_selection_criterion_is_the_planned_one``
+    The clause-by-clause check on `ANALYSIS_PLAN.md` 2.3 itself, which nothing
+    in this repository performed. Every case in the block above supplies its
+    own fixture rule so as not to depend on the criterion, which was right for
+    what those cases are about and left the criterion unguarded: no file in
+    `experiments/` read `SELECTION_CRITERION_ENDPOINT`, `COMPETENCE_ENDPOINT`,
+    `COMPETENCE_FLOOR`, `SELECTION_VARIANCE_FIELD` or `SELECTION_N`, and the
+    single place the installed rule ran asserted only that its answer came out
+    of the pool it was handed. Swapping the criterion endpoint to final score,
+    the competence floor onto AUC, the ddof=1 variance to ddof=0, the strict
+    `>` to `>=`, or the tie-breaks into another order each left the suite green
+    while changing which configuration every cell's tuned arms run at, and
+    therefore which RQ2 and RQ3 conclusions the `DESIGN.md` 3.3 arbitration
+    licenses. The fixtures use values that are exact in binary floating point,
+    so a rival can sit ON the one-standard-error margin instead of near it.
+
+``test_selection_records_the_plan_its_evidence_was_produced_under``
+    `ANALYSIS_PLAN.md` 1 puts the plan hash on every run and every emitted
+    table and figure and re-labels results produced under a superseded version
+    exploratory, and for the tuned leg there was no path by which it could:
+    `E3` runs on `TUNE`, 8 bars `TUNE` from every reported estimate, so `E3`'s
+    plan hashes reach no reported table, while the selection artifact recorded
+    the hash of the plan on disk when it was COMPUTED and so read as though its
+    evidence had been produced under that plan. The completed screen spans
+    three versions (134 runs, 21, and 5 under the current one). The artifact
+    now records what the evidence carried, inside its content address, and the
+    case drives clean, split, stale and unrecorded provenance and requires
+    `report.py`, `tables.py` and `plots.py` to state the same thing about the
+    same tree.
+
 ``test_guardrail_coverage_is_declared``
     The meta-case. It parses the §9 table out of `DESIGN.md` and requires
     `_GUARDRAIL_COVERAGE` to name, for every row, the case that covers it and
@@ -1474,6 +1504,41 @@ def _train_until_crash(cfg, crash_at: int, checkpoint_at: int | None):
     return trainer
 
 
+def _train_until_kill_after_loop(cfg):
+    """Run every episode, then die in the finalisation, before any manifest.
+
+    The kill lands after the final `save_checkpoint(num_episodes - 1)` and
+    inside the `model.keras` write, which is the window the finalisation defect
+    lives in: the resume finds every episode already done, runs none, and
+    therefore rebuilds nothing that the episode loop was the only producer of.
+    """
+    from src.dqn.train import Trainer
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        trainer = Trainer(cfg, argv=[])
+
+        def save_model(path: str) -> None:
+            raise _SimulatedCrash('injected kill during the model.keras write')
+
+        trainer._save_model_atomic = save_model   # type: ignore[assignment]
+        try:
+            trainer.run()
+        except _SimulatedCrash:
+            pass
+        else:
+            raise Failed(
+                'the injected kill during the model write never fired, so the '
+                'finalisation window this case is about was never entered.')
+        finally:
+            trainer.metrics.close()
+            for env in (getattr(trainer, 'env', None),
+                        getattr(trainer, 'eval_env', None)):
+                if env is not None:
+                    with contextlib.suppress(Exception):
+                        env.close()
+    return trainer
+
+
 @case('DESIGN.md §8.2 -- a run interrupted and resumed produces the same '
       'metrics as an uninterrupted one')
 def test_resume_equivalence(ctx: Ctx) -> None:
@@ -1793,7 +1858,31 @@ def test_checkpoint_write_is_atomic(ctx: Ctx) -> None:
 
     expected_by_episode = {int(older['episode']): older,
                            int(newer['episode']): newer}
-    resumed, refused = [], []
+
+    # WHICH checkpoint each boundary has to leave behind. Naming it per
+    # boundary is the whole strength of this case: the previous version
+    # accepted a refusal at any boundary as a safe outcome, and both of the
+    # defects below then passed it.
+    #
+    #   phase 1 -- artefact write, staged state write. Nothing committed is
+    #   touched and nothing ever pointed at the staged set, so the previously
+    #   committed checkpoint stands: episode 10. A resume at episode 20 here
+    #   would mean an artefact reached a committed name during phase 1, which
+    #   is the M1 mutation (every artefact written under its committed name);
+    #   a REFUSAL here would mean the same thing, because the committed set
+    #   would have been half-overwritten.
+    #
+    #   phase 2 -- commit rename. Every artefact of the new generation is on
+    #   disk, committed or staged, so `_recover_checkpoint` finishes the
+    #   commit and the NEW checkpoint stands: episode 20. Deleting that
+    #   roll-forward repair leaves commit rename[0] resuming at episode 10 and
+    #   [1..4] refused, and the previous version of this case reported all
+    #   five as safe.
+    def wanted_episode(phase: str) -> int:
+        return (int(newer['episode']) if phase == 'commit rename'
+                else int(older['episode']))
+
+    resumed = []
     try:
         for phase, index in boundaries:
             label = f'{phase}[{index}]'
@@ -1802,21 +1891,37 @@ def test_checkpoint_write_is_atomic(ctx: Ctx) -> None:
                 with contextlib.redirect_stdout(io.StringIO()):
                     reader = Trainer(cfg, argv=[])
             except RuntimeError as exc:
-                req('refusing to resume' in str(exc),
-                    f'a checkpoint interrupted at {label} failed the resume, '
-                    f'but not as a refusal: {exc}')
-                refused.append(label)
-                continue
+                raise Failed(
+                    f'a checkpoint interrupted at {label} was REFUSED: {exc}\n'
+                    f'    Every one of these boundaries is recoverable, so a '
+                    f'refusal is a regression and not a safe outcome. In '
+                    f'phase 1 nothing committed has been touched and the '
+                    f'previous checkpoint stands unaltered; in phase 2 every '
+                    f'artefact of the new generation is on disk, committed or '
+                    f'staged, and `_recover_checkpoint` finishes the commit. '
+                    f'Counting a refusal as acceptable is what let the '
+                    f'roll-forward repair be deleted outright with this case '
+                    f'still passing, and it costs a real half-hour run every '
+                    f'time a kill lands in the five-millisecond commit '
+                    f'window.') from None
             try:
                 episode = reader.start_episode - 1
-                expected = expected_by_episode.get(episode)
-                req(expected is not None,
-                    f'a checkpoint interrupted at {label} resumed at episode '
-                    f'{episode}, which belongs to neither the committed '
-                    f'checkpoint (episode {older["episode"]}) nor the '
-                    f'interrupted one (episode {newer["episode"]})')
+                want = wanted_episode(phase)
+                same(episode, want,
+                     f'a checkpoint interrupted at {label} resumed at episode '
+                     f'{episode}, not {want}. Phase 1 must leave the '
+                     f'previously committed checkpoint (episode '
+                     f'{older["episode"]}) exactly as it was, and phase 2 must '
+                     f'be rolled forward to the new one (episode '
+                     f'{newer["episode"]}). Resuming at {older["episode"]} '
+                     f'after a commit rename means the roll-forward repair is '
+                     f'gone; resuming at {newer["episode"]} during phase 1 '
+                     f'means an artefact reached its committed name before the '
+                     f'commit, which destroys the checkpoint being overwritten '
+                     f'as well as the one being made.')
                 same(_checkpoint_probe(reader),
-                     {k: v for k, v in expected.items() if k != 'episode'},
+                     {k: v for k, v in expected_by_episode[want].items()
+                      if k != 'episode'},
                      f'a checkpoint interrupted at {label} resumed at episode '
                      f'{episode} but restored state belonging to the other '
                      f'checkpoint. This is the silent defect: the run would '
@@ -1860,9 +1965,12 @@ def test_checkpoint_write_is_atomic(ctx: Ctx) -> None:
                 with contextlib.suppress(Exception):
                     env.close()
 
-    ctx.note(f'{len(boundaries)} write boundaries: {len(resumed)} resumed '
-             f'consistently, {len(refused)} refused; a tidied-up mixed set is '
-             f'refused')
+    same(len(resumed), len(boundaries),
+         f'only {len(resumed)} of {len(boundaries)} write boundaries resumed')
+    ctx.note(f'{len(boundaries)} write boundaries: all resumed, '
+             f'{len(boundaries) - n_artefacts - 1} rolled forward to the new '
+             f'checkpoint and {n_artefacts + 1} left the old one intact; a '
+             f'tidied-up mixed set is refused')
 
 
 @case('DESIGN.md 8.2 -- a checkpoint that cannot be shown to be one checkpoint '
@@ -1904,7 +2012,32 @@ def test_checkpoint_consistency_is_verified(ctx: Ctx) -> None:
         trainer = Trainer(cfg, argv=[])
     try:
         # -- 1 and 2. Where the writer writes, and in what order it commits.
+        import hashlib
+
+        def committed_digests() -> dict:
+            """Every committed artefact's bytes, by name."""
+            paths = trainer._paths()
+            out = {}
+            for kind in train_mod.CHECKPOINT_ARTEFACTS + ('state',):
+                path = paths[kind]
+                if os.path.exists(path):
+                    with open(path, 'rb') as fh:
+                        out[os.path.basename(path)] = hashlib.blake2b(
+                            fh.read(), digest_size=16).hexdigest()
+            return out
+
         written, committed = [], []
+        # The path the writer was ASKED to write is one kind of evidence; what
+        # actually changed on disk is the other, and only the second survives
+        # a mutation that redirects the path lower down. The M1 mutation
+        # (write every artefact under its committed name) was reported as
+        # caught and does not reproduce: it left the boundary case passing,
+        # because a half-overwritten committed set is refused on resume and a
+        # refusal counted as safe. This snapshot is taken at the moment the
+        # first rename happens, which is the first instant at which a
+        # committed name is allowed to change.
+        before_digests = committed_digests()
+        at_first_commit: dict = {}
         real_write = trainer._write_artefact
         real_commit = trainer._commit_one
 
@@ -1913,6 +2046,8 @@ def test_checkpoint_consistency_is_verified(ctx: Ctx) -> None:
             real_write(kind, path, generation)
 
         def commit(src, dst):
+            if not committed:
+                at_first_commit.update(committed_digests())
             committed.append(os.path.basename(dst))
             real_commit(src, dst)
 
@@ -1926,6 +2061,20 @@ def test_checkpoint_consistency_is_verified(ctx: Ctx) -> None:
             trainer._commit_one = real_commit         # type: ignore[assignment]
 
         req(written, 'the writer wrote no artefact at all')
+        req(len(before_digests) > len(train_mod.CHECKPOINT_ARTEFACTS) - 1,
+            f'the directory held only {sorted(before_digests)} before the '
+            f'write, so there was no committed checkpoint for this sub-case '
+            f'to protect and it would pass whatever the writer did')
+        same(at_first_commit, before_digests,
+             'a committed artefact changed on disk during phase 1, before the '
+             'first os.replace. Staging is not a naming convention: a file '
+             'written under the name a resume reads is torn for as long as '
+             'the write takes, and the replay archive takes about a second, '
+             'so the kill destroys the checkpoint being overwritten as well '
+             'as the one being made. Checking only the path the writer was '
+             'handed misses a redirect further down; this compares the bytes '
+             'on disk before the write against the bytes at the instant of '
+             'the first rename.')
         outside = sorted(p for p in written
                          if os.path.dirname(os.path.abspath(p))
                          != os.path.abspath(staging))
@@ -2044,8 +2193,317 @@ def test_checkpoint_consistency_is_verified(ctx: Ctx) -> None:
         for env in (good.env, good.eval_env):
             with contextlib.suppress(Exception):
                 env.close()
-    ctx.note('staged writes, state.json committed last, and six unsound '
-             'checkpoints refused with a reason')
+    ctx.note(f'staged writes ({len(before_digests)} committed artefacts '
+             f'byte-unchanged until the first rename), state.json committed '
+             f'last, and six unsound checkpoints refused with a reason')
+
+
+@case('DESIGN.md 5.2 P1, ANALYSIS_PLAN.md 1 -- the held-out evaluations '
+      'survive a resume, and a final_score averaged over a subset of the '
+      'declared checkpoints is refused instead of written')
+def test_finalisation_needs_the_declared_evaluation_set(ctx: Ctx) -> None:
+    """A resumed run's primary endpoint equals an uninterrupted one's exactly.
+
+    P1 is a mean over the held-out evaluations at EACH of the declared final
+    checkpoints. Those evaluations were produced inside the episode loop and
+    accumulated in a local dict, so a resume, which starts the loop at
+    `start_episode`, silently dropped every declared checkpoint below that
+    point. Two failures came out of that, and this case covers both plus the
+    refusal that has to stand in when neither can be repaired.
+
+    * **Killed at the very end.** A kill after the final
+      `save_checkpoint(num_episodes - 1)` and during the `model.keras` or
+      `manifest.json` write leaves every episode done. The resume runs none, so
+      the dict is empty, and the manifest was rewritten with
+      `final_score: null` and `final_return_per_checkpoint: {}` while
+      `episodes_completed` stayed at the full budget. `find_runs` listed it and
+      `sweep.completion_state` called it complete.
+
+    * **Killed a few episodes short: the same trajectory, a wrong number.**
+      With held-out evaluations declared at episodes 5, 8 and 11, a kill at
+      episode 10 and a resume produced a bit-identical trajectory and a
+      `final_score` of -0.016619519094766617 against the uninterrupted run's
+      -0.024354667609618103, because the mean was taken over {11} alone. A
+      plausible number, no error raised, nothing downstream able to see it:
+      that is the failure this case exists for, and it is why the comparison
+      here is exact equality against a reference run rather than a tolerance.
+
+    * **Unrepairable.** `eval_episodes.jsonl` is what makes the first two
+      recoverable. When a declared checkpoint is not in it, no number may be
+      written: the case requires a refusal, no manifest, and a directory that
+      `sweep.completion_state` and `aggregate.py` both read as unfinished.
+    """
+    from experiments import aggregate, sweep
+
+    kwargs = dict(arch='mlp', target_rule='double', env='CartPole-v1', seed=5,
+                  num_episodes=12, max_steps=150, eval_every=3,
+                  final_eval_episodes=2, final_eval_checkpoints=3,
+                  prefix_checkpoints=(4,))
+    endpoint_fields = ('episodes_completed', 'final_eval_episodes',
+                       'final_eval_episodes_contributing',
+                       'prefix_eval_episodes', 'final_return', 'final_score',
+                       'final_return_per_checkpoint', 'prefix_evaluations')
+
+    def result_of(run_dir: str) -> dict:
+        with open(os.path.join(run_dir, 'manifest.json'), encoding='utf-8') \
+                as fh:
+            return json.load(fh)['result']
+
+    def endpoint(run_dir: str) -> dict:
+        result = result_of(run_dir)
+        return {key: result.get(key) for key in endpoint_fields}
+
+    def sources(run_dir: str) -> dict:
+        evals = result_of(run_dir).get('held_out_evaluations') or {}
+        return {int(k): v.get('source') for k, v in evals.items()}
+
+    # -- the reference. Never interrupted, and it defines the right answer.
+    root_a = ctx.tmpdir('finalise_ref_')
+    cfg_a = _tiny_cfg(out_root=root_a, **kwargs)
+    _train(cfg_a)
+    reference = endpoint(cfg_a.run_dir())
+    same(reference['final_eval_episodes'], [5, 8, 11],
+         'the declared final checkpoints are not the three this case is '
+         'written around, so its kill points no longer straddle them')
+    same(reference['prefix_eval_episodes'], [4],
+         'the declared prefix checkpoint moved, so the prefix half of the '
+         'declared set is no longer exercised')
+    same(reference['final_eval_episodes_contributing'],
+         reference['final_eval_episodes'],
+         'the uninterrupted reference run did not contribute every declared '
+         'checkpoint to its own final_score')
+    per_checkpoint = reference['final_return_per_checkpoint']
+    same(sorted(int(k) for k in per_checkpoint), [5, 8, 11],
+         f'the reference manifest records held-out returns at '
+         f'{sorted(per_checkpoint)}, not at all three declared checkpoints')
+    req(len(set(per_checkpoint.values())) > 1,
+        f'the reference measured the identical held-out return '
+        f'{per_checkpoint} at every declared checkpoint, so a mean over a '
+        f'subset would equal the mean over the whole set and neither of the '
+        f'scenarios below could tell right from wrong')
+    same(set(sources(cfg_a.run_dir()).values()),
+         {'measured_in_this_session'},
+         'the reference run records something other than its own measurements '
+         'as the source of its held-out evaluations')
+
+    # -- 1. killed after the last checkpoint, during the model write.
+    root_b = ctx.tmpdir('finalise_end_')
+    cfg_b = _tiny_cfg(out_root=root_b, **kwargs)
+    _train_until_kill_after_loop(cfg_b)
+    run_b = cfg_b.run_dir()
+    req(not os.path.exists(os.path.join(run_b, 'manifest.json')),
+        'the kill landed after manifest.json was already written, so the '
+        'resume this sub-case needs was not the resume it got')
+    _train(_tiny_cfg(out_root=root_b, **kwargs))
+    same(endpoint(run_b), reference,
+         'a run killed after its final checkpoint and resumed does not report '
+         'the uninterrupted run\'s endpoints. The resume runs no episodes, so '
+         'the held-out evaluations have to be reloaded from '
+         'eval_episodes.jsonl; without that the manifest carried '
+         'final_score: null over a full episodes_completed and read as '
+         'complete.')
+    same(sources(run_b),
+         {4: 'reloaded_from_eval_episodes_jsonl',
+          5: 'reloaded_from_eval_episodes_jsonl',
+          8: 'reloaded_from_eval_episodes_jsonl',
+          11: 'reloaded_from_eval_episodes_jsonl'},
+         'the resumed run did not reload all four declared evaluations, so '
+         'either the kill did not land where this sub-case needs it or the '
+         'manifest is not recording which evaluations contributed')
+
+    # Finalising a directory that is already finalised must be idempotent: the
+    # sweep may re-enter one under --force, and a second pass rewriting a
+    # different number would be the same defect from the other direction.
+    _train(_tiny_cfg(out_root=root_b, **kwargs))
+    same(endpoint(run_b), reference,
+         're-finalising an already complete run changed its endpoints')
+
+    # -- 2. the worse variant: some declared checkpoints before the resume
+    # point, some after, and a bit-identical trajectory either way.
+    root_c = ctx.tmpdir('finalise_split_')
+    cfg_c = _tiny_cfg(out_root=root_c, **kwargs)
+    _train_until_crash(cfg_c, crash_at=10, checkpoint_at=9)
+    run_c = cfg_c.run_dir()
+    partial = [int(r['episode']) for r in _metric_rows(run_c)]
+    same(partial, list(range(10)),
+         f'after the injected crash the log holds {partial}, so the kill did '
+         f'not land between the declared checkpoints at 8 and 11 and the '
+         f'split this sub-case is about did not happen')
+    _train(_tiny_cfg(out_root=root_c, **kwargs))
+    same(sources(run_c),
+         {4: 'reloaded_from_eval_episodes_jsonl',
+          5: 'reloaded_from_eval_episodes_jsonl',
+          8: 'reloaded_from_eval_episodes_jsonl',
+          11: 'measured_in_this_session'},
+         'the split this sub-case needs did not happen: the declared '
+         'evaluations at 4, 5 and 8 must be reloaded and the one at 11 '
+         'measured after the resume')
+
+    # The trajectory is identical, which is exactly why the wrong number was
+    # invisible. Asserted, not assumed: if the resume perturbed the run then
+    # the endpoint difference below would have an innocent explanation.
+    worst, worst_field = 0.0, ''
+    for field_name in ('return', 'length', 'epsilon', 'env_steps', 'updates'):
+        for x, y in zip(_metric_rows(cfg_a.run_dir()), _metric_rows(run_c)):
+            a, b = x.get(field_name), y.get(field_name)
+            if a is None or b is None:
+                continue
+            if abs(float(a) - float(b)) > worst:
+                worst = abs(float(a) - float(b))
+                worst_field = f'{field_name}@ep{x["episode"]}'
+    same(worst, 0.0,
+         f'the interrupted run\'s trajectory differs from the reference by '
+         f'{worst:.3e} at {worst_field}, so this sub-case is no longer '
+         f'measuring what it claims: the point is that the trajectory is '
+         f'identical and only the endpoint is wrong.')
+    same(endpoint(run_c), reference,
+         'a run killed between two declared held-out checkpoints and resumed '
+         'reports a different primary endpoint from the uninterrupted run, '
+         'over an identical trajectory. Measured before the repair: '
+         'final_score -0.016619519094766617 against the reference\'s '
+         '-0.024354667609618103, a mean over {11} rather than over {5, 8, 11}. '
+         'A plausible number with no error attached, on P1.')
+
+    # -- 3. unrepairable: refuse, and leave a directory that says so.
+    #
+    # Three ways a declared block fails to be the declared block, and they are
+    # not one check. The whole block absent is caught by a presence test; a
+    # block one record short is not, and it is the one a kill inside the
+    # batched write to eval_episodes.jsonl actually leaves; a block whose
+    # records came from another configuration is caught by neither.
+    root_d = ctx.tmpdir('finalise_refuse_')
+    cfg_d = _tiny_cfg(out_root=root_d, **kwargs)
+    _train_until_kill_after_loop(cfg_d)
+    run_d = cfg_d.run_dir()
+    manifest_d = os.path.join(run_d, 'manifest.json')
+    evals_path = os.path.join(run_d, 'eval_episodes.jsonl')
+    with open(evals_path, encoding='utf-8') as fh:
+        intact_evals = [json.loads(line) for line in fh if line.strip()]
+    dropped = 8
+    block = [r for r in intact_evals
+             if r.get('stream') == 'eval_final'
+             and int(r.get('checkpoint', -10 ** 9)) == dropped]
+    same(len(block), int(cfg_d.final_eval_episodes),
+         f'eval_episodes.jsonl holds {len(block)} eval_final records at '
+         f'checkpoint {dropped}, not the {cfg_d.final_eval_episodes} the '
+         f'configuration declares, so the sub-cases below would be damaging '
+         f'something other than a whole declared block')
+
+    def rewrite_evals(rows) -> None:
+        with open(evals_path, 'w', encoding='utf-8', newline='') as fh:
+            for row in rows:
+                fh.write(json.dumps(row, sort_keys=True) + '\n')
+
+    def refusal(what: str, rows) -> str:
+        """Damage the evaluation log this way, resume, and require a refusal."""
+        rewrite_evals(rows)
+        try:
+            _train(_tiny_cfg(out_root=root_d, **kwargs))
+        except RuntimeError as exc:
+            message = str(exc)
+            req('refusing to finalise' in message,
+                f'{what}: finalisation stopped, but not as a refusal: '
+                f'{message}')
+            req(f'episode {dropped}' in message,
+                f'{what}: the refusal does not name the declared checkpoint it '
+                f'could not reconstruct, so its reader cannot tell which '
+                f'evaluation to restore: {message}')
+            req(not os.path.exists(manifest_d),
+                f'{what}: the refusal still left a manifest.json behind. '
+                f'manifest.json is the only marker in a run directory that '
+                f'reads as finished: find_runs globs for it and '
+                f'completion_state reads episodes_completed out of it, so '
+                f'writing one for an unfinalised run is what made the defect '
+                f'silent.')
+            return message
+        raise Failed(
+            f'{what} was accepted and a manifest written. A final_score '
+            f'averaged over a subset of the declared evaluation episodes is '
+            f'the study\'s primary endpoint reported wrong, with '
+            f'episodes_completed at the full budget and a contiguous metrics '
+            f'log vouching for it. A refusal costs one run; a wrong P1 costs '
+            f'the paper.')
+
+    # -- 3a. the whole declared block is gone.
+    message = refusal(
+        f'a run whose evaluation log has lost every record at checkpoint '
+        f'{dropped}',
+        [r for r in intact_evals if r not in block])
+    req('holds no eval_final record' in message,
+        f'the refusal does not say the records are absent: {message}')
+    state, why = sweep.completion_state({'run_dir': run_d, 'num_episodes': 12})
+    req(state != 'complete',
+        f'sweep.completion_state reads the refused run as {state!r} ({why}). '
+        f'A run whose finalisation did not complete must not read as complete, '
+        f'or the sweep counts it, skips it and the analysis layer averages it.')
+    same(aggregate.find_runs(root_d), [],
+         'aggregate.find_runs lists the refused run as a finished run')
+    req(aggregate.find_unmanifested_runs(root_d),
+         'aggregate.find_unmanifested_runs does not see the refused run at '
+         'all, so it would be neither aggregated nor counted as unfinished '
+         'and would vanish from the accounting entirely')
+
+    # -- 3b. the block is one record short, which is what a kill inside the
+    # batched write leaves. A presence test cannot see this, and averaging the
+    # records that survived would silently change what the checkpoint's number
+    # is a mean of.
+    message = refusal(
+        f'a run whose evaluation block at checkpoint {dropped} is one record '
+        f'short',
+        [r for r in intact_evals if r is not block[-1]])
+    req(f'range(0, {cfg_d.final_eval_episodes})' in message,
+        f'the refusal does not say the block is short of the declared '
+        f'evaluation-episode count: {message}')
+
+    # -- 3c. the records are a full block, but not this run's: their initial
+    # states came from somewhere else, so the number they average to is not
+    # the held-out evaluation the design declares.
+    foreign = []
+    for row in intact_evals:
+        if row is block[0]:
+            row = dict(row, env_seed=int(row['env_seed']) + 1)
+        foreign.append(row)
+    message = refusal(
+        f'a run whose evaluation block at checkpoint {dropped} was produced '
+        f'from foreign environment seeds', foreign)
+    req('eval_final stream derives' in message,
+        f'the refusal does not say the recorded environment seed is not the '
+        f'one this run derives: {message}')
+
+    # -- 3d. a whole block with the right indices and the right seeds, whose
+    # returns have been altered. Every check above passes on it, and the
+    # endpoint would be a mean of those numbers; the episode's own row in
+    # metrics.jsonl is the second, independent record that catches it.
+    altered = []
+    for row in intact_evals:
+        if row is block[0]:
+            row = dict(row, **{'return': float(row['return']) + 1.0})
+        altered.append(row)
+    message = refusal(
+        f'a run whose evaluation block at checkpoint {dropped} has an altered '
+        f'return', altered)
+    req('disagree' in message,
+        f'the refusal does not say the two logs of the same evaluation '
+        f'disagree: {message}')
+
+    # -- the control: put the evaluation log back and the run finalises, with
+    # the reference endpoints. Without this the four refusals above would be
+    # satisfied by a finalisation that never works.
+    rewrite_evals(intact_evals)
+    _train(_tiny_cfg(out_root=root_d, **kwargs))
+    same(endpoint(run_d), reference,
+         'restoring eval_episodes.jsonl did not let the run finalise to the '
+         'reference endpoints, so the refusals above are not a guard but a '
+         'broken reconstruction')
+    same(sweep.completion_state({'run_dir': run_d, 'num_episodes': 12})[0],
+         'complete',
+         'the repaired run still does not read as complete')
+
+    ctx.note(f'reference final_score {reference["final_score"]!r} reproduced '
+             f'exactly across both resume windows; four kinds of '
+             f'unreconstructable evaluation block refused, each reading as '
+             f'{state!r} to sweep.completion_state, and the repaired run '
+             f'finalises to the reference')
 
 
 # ===========================================================================
@@ -6582,6 +7040,620 @@ def test_audit_scopes_and_provenances_the_tuned_arms(ctx: Ctx) -> None:
 
 
 # ===========================================================================
+# 7b2. The pre-registered selection CRITERION itself
+# ===========================================================================
+# Everything in 7b is about the machinery around the rule and supplies its own
+# fixture rule so as not to depend on the criterion. That was the right call
+# for those cases, and it left the criterion itself unchecked: nothing in
+# `experiments/` read `SELECTION_CRITERION_ENDPOINT`, `COMPETENCE_ENDPOINT`,
+# `COMPETENCE_FLOOR`, `SELECTION_VARIANCE_FIELD` or `SELECTION_N`, and the one
+# place the installed rule ran asserted only that it returned a candidate from
+# the pool it was handed. Under that suite, swapping the criterion endpoint to
+# final_score, the variance to ddof=0, the strict `>` to `>=`, the competence
+# floor onto AUC, or the tie-breaks into another order was a silent change and
+# every case still passed. The rule decides the tuned leg of the DESIGN.md 3.3
+# arbitration, and the arbitration is what licenses this study's primary
+# confirmatory conclusion, so each clause of ANALYSIS_PLAN.md 2.3 is driven
+# below on numbers chosen to be EXACT in binary floating point: that is what
+# lets a candidate sit ON the margin rather than near it.
+
+#: A priori AUC values at the five TUNE seeds. Exact, not nearly exact: the
+#: five values are representable, they sum to exactly 0 so the mean is exactly
+#: 0.0, and their sum of squared deviations is exactly 1.25, so the ddof=1
+#: variance is exactly 0.3125 and 2.3's standard error sqrt(var_A/5 + var_B/5)
+#: against a zero-variance rival is exactly 0.25. A rival placed at 0.25 is
+#: therefore ON the margin, which is the only way to tell `>` from `>=` in a
+#: test rather than in a comment.
+_CRIT_A_AUC = (-0.75, -0.25, 0.0, 0.25, 0.75)
+_CRIT_SE_DDOF1 = 0.25
+#: What the estimator 2.3 REJECTS would have produced from the same values:
+#: sqrt(0.25/5). Smaller, so a rival between the two switches the cell under
+#: ddof=0 and keeps it under ddof=1.
+_CRIT_SE_DDOF0 = math.sqrt(0.25 / 5)
+
+
+def _crit_five(value) -> tuple[float, ...]:
+    """Five per-seed values. A scalar means the same value at every TUNE seed."""
+    if isinstance(value, (int, float)):
+        return (float(value),) * 5
+    out = tuple(float(v) for v in value)
+    if len(out) != 5:
+        raise Failed(f'a criterion fixture supplied {len(out)} value(s) where '
+                     f'ANALYSIS_PLAN.md 2.3 writes five TUNE seeds: {out}')
+    return out
+
+
+def _criterion_table(values: dict, default=(0.05, 1.0),
+                     plan_hash=None, drop: Sequence[str] = ()) -> list[dict]:
+    """A complete `E3` table whose every number the caller chose.
+
+    `values` maps `config_key` to `(auc, final)`, each either a scalar or five
+    per-seed values; a configuration the caller does not name gets `default`.
+    The same numbers are used in all four cells, so one fixture exercises the
+    rule four times: a clause that fired in one cell and not another would be a
+    defect in the rule rather than in the fixture, and that is worth being able
+    to see.
+
+    `drop` removes configurations entirely, for the refusal that is about a
+    candidate being absent. `plan_hash` is a value or a
+    `(cell, config, seed) -> value` callable, for the provenance case below.
+
+    The grid is read from `tuning.candidate_grid`, which reads it from the
+    catalogue, so a fixture cannot drift from the experiment it describes.
+    """
+    import hashlib
+
+    from experiments import registry
+
+    tuning = _tuning()
+    grid = tuning.candidate_grid()
+    block = list(registry.SEED_BLOCKS[tuning.SELECTION_SEED_BLOCK])
+    rows: list[dict] = []
+    for arch, target_rule in registry.CELLS:
+        cell_key = registry._tag(arch, target_rule)
+        for config_key in sorted(grid[cell_key]):
+            if config_key in drop:
+                continue
+            label, cfg = grid[cell_key][config_key]
+            auc, final = values.get(config_key, default)
+            aucs, finals = _crit_five(auc), _crit_five(final)
+            for index, seed in enumerate(block):
+                tag = (f'{_TUNING_FIXTURE_MARKER}|criterion|{cell_key}'
+                       f'|{config_key}|{seed}')
+                row = {
+                    'experiments': 'E3', 'experiment': 'E3',
+                    'arch': arch, 'target_rule': target_rule,
+                    'cell': cell_key, 'label': label,
+                    'seed': int(seed), 'seed_block': 'TUNE',
+                    'env': registry.TARGET_ENV, 'condition': 'scratch',
+                    'lr': float(cfg.lr),
+                    'target_update': cfg.target_update,
+                    'target_update_freq': int(cfg.target_update_freq),
+                    'tau': float(cfg.tau),
+                    'run_digest': hashlib.md5(tag.encode()).hexdigest(),
+                    'run_dir': f'{_TUNING_FIXTURE_MARKER}/{cell_key}',
+                    'auc_score': aucs[index],
+                    'final_score': finals[index],
+                }
+                if plan_hash is not None:
+                    row['plan_hash'] = (
+                        plan_hash(cell_key, config_key, seed)
+                        if callable(plan_hash) else str(plan_hash))
+                rows.append(row)
+    return rows
+
+
+def _criterion_selection(table, require_complete: bool = True):
+    """The table put through the INSTALLED rule, warnings silenced."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        return _tuning().compute_selection(
+            list(table), require_complete=require_complete,
+            generator=_TUNING_FIXTURE_MARKER, record_git=False)
+
+
+def _criterion_choice(table) -> dict:
+    """`cell -> (selected config_key, the rule's own working)`, all four cells."""
+    selection = _criterion_selection(table)
+    return {key: (sel.config_key, dict(sel.evidence.get('rule_working') or {}))
+            for key, sel in selection.cells.items()}
+
+
+def _criterion_refusal(table, require_complete: bool = True):
+    """The refusal a fixture was built to provoke, or None if it did not fire."""
+    tuning = _tuning()
+    try:
+        _criterion_selection(table, require_complete=require_complete)
+    except tuning.SelectionError as exc:
+        return exc
+    return None
+
+
+@case('ANALYSIS_PLAN.md 2.3 -- the installed selection criterion is the one '
+      'the plan pre-registers, clause by clause, and not merely some rule')
+def test_preregistered_selection_criterion_is_the_planned_one(ctx: Ctx) -> None:
+    """2.3's criterion, driven clause by clause on exact arithmetic.
+
+    The rule decides which configuration each cell's tuned arms run at, the
+    tuned arms are one leg of the `DESIGN.md` 3.3 arbitration, and the
+    arbitration is what licenses an RQ2 or RQ3 conclusion. Every clause of it
+    is therefore load-bearing on this study's primary claim, and until this
+    case existed none of them was checked anywhere: the constants naming the
+    criterion endpoint, the competence endpoint and floor, the variance
+    estimator and the n=5 denominator appeared in no case here, in no check in
+    `audit.py` and nowhere in `stats.py`.
+
+    Each sub-case is written so that ONE mutation flips it and the others do
+    not, which is what makes a failure here name the clause that moved.
+    """
+    import statistics
+
+    from experiments import registry
+
+    tuning = _tuning()
+    a_priori = tuning.A_PRIORI_CONFIG.config_key
+
+    # -- 0. the rule in force is the pre-registered one, and its constants are
+    #       2.3's. Pins rather than behaviour, so a failure below reads as "the
+    #       rule moved" rather than as "the fixture is wrong".
+    req(tuning.SELECTION_RULE is tuning.preregistered_selection_rule,
+        f'tuning.SELECTION_RULE is {tuning.SELECTION_RULE!r}, not the '
+        f'pre-registered criterion of ANALYSIS_PLAN.md 2.3. Everything this '
+        f'case checks would then be about a rule that is not installed.')
+    req(tuning.SELECTION_RULE_IS_PLACEHOLDER is False,
+        'the installed rule advertises itself as a placeholder, so stats.py '
+        'blocks every RQ2 and RQ3 assertion drawn from it and the arbitration '
+        'is a formality')
+    same(tuning.SELECTION_CRITERION_ENDPOINT, 'auc_score',
+         'ANALYSIS_PLAN.md 2.3 fixes the criterion as mean auc_score across '
+         'the five TUNE seeds, NOT final score: on LunarLander every cell '
+         'finishes above the solved threshold, so a final-score comparison is '
+         'a comparison of ceilings that cannot express an ordering')
+    same(tuning.COMPETENCE_ENDPOINT, 'final_score',
+         'ANALYSIS_PLAN.md 2.3 reads its competence floor on mean normalised '
+         'final_score. Read on auc_score it would refuse EVERY cell, because '
+         'AUC integrates the curve from zero and never reaches 1.0 even for a '
+         'solved task; that is the defect 11 records as the first draft\'s')
+    same(tuning.COMPETENCE_FLOOR, 0.6,
+         'the floor is DESIGN.md 4.3\'s competence value, reused by 2.3 rather '
+         'than a second constant invented there')
+    same(tuning.SELECTION_VARIANCE_FIELD, 'var',
+         'ANALYSIS_PLAN.md 2.3 names the ddof=1 SAMPLE variance explicitly, '
+         'because at n=5 the two estimators differ by about 12 per cent in '
+         'the standard error, which is enough to move a marginal cell')
+    same(tuning.SELECTION_N, 5,
+         'ANALYSIS_PLAN.md 2.3 writes the standard error as '
+         'sqrt(var_A/5 + var_B/5), for a five-seed block')
+    same(tuning.SELECTION_N,
+         len(registry.SEED_BLOCKS[tuning.SELECTION_SEED_BLOCK]),
+         'the n the standard error is written for and the size of the TUNE '
+         'block have drifted apart')
+    same((tuning.A_PRIORI_CONFIG.lr, tuning.A_PRIORI_CONFIG.target_update,
+          tuning.A_PRIORI_CONFIG.target_update_freq),
+         (5e-4, 'hard', 1000),
+         'ANALYSIS_PLAN.md 2.3 names A as lr=5e-4 with a hard target update '
+         'every 1000 updates. The rule is a comparison against A, so an A that '
+         'is not that configuration is a different rule')
+
+    # -- 1. the criterion endpoint is mean AUC. The candidate with the highest
+    #       mean final_score is a DIFFERENT one and it must lose.
+    #
+    #       The winner's mean AUC is 0.26, below the 0.6 floor, and its mean
+    #       final_score is 0.70, above it. So this fixture also decides where
+    #       the floor is READ: on final_score the cell selects, on auc_score
+    #       every cell would be refused.
+    table = _criterion_table({
+        a_priori: (_CRIT_A_AUC, 1.0),
+        'lr0.001-hard': (0.26, 0.70),          # highest mean AUC
+        'lr0.0001-soft': (0.10, 5.00),         # highest mean final score
+    }, default=(0.05, 0.90))
+    for cell_key, (key, working) in sorted(_criterion_choice(table).items()):
+        same(key, 'lr0.001-hard',
+             f'{cell_key}: the criterion selected {key!r}. ANALYSIS_PLAN.md '
+             f'2.3 selects on mean auc_score; lr0.0001-soft has the highest '
+             f'mean final_score in this table and lr0.001-hard the highest '
+             f'mean AUC, so a criterion reading final_score picks the wrong '
+             f'one and a floor read on AUC refuses the cell outright')
+        same(working.get('criterion_endpoint'), 'auc_score',
+             f'{cell_key}: the recorded working names a criterion endpoint '
+             f'other than the one the decision was made on')
+        near(float(working['competence']['mean_of_selected']), 0.70, 1e-12,
+             f'{cell_key}: the competence check did not read the selected '
+             f'candidate\'s mean final_score')
+        req(bool(working['competence']['passes']),
+            f'{cell_key}: a candidate at mean final_score 0.70 was failed by a '
+            f'0.6 floor')
+
+    # -- 2. the margin: one standard error, strict, from the ddof=1 variance.
+    #       Three fixtures around a boundary that is EXACT, so each mutation
+    #       flips exactly one of them:
+    #         0.26  clears it under 2.3      -> B, and A under an n=4 denominator
+    #         0.25  sits ON it               -> A under `>`, B under `>=`
+    #         0.24  sits between the two SEs -> A under ddof=1, B under ddof=0
+    var_a = statistics.variance(list(_CRIT_A_AUC))    # ddof=1, re-derived here
+    same(var_a, 0.3125,
+         'the fixture\'s a priori ddof=1 variance is not the exact 0.3125 the '
+         'boundary arithmetic below depends on')
+    same(math.sqrt(var_a / 5 + 0.0 / 5), _CRIT_SE_DDOF1,
+         'sqrt(var_A/5 + var_B/5), re-derived here from the fixture values, is '
+         'not the exact 0.25 the margin cases are placed against')
+    req(_CRIT_SE_DDOF0 < _CRIT_SE_DDOF1,
+        'the population estimator is not smaller than the sample one here, so '
+        'the ddof sub-case below could not tell them apart')
+
+    for rival, expect, why in (
+            (0.26, 'lr0.001-hard',
+             'a difference of 0.26 exceeds the 0.25 standard error, so 2.3 '
+             'selects B. Keeping A here means the margin is too wide, which is '
+             'what an n=4 denominator (SE 0.2795) would do'),
+            (0.25, a_priori,
+             'a difference of exactly 0.25 does NOT exceed the 0.25 standard '
+             'error. 2.3 writes "B if mean_AUC(B) - mean_AUC(A) > SE", so the '
+             'comparison is strict and A is kept; selecting B here is `>=`'),
+            (0.24, a_priori,
+             'a difference of 0.24 exceeds the ddof=0 standard error 0.2236 '
+             'and not the ddof=1 standard error 0.25. 2.3 names the ddof=1 '
+             'sample variance, so A is kept; selecting B here is var_pop')):
+        fixture = _criterion_table({
+            a_priori: (_CRIT_A_AUC, 1.0),
+            'lr0.001-hard': (rival, 1.0),
+        }, default=(-1.0, 1.0))
+        for cell_key, (key, working) in sorted(
+                _criterion_choice(fixture).items()):
+            same(key, expect, f'{cell_key} at rival mean {rival}: {why}')
+            same(float(working['difference']), rival - 0.0,
+                 f'{cell_key}: the recorded difference is not '
+                 f'mean_AUC(B) - mean_AUC(A)')
+            same(float(working['se_ddof1']), _CRIT_SE_DDOF1,
+                 f'{cell_key}: the recorded standard error is not '
+                 f'sqrt(var_A/5 + var_B/5) with var the ddof=1 sample variance')
+            same(float(working['se_ddof0_not_used']), _CRIT_SE_DDOF0,
+                 f'{cell_key}: the ddof=0 standard error 2.3 rejects is '
+                 f'recorded beside the one it uses, and it has moved')
+            same(bool(working['margin_cleared']), key != a_priori,
+                 f'{cell_key}: margin_cleared disagrees with what was selected')
+            same(int(working['n_seeds']), 5,
+                 f'{cell_key}: the working records a denominator other than 5')
+
+    se_at_four = math.sqrt(var_a / 4 + 0.0 / 4)
+    req(0.26 > _CRIT_SE_DDOF1 and not 0.26 > se_at_four,
+        f'the 0.26 sub-case no longer distinguishes the n=5 denominator 2.3 '
+        f'writes from an observed-count one (SE at n=5 {_CRIT_SE_DDOF1}, at '
+        f'n=4 {se_at_four:.4f}), so a rule that shrank the denominator would '
+        f'pass it')
+
+    # -- 3. the competence floor: its value, its direction, and WHICH candidate
+    #       it reads. 2.3 puts it on the SELECTED candidate, not on the argmax.
+    below = _criterion_refusal(_criterion_table({
+        a_priori: (_CRIT_A_AUC, 0.59),
+        'lr0.001-hard': (-1.0, 0.59),
+    }, default=(-1.0, 0.59)))
+    req(isinstance(below, tuning.SelectionRefused),
+        f'a cell whose selected candidate reaches a mean final_score of 0.59 '
+        f'was not refused. ANALYSIS_PLAN.md 2.3 refuses it rather than '
+        f'returning its least-bad option. Got {below!r}')
+    req('0.59' in str(below) and str(tuning.COMPETENCE_FLOOR) in str(below),
+        f'the competence refusal names neither the value reached nor the '
+        f'floor, so a reader cannot tell how far short the cell fell: {below}')
+
+    at_floor = _criterion_choice(_criterion_table({
+        a_priori: (_CRIT_A_AUC, 0.6),
+        'lr0.001-hard': (-1.0, 0.6),
+    }, default=(-1.0, 0.6)))
+    for cell_key, (key, working) in sorted(at_floor.items()):
+        same(key, a_priori,
+             f'{cell_key}: a candidate exactly AT the floor was not selected')
+        req(bool(working['competence']['passes']),
+            f'{cell_key}: ANALYSIS_PLAN.md 2.3 requires a mean final_score "of '
+            f'at least 0.6", so a candidate at exactly 0.6 must pass. This one '
+            f'did not, which means the comparison is a strict `>`')
+
+    # The floor reads the SELECTED candidate. Here the highest-mean candidate
+    # is below the floor and does NOT clear the margin, so A is selected and A
+    # passes; a floor read on the argmax instead would refuse the cell.
+    for cell_key, (key, working) in sorted(_criterion_choice(_criterion_table({
+            a_priori: (_CRIT_A_AUC, 1.0),
+            'lr0.001-hard': (0.24, 0.10),
+    }, default=(-1.0, 1.0))).items()):
+        same(key, a_priori,
+             f'{cell_key}: the 0.24 rival cleared a margin it should not have')
+        near(float(working['competence']['mean_of_selected']), 1.0, 1e-12,
+             f'{cell_key}: the floor was read on the highest-mean candidate '
+             f'rather than on the selected one. ANALYSIS_PLAN.md 2.3 puts it '
+             f'on "its selected candidate", and reading it on the argmax '
+             f'refuses cells the plan keeps')
+
+    # ...and the same shape with the rival CLEARING the margin must refuse, so
+    # the sub-case above cannot be satisfied by a floor that never fires.
+    argmax_wins = _criterion_refusal(_criterion_table({
+        a_priori: (_CRIT_A_AUC, 1.0),
+        'lr0.001-hard': (0.26, 0.10),
+    }, default=(-1.0, 1.0)))
+    req(isinstance(argmax_wins, tuning.SelectionRefused),
+        f'a cell that SELECTED a candidate at mean final_score 0.10 was not '
+        f'refused, so the competence floor never fires on a switched cell. '
+        f'Got {argmax_wins!r}')
+
+    # -- 4. the three tie-breaks, in 2.3's order. Read off the recorded working
+    #       rather than off the selection, so the ordering is exercised even
+    #       where the tied winner does not go on to clear the margin.
+    for named, expect, why in (
+            ({'lr0.001-hard': (0.30, 2.0), 'lr0.0001-soft': (0.30, 1.0)},
+             'lr0.001-hard',
+             'ties in the highest mean AUC are broken FIRST by higher mean '
+             'final score. lr0.001-hard has the higher final score and the '
+             'higher lr, so a rule breaking ties by lr first takes '
+             'lr0.0001-soft instead'),
+            ({'lr0.001-hard': (0.30, 2.0), 'lr0.0001-soft': (0.30, 2.0)},
+             'lr0.0001-soft',
+             'with the final scores tied the next tie-break is LOWER lr. '
+             'lr0.0001-soft has the lower lr and the soft rule, so a rule '
+             'preferring hard first takes lr0.001-hard instead'),
+            ({'lr0.0003-hard': (0.30, 2.0), 'lr0.0003-soft': (0.30, 2.0)},
+             'lr0.0003-hard',
+             'with mean AUC, mean final score and lr all tied, the last '
+             'tie-break is hard before soft')):
+        fixture = _criterion_table(
+            dict({a_priori: (_CRIT_A_AUC, 1.0)}, **named), default=(-1.0, 1.0))
+        for cell_key, sel in sorted(_criterion_selection(fixture).cells.items()):
+            working = dict(sel.evidence.get('rule_working') or {})
+            same(working.get('highest_mean', {}).get('config_key'), expect,
+                 f'{cell_key}: {why}')
+            same(sorted(working.get('tied_at_highest_mean') or []),
+                 sorted(named),
+                 f'{cell_key}: the working does not record the tie it broke, '
+                 f'so the choice is not reproducible from the stored table')
+            req(bool(working.get('tie_break_applied')),
+                f'{cell_key}: a tie at the highest mean was not recorded as one')
+
+    # -- 5. B is compared against A, and not against the runner-up. The
+    #       runner-up here is far closer to B than A is and carries enough
+    #       variance that B would NOT clear a margin computed against it.
+    for cell_key, (key, working) in sorted(_criterion_choice(_criterion_table({
+            a_priori: (_CRIT_A_AUC, 1.0),
+            'lr0.001-hard': (0.26, 1.0),
+            'lr0.0001-soft': ((-0.8, -0.3, 0.2, 0.7, 1.2), 1.0),
+    }, default=(-1.0, 1.0))).items()):
+        same(key, 'lr0.001-hard',
+             f'{cell_key}: B did not clear the margin. Against A the '
+             f'difference is 0.26 over a standard error of 0.25 and it does; '
+             f'against the runner-up (mean 0.2, ddof=1 variance 0.625) it is '
+             f'0.06 over 0.354 and it does not. Keeping A here means the '
+             f'comparison is being made against the wrong candidate')
+        same(working.get('a_priori', {}).get('config_key'), a_priori,
+             f'{cell_key}: the working names something other than the a priori '
+             f'configuration as A')
+
+    # -- 6. no A at all: refused, rather than falling back to the argmax, which
+    #       is the rule 2.3 rejects by name.
+    no_a = _criterion_refusal(_criterion_table(
+        {'lr0.001-hard': (0.99, 1.0)}, default=(0.05, 1.0),
+        drop=(a_priori,)), require_complete=False)
+    req(isinstance(no_a, tuning.SelectionIncomplete),
+        f'a table with no candidate at the a priori configuration was not '
+        f'refused. ANALYSIS_PLAN.md 2.3 states the rule as a comparison '
+        f'against A; without A there is no baseline to beat by one standard '
+        f'error, and selecting the argmax instead is the rule 2.3 rejects. '
+        f'Got {no_a!r}')
+    req(a_priori in str(no_a),
+        f'the refusal does not name the missing configuration: {no_a}')
+
+    ctx.note('2.3 clause by clause on exact arithmetic: criterion mean '
+             'auc_score and not final score; margin one ddof=1 standard error '
+             'compared strictly (0.26 switches, 0.25 does not, 0.24 does not); '
+             'n=5 denominator; floor 0.6 on the mean final_score of the '
+             'SELECTED candidate; three tie-breaks in order; B compared '
+             'against A; a missing A refused')
+
+
+@case('ANALYSIS_PLAN.md 1 -- a selection records which pre-registration its '
+      'evidence was produced under, and every consumer states it')
+def test_selection_records_the_plan_its_evidence_was_produced_under(
+        ctx: Ctx) -> None:
+    """The tuned leg's pre-registration, in the artifact and in the output.
+
+    `ANALYSIS_PLAN.md` 1 writes the plan hash into every run manifest and every
+    emitted table and figure, and re-labels every result produced under a
+    superseded version exploratory. For the runs in `per_seed.csv` that already
+    worked. For the tuned leg it did not, and the gap is structural rather than
+    incidental: `E3` runs on the `TUNE` block, `ANALYSIS_PLAN.md` 8 bars `TUNE`
+    from every reported estimate, so `E3`'s plan hashes appear in no reported
+    table at any n. A selection computed from superseded-plan evidence
+    therefore reached the arbitration with nothing downstream able to say so,
+    while the artifact's own `plans` block recorded the CURRENT hash and read
+    as though the evidence had been produced under it.
+
+    Not hypothetical. The completed screen spans three versions of the plan:
+    134 runs under one, 21 under a second and 5 under the current one, which is
+    what `audit.py` reports as `plan_hash_split` and what 11's 2026-08-27 entry
+    predicted would happen if `E3` were not restarted.
+
+    A label and not a refusal: 2.3 states four refusals and this is not among
+    them, so what follows requires the fact to be RECORDED and STATED, never
+    that a selection be refused for it.
+    """
+    tuning = _tuning()
+    a_priori = tuning.A_PRIORI_CONFIG.config_key
+    clean_values = {a_priori: (_CRIT_A_AUC, 1.0)}
+    current = tuning.provenance.plan_hashes().get(
+        tuning.EVIDENCE_PLAN_DOCUMENT)
+    req(current,
+        f'{tuning.EVIDENCE_PLAN_DOCUMENT} has no hash on disk, so there is '
+        f'nothing for the evidence to be compared against')
+    other = 'f' * len(str(current))
+
+    # -- 1. one pre-registration, and it is the one in force: no drift.
+    clean = _criterion_selection(_criterion_table(
+        clean_values, default=(-1.0, 1.0), plan_hash=current))
+    same(clean.evidence_plan_hashes, (str(current),),
+         'a table whose every row carries the current plan hash was not '
+         'recorded as one pre-registered set')
+    req(not clean.evidence_plan_split, 'a single-hash table was read as split')
+    req(not clean.evidence_plan_stale(current),
+        'a table produced under the plan in force was read as stale')
+    req(not clean.evidence_plan_unknown,
+        'a table carrying a plan hash on every row was read as unknown')
+    same(clean.evidence_plan_note(current), '',
+         'a clean selection emitted a drift note, which trains a reader to '
+         'skim past the real one')
+    same(sum(clean.evidence_plan_counts.values()),
+         len(_criterion_table(clean_values, plan_hash=current)),
+         'the tally does not cover every evidence row')
+
+    # -- 2. a split: two versions across the evidence. One row would be enough,
+    #       because one candidate measured under another pre-registration is
+    #       enough to decide a cell.
+    def _split_hash(cell, config, seed):
+        del cell, config
+        return current if int(seed) % 2 else other
+
+    split = _criterion_selection(_criterion_table(
+        clean_values, default=(-1.0, 1.0), plan_hash=_split_hash))
+    req(split.evidence_plan_split,
+        'a selection computed from evidence spanning two ANALYSIS_PLAN.md '
+        'versions did not record the split, so the artifact says it is one '
+        'pre-registered set while audit.py says it is not')
+    same(split.evidence_plan_hashes, tuple(sorted({str(current), other})),
+         'the recorded hashes are not the ones the evidence carried')
+    note = split.evidence_plan_note(current)
+    req(note and other in note and str(current) in note,
+        f'the drift note does not name both versions the evidence spans: '
+        f'{note!r}')
+    req('EXPLORATORY' in note,
+        f'the drift note does not state ANALYSIS_PLAN.md 1\'s consequence, '
+        f'which is that every affected result is re-labelled exploratory: '
+        f'{note!r}')
+
+    # -- 3. wholly under a superseded version: stale, though not split.
+    stale = _criterion_selection(_criterion_table(
+        clean_values, default=(-1.0, 1.0), plan_hash=other))
+    req(not stale.evidence_plan_split,
+        'a single-hash table was reported as spanning several versions')
+    req(stale.evidence_plan_stale(current),
+        'evidence produced entirely under a superseded plan was not reported '
+        'as stale, which is the state 11 predicted for an E3 that finished '
+        'before the plan was corrected again')
+
+    # -- 4. no hash at all is UNKNOWN, which is not the same as clean.
+    silent = _criterion_selection(_criterion_table(
+        clean_values, default=(-1.0, 1.0)))
+    req(silent.evidence_plan_unknown and silent.evidence_plan_drift(current),
+        'a table with no plan_hash column was reported as clean. An absent '
+        'hash is not evidence that the runs are one pre-registered set, and '
+        'ANALYSIS_PLAN.md 1 requires the hash on every run')
+    req('UNKNOWN' in silent.evidence_plan_note(current),
+        f'the note for an unrecorded provenance does not say it is unknown: '
+        f'{silent.evidence_plan_note(current)!r}')
+
+    # -- 5. the record is inside the content address, so it cannot be edited
+    #       out and two selections differing only in it cannot collide.
+    req(len({clean.selection_id, split.selection_id, stale.selection_id}) == 3,
+        'selections whose evidence was produced under different '
+        'pre-registrations share a content address, so the artifact\'s id does '
+        'not distinguish them and a stale one reads as the current one')
+    root = ctx.tmpdir('selection_plan_')
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        tuning.write_selection(split, root, replace=True)
+    path = tuning.selection_path(root)
+    with open(path, encoding='utf-8') as fh:
+        stored = json.load(fh)
+    same(sorted(stored['evidence_plans']['counts']),
+         sorted({str(current), other}),
+         'the stored artifact does not carry the evidence provenance')
+    stored['evidence_plans']['counts'] = {str(current): 40}
+    with open(path, 'w', encoding='utf-8') as fh:
+        json.dump(stored, fh, indent=2, sort_keys=True)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            tuning.read_selection(root)
+    except tuning.SelectionCorrupt:
+        pass
+    else:
+        raise Failed(
+            'an artifact whose evidence provenance was edited to claim one '
+            'pre-registration still verified against its own content address. '
+            'The record has to be inside the address, or it survives exactly '
+            'until somebody finds it inconvenient')
+
+    # -- 6. the per-candidate record is seed-ordered and parallel to the
+    #       digests, so "which run, under which plan" is answerable per run.
+    for cell_key, cands in sorted(split.candidates.items()):
+        for cand in cands:
+            same(len(cand.plan_hashes), len(cand.seeds),
+                 f'{cell_key} {cand.config_key}: the per-seed plan hashes are '
+                 f'not parallel to the seeds they describe')
+            for seed, got in zip(cand.seeds, cand.plan_hashes):
+                same(got, _split_hash(cell_key, cand.config_key, seed),
+                     f'{cell_key} {cand.config_key} seed {seed}: the recorded '
+                     f'plan hash is not the one that run carried')
+
+    # -- 7. every consumer states it. ANALYSIS_PLAN.md 2.4's closing rule binds
+    #       report.py, tables.py and plots.py to READ a recorded verdict rather
+    #       than re-derive one; 1 binds the same three to the plan hash. A
+    #       guard the consumer ignores is not a guard, so all three are driven
+    #       against the same tree and required to agree.
+    from experiments import plots as plots_mod
+    from experiments import report as report_mod
+    from experiments import tables as tables_mod
+
+    readers = {'report.py': report_mod.selection_plan_provenance,
+               'tables.py': tables_mod.selection_plan_provenance,
+               'plots.py': plots_mod.selection_plan_provenance}
+
+    # The artifact on disk is still the edited one from sub-case 5, which no
+    # longer verifies. That is the fail-closed path, and it must not be silence.
+    for name, reader in sorted(readers.items()):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            got = reader(root, current)
+        req(got.get('drift') or got.get('error'),
+            f'{name} read an unverifiable selection and reported neither drift '
+            f'nor an error, so a bundle built over it would say nothing about '
+            f'the pre-registration behind its tuned leg: {got}')
+        req(str(got.get('sentence') or '').strip(),
+            f'{name} produced no sentence about the tuning selection. '
+            f'ANALYSIS_PLAN.md 2.4 makes not-evaluable the DEFAULT, so silence '
+            f'is the one answer that is never right')
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        tuning.write_selection(split, root, replace=True)
+    fresh = {}
+    for name, reader in sorted(readers.items()):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            fresh[name] = reader(root, current)
+    for name, got in sorted(fresh.items()):
+        req(got.get('present') and got.get('split') and got.get('drift'),
+            f'{name} read the split selection {split.short_id} and did not '
+            f'report the split: {got}')
+        req(other in str(got.get('note')),
+            f'{name} does not name the superseded version in its note: {got}')
+    same(len({json.dumps(v, sort_keys=True, default=str)
+              for v in fresh.values()}), 1,
+         'the three consumers disagree about the same selection. They carry '
+         'one copy of the helper each on purpose, and three copies that have '
+         'drifted apart are worse than one shared copy, because then two of '
+         'them can be right')
+
+    # -- 8. and with no selection at all the answer is still not silence.
+    empty = ctx.tmpdir('selection_absent_')
+    for name, reader in sorted(readers.items()):
+        got = reader(empty, current)
+        req(not got.get('present') and str(got.get('sentence') or '').strip(),
+            f'{name} says nothing about a run tree with no selection in it. An '
+            f'unrun tuned stage has to read as unrun, not as absent of the '
+            f'question')
+
+    ctx.note(f'clean, split, stale and unrecorded provenance each recorded and '
+             f'distinguished; the record is inside the content address, so an '
+             f'edited one is refused; report.py, tables.py and plots.py all '
+             f'state the split for {split.short_id} and agree on it')
+
+
+# ===========================================================================
 # 7c. Coverage: what this suite does and does not check
 # ===========================================================================
 #: One entry per row of the `DESIGN.md` §9 table, keyed by the row's exact
@@ -6624,13 +7696,16 @@ _GUARDRAIL_COVERAGE: dict[str, tuple[tuple[str, ...], str]] = {
         ('test_stats_excludes_tune_and_partial_arms', 'test_n1_is_labelled',
          'test_selection_refuses_evidence_outside_tune',
          'test_no_reported_estimate_draws_on_tune_with_tuned_arms',
-         'test_selection_refuses_incomplete_evidence'),
-        'the catalogue-side half is now covered for the tuned arms, which are '
-        'the first reported experiments whose provenance runs through TUNE: '
-        'their declared seeds, the selection\'s evidence seeds and the '
-        'analysis-layer exclusion are each checked. What is still not checked '
-        'here is that the seed blocks are disjoint for every OTHER experiment '
-        'in the catalogue, which registry.py asserts at import and audit.py '
+         'test_selection_refuses_incomplete_evidence',
+         'test_preregistered_selection_criterion_is_the_planned_one'),
+        'the catalogue-side half is covered for the tuned arms, which are the '
+        'first reported experiments whose provenance runs through TUNE: their '
+        'declared seeds, the selection\'s evidence seeds and the '
+        'analysis-layer exclusion are each checked, and the CRITERION itself '
+        'is now driven clause by clause rather than only for returning a '
+        'candidate from the pool it was handed. What is still not checked here '
+        'is that the seed blocks are disjoint for every OTHER experiment in '
+        'the catalogue, which registry.py asserts at import and audit.py '
         'asserts over a tree'),
     'Treatment intensity mistaken for architecture': (
         ('test_stats_intensity_gate', 'test_statlib_reference_values'),
@@ -6656,9 +7731,14 @@ _GUARDRAIL_COVERAGE: dict[str, tuple[tuple[str, ...], str]] = {
     'Generalising past the evidence': (
         ('test_report_wording_guards_fire',), ''),
     'Stale artifacts': (
-        ('test_provenance_is_content_addressed',),
-        'the per-figure and per-table provenance sidecars are written by '
-        'plots.py and tables.py and are not produced or inspected here'),
+        ('test_provenance_is_content_addressed',
+         'test_selection_records_the_plan_its_evidence_was_produced_under'),
+        'the selection artifact is now checked for asserting a '
+        'pre-registration its evidence does not have, and all three consumers '
+        'are driven through the helper that states it. What is still not '
+        'checked here is the rendered per-figure and per-table provenance '
+        'sidecars themselves, which plots.py and tables.py write and which '
+        'this suite does not produce'),
 }
 
 
